@@ -33,7 +33,7 @@ pub use downloader::{
 };
 
 // Re-export NER types
-pub use ner::{NerConfig, NerEntity, NerEntityType, NeuralNer};
+pub use ner::{cold_start_extract_entities, NerConfig, NerEntity, NerEntityType, NeuralNer};
 
 // Re-export keyword types
 pub use keywords::{Keyword, KeywordConfig, KeywordExtractor};

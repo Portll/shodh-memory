@@ -369,6 +369,53 @@ pub async fn remember(
             merged_entities.push(keyword);
         }
     }
+
+    // Cold-start fallback: when graph is sparse and NER found few entities,
+    // apply aggressive heuristic extraction to bootstrap the knowledge graph.
+    {
+        use crate::constants::{ENTITY_COLD_START_THRESHOLD, ENTITY_COLD_START_YAKE_BOOST};
+        use crate::embeddings::cold_start_extract_entities;
+
+        let graph_entity_count = state
+            .get_user_graph_stats(&req.user_id)
+            .map(|s| s.entity_count)
+            .unwrap_or(0);
+        let ner_entity_count = ner_entities.len();
+
+        if graph_entity_count < ENTITY_COLD_START_THRESHOLD && ner_entity_count < 2 {
+            tracing::debug!(
+                graph_entities = graph_entity_count,
+                ner_entities = ner_entity_count,
+                "Cold-start: running aggressive entity extraction"
+            );
+
+            // Aggressive YAKE: extract more keywords with lower threshold
+            let cold_start_keywords = {
+                let boosted_config = crate::embeddings::KeywordConfig {
+                    max_keywords: (10.0 / ENTITY_COLD_START_YAKE_BOOST) as usize,
+                    ..Default::default()
+                };
+                let boosted_extractor =
+                    crate::embeddings::KeywordExtractor::with_config(boosted_config);
+                boosted_extractor.extract_texts(&req.content)
+            };
+            for keyword in cold_start_keywords {
+                if seen.insert(keyword.to_lowercase()) {
+                    merged_entities.push(keyword);
+                }
+            }
+
+            // Pattern-based extraction: proper nouns, emails, URLs, paths, versions, tech names
+            let cold_start_entities =
+                cold_start_extract_entities(&req.content, &merged_entities);
+            for entity in cold_start_entities {
+                if seen.insert(entity.to_lowercase()) {
+                    merged_entities.push(entity);
+                }
+            }
+        }
+    }
+
     if merged_entities.len() > validation::MAX_ENTITIES_PER_MEMORY {
         tracing::debug!(
             count = merged_entities.len(),
@@ -692,6 +739,16 @@ pub async fn batch_remember(
     let neural_ner = state.get_neural_ner();
     let keyword_extractor = state.get_keyword_extractor();
 
+    // Check graph density once for cold-start detection (applies to all batch items)
+    let is_cold_start = {
+        use crate::constants::ENTITY_COLD_START_THRESHOLD;
+        let graph_entity_count = state
+            .get_user_graph_stats(&req.user_id)
+            .map(|s| s.entity_count)
+            .unwrap_or(0);
+        graph_entity_count < ENTITY_COLD_START_THRESHOLD
+    };
+
     // Build experiences
     let mut experiences_with_index: Vec<(
         usize,
@@ -736,6 +793,30 @@ pub async fn batch_remember(
                     merged.push(keyword);
                 }
             }
+
+            // Cold-start fallback for batch items
+            if is_cold_start && ner_records.len() < 2 {
+                use crate::constants::ENTITY_COLD_START_YAKE_BOOST;
+                use crate::embeddings::cold_start_extract_entities;
+
+                let boosted_config = crate::embeddings::KeywordConfig {
+                    max_keywords: (10.0 / ENTITY_COLD_START_YAKE_BOOST) as usize,
+                    ..Default::default()
+                };
+                let boosted_extractor =
+                    crate::embeddings::KeywordExtractor::with_config(boosted_config);
+                for keyword in boosted_extractor.extract_texts(&item.content) {
+                    if seen.insert(keyword.to_lowercase()) {
+                        merged.push(keyword);
+                    }
+                }
+                for entity in cold_start_extract_entities(&item.content, &merged) {
+                    if seen.insert(entity.to_lowercase()) {
+                        merged.push(entity);
+                    }
+                }
+            }
+
             if merged.len() > validation::MAX_ENTITIES_PER_MEMORY {
                 tracing::debug!(
                     batch_index = index,
@@ -908,6 +989,42 @@ pub async fn upsert_memory(
             merged_entities.push(keyword);
         }
     }
+
+    // Cold-start fallback for upsert
+    {
+        use crate::constants::{ENTITY_COLD_START_THRESHOLD, ENTITY_COLD_START_YAKE_BOOST};
+        use crate::embeddings::cold_start_extract_entities;
+
+        let graph_entity_count = state
+            .get_user_graph_stats(&req.user_id)
+            .map(|s| s.entity_count)
+            .unwrap_or(0);
+
+        if graph_entity_count < ENTITY_COLD_START_THRESHOLD && ner_entities.len() < 2 {
+            tracing::debug!(
+                graph_entities = graph_entity_count,
+                ner_entities = ner_entities.len(),
+                "Cold-start: running aggressive entity extraction (upsert)"
+            );
+            let boosted_config = crate::embeddings::KeywordConfig {
+                max_keywords: (10.0 / ENTITY_COLD_START_YAKE_BOOST) as usize,
+                ..Default::default()
+            };
+            let boosted_extractor =
+                crate::embeddings::KeywordExtractor::with_config(boosted_config);
+            for keyword in boosted_extractor.extract_texts(&req.content) {
+                if seen.insert(keyword.to_lowercase()) {
+                    merged_entities.push(keyword);
+                }
+            }
+            for entity in cold_start_extract_entities(&req.content, &merged_entities) {
+                if seen.insert(entity.to_lowercase()) {
+                    merged_entities.push(entity);
+                }
+            }
+        }
+    }
+
     if merged_entities.len() > validation::MAX_ENTITIES_PER_MEMORY {
         tracing::debug!(
             count = merged_entities.len(),

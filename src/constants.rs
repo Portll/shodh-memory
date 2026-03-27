@@ -4,6 +4,41 @@
 //! Centralizing constants prevents magic numbers and makes tuning easier.
 
 // =============================================================================
+// COLD-START ENTITY EXTRACTION CONSTANTS
+// When the knowledge graph is sparse (few entities), NER+YAKE pipelines miss
+// entities that richer context would catch. These constants control aggressive
+// extraction during the cold-start phase to bootstrap the graph faster.
+// =============================================================================
+
+/// Entity count threshold below which cold-start aggressive extraction is active.
+///
+/// When graph entity_count < this value, the extraction pipeline supplements
+/// NER+YAKE output with heuristic pattern matchers (mid-sentence proper nouns,
+/// email addresses, URLs, file paths, version numbers, tech names).
+///
+/// Justification:
+/// - Below 50 entities the graph lacks enough structure for spreading activation
+///   to find multi-hop paths — aggressive extraction fills the gap
+/// - Above 50, NER+YAKE produce sufficient coverage and aggressive extraction
+///   would add noise (diminishing returns above 95th percentile cold-start)
+/// - Matches typical bootstrapping window: ~25 memories × 2 entities/memory
+pub const ENTITY_COLD_START_THRESHOLD: usize = 50;
+
+/// YAKE threshold multiplier during cold-start phase.
+///
+/// During cold start, the YAKE max_keywords limit is divided by this factor,
+/// effectively extracting more keywords (lower bar for inclusion).
+///
+/// Justification:
+/// - 0.5 doubles the keyword budget (10 → 20 keywords)
+/// - More keywords = more graph nodes = faster structural convergence
+/// - Once entity_count >= ENTITY_COLD_START_THRESHOLD, reverts to default budget
+///
+/// Note: Applied as a multiplier on the importance filter, not on YAKE scores.
+/// Lower multiplier = lower threshold = more keywords pass the filter.
+pub const ENTITY_COLD_START_YAKE_BOOST: f32 = 0.5;
+
+// =============================================================================
 // HEBBIAN LEARNING CONSTANTS
 // Based on synaptic plasticity research: small incremental changes over time
 // produce stable learning. Large changes cause instability.

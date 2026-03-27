@@ -930,6 +930,283 @@ pub fn argmax_softmax(logits: &[f32]) -> Option<(usize, f32)> {
         .map(|(idx, &val)| (idx, (val - max_logit).exp() / exp_sum))
 }
 
+// =============================================================================
+// COLD-START ENTITY EXTRACTION
+// Aggressive heuristic extraction for bootstrapping sparse knowledge graphs.
+// Supplements NER+YAKE when entity_count < ENTITY_COLD_START_THRESHOLD.
+// =============================================================================
+
+/// Extract additional entities using aggressive heuristics for cold-start graphs.
+///
+/// When the graph has fewer than `ENTITY_COLD_START_THRESHOLD` entities, NER+YAKE
+/// miss entities that would be obvious to a human reader. This function catches:
+///
+/// 1. **Mid-sentence proper nouns**: Capitalized words not at sentence start
+/// 2. **Email addresses**: user@domain.com patterns
+/// 3. **URLs**: http(s)://... patterns
+/// 4. **File paths**: /foo/bar.rs, ./src/main.rs patterns
+/// 5. **Version numbers**: v1.2.3, 2.0.0-rc1 patterns
+/// 6. **Tech names**: CamelCase identifiers (PostgreSQL, FastAPI, GraphQL)
+///
+/// Returns deduplicated entity strings not already present in `existing_entities`.
+pub fn cold_start_extract_entities(text: &str, existing_entities: &[String]) -> Vec<String> {
+    use std::collections::HashSet;
+
+    let existing_lower: HashSet<String> = existing_entities
+        .iter()
+        .map(|e| e.to_lowercase())
+        .collect();
+
+    let mut extracted: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = existing_lower;
+
+    // Common stop words that appear capitalized at sentence starts
+    let stop_words: HashSet<&str> = [
+        "the", "a", "an", "is", "are", "was", "were", "be", "been", "being",
+        "have", "has", "had", "do", "does", "did", "will", "would", "could",
+        "should", "may", "might", "shall", "can", "need", "must", "it", "its",
+        "this", "that", "these", "those", "i", "we", "you", "he", "she", "they",
+        "me", "him", "her", "us", "them", "my", "your", "his", "our", "their",
+        "what", "which", "who", "whom", "where", "when", "why", "how",
+        "not", "no", "nor", "but", "or", "and", "if", "then", "else",
+        "for", "from", "with", "without", "about", "between", "through",
+        "during", "before", "after", "above", "below", "to", "of", "in", "on",
+        "at", "by", "up", "out", "off", "over", "under", "again", "further",
+        "once", "here", "there", "all", "each", "every", "both", "few", "more",
+        "most", "other", "some", "such", "only", "own", "same", "so", "than",
+        "too", "very", "just", "because", "as", "until", "while", "also",
+        "however", "although", "since", "already", "still", "yet", "now",
+    ]
+    .into_iter()
+    .collect();
+
+    let words: Vec<&str> = text.split_whitespace().collect();
+
+    // --- 1. Mid-sentence proper nouns ---
+    // Words starting with uppercase that are NOT at the start of a sentence
+    let mut i = 0;
+    while i < words.len() {
+        let word = words[i];
+        let clean = word.trim_matches(|c: char| !c.is_alphanumeric() && c != '-');
+
+        if clean.is_empty() || clean.len() < 2 {
+            i += 1;
+            continue;
+        }
+
+        let first_char = clean.chars().next().unwrap_or(' ');
+        let is_capitalized = first_char.is_uppercase();
+
+        if !is_capitalized {
+            i += 1;
+            continue;
+        }
+
+        // Check if this is at a sentence start (preceded by sentence-ending punctuation)
+        let at_sentence_start = if i == 0 {
+            true
+        } else {
+            let prev = words[i - 1];
+            prev.ends_with('.') || prev.ends_with('!') || prev.ends_with('?')
+                || prev.ends_with(':')
+        };
+
+        let lower = clean.to_lowercase();
+
+        // Skip stop words
+        if stop_words.contains(lower.as_str()) {
+            i += 1;
+            continue;
+        }
+
+        // At sentence start, only extract if it looks like a proper noun
+        // (CamelCase, all-caps acronym, or known pattern)
+        if at_sentence_start && !is_camel_case(clean) && !is_acronym(clean) {
+            i += 1;
+            continue;
+        }
+
+        // Build multi-word entity by consuming consecutive capitalized words
+        let mut entity_parts: Vec<&str> = vec![clean];
+        let mut j = i + 1;
+        while j < words.len() {
+            let next = words[j].trim_matches(|c: char| !c.is_alphanumeric() && c != '-');
+            if next.is_empty() {
+                break;
+            }
+            let next_first = next.chars().next().unwrap_or(' ');
+            if next_first.is_uppercase() || stop_words.contains(next.to_lowercase().as_str()) {
+                // Include capitalized words and connecting stop words (e.g., "Bank of America")
+                if next_first.is_uppercase() {
+                    entity_parts.push(next);
+                    j += 1;
+                } else {
+                    // Lowercase connector — only include if the NEXT word is capitalized
+                    if j + 1 < words.len() {
+                        let after = words[j + 1].trim_matches(|c: char| !c.is_alphanumeric());
+                        if after.chars().next().map(|c| c.is_uppercase()).unwrap_or(false) {
+                            entity_parts.push(next);
+                            j += 1;
+                        } else {
+                            break;
+                        }
+                    } else {
+                        break;
+                    }
+                }
+            } else {
+                break;
+            }
+        }
+
+        let entity_name = entity_parts.join(" ");
+        let entity_lower = entity_name.to_lowercase();
+
+        if !seen.contains(&entity_lower) && entity_lower.len() >= 2 {
+            seen.insert(entity_lower);
+            extracted.push(entity_name);
+        }
+
+        // Skip past consumed words
+        i = j;
+    }
+
+    // --- 2. Email addresses ---
+    for word in &words {
+        let clean = word.trim_matches(|c: char| !c.is_alphanumeric() && c != '@' && c != '.' && c != '-' && c != '_' && c != '+');
+        if clean.contains('@') && clean.contains('.') {
+            // Basic email validation: has @ with text before and after, has . after @
+            let parts: Vec<&str> = clean.splitn(2, '@').collect();
+            if parts.len() == 2 && !parts[0].is_empty() && parts[1].contains('.') {
+                let lower = clean.to_lowercase();
+                if !seen.contains(&lower) {
+                    seen.insert(lower);
+                    extracted.push(clean.to_string());
+                }
+            }
+        }
+    }
+
+    // --- 3. URLs ---
+    for word in &words {
+        let clean = word.trim_matches(|c: char| c == '(' || c == ')' || c == '<' || c == '>' || c == '"' || c == '\'');
+        if (clean.starts_with("http://") || clean.starts_with("https://"))
+            && clean.len() > 10
+        {
+            let lower = clean.to_lowercase();
+            if !seen.contains(&lower) {
+                seen.insert(lower);
+                extracted.push(clean.to_string());
+            }
+        }
+    }
+
+    // --- 4. File paths ---
+    for word in &words {
+        let clean = word.trim_matches(|c: char| c == '"' || c == '\'' || c == '`' || c == '(' || c == ')' || c == ',');
+        // Unix-style paths: /foo/bar or ./foo/bar
+        if (clean.starts_with('/') || clean.starts_with("./") || clean.starts_with("../"))
+            && clean.contains('/')
+            && clean.len() >= 4
+            && !clean.starts_with("http")
+        {
+            let lower = clean.to_lowercase();
+            if !seen.contains(&lower) {
+                seen.insert(lower);
+                extracted.push(clean.to_string());
+            }
+        }
+    }
+
+    // --- 5. Version numbers ---
+    for word in &words {
+        let clean = word.trim_matches(|c: char| c == '(' || c == ')' || c == ',' || c == ';');
+        if is_version_number(clean) {
+            let lower = clean.to_lowercase();
+            if !seen.contains(&lower) {
+                seen.insert(lower);
+                extracted.push(clean.to_string());
+            }
+        }
+    }
+
+    // --- 6. CamelCase tech names (not caught by proper noun detection) ---
+    for word in &words {
+        let clean = word.trim_matches(|c: char| !c.is_alphanumeric());
+        if clean.len() >= 3 && is_camel_case(clean) {
+            let lower = clean.to_lowercase();
+            if !seen.contains(&lower) && !stop_words.contains(lower.as_str()) {
+                seen.insert(lower);
+                extracted.push(clean.to_string());
+            }
+        }
+    }
+
+    extracted
+}
+
+/// Check if a word is CamelCase (e.g., PostgreSQL, FastAPI, GraphQL, RocksDB).
+/// Requires at least one uppercase letter after the first character position.
+fn is_camel_case(word: &str) -> bool {
+    if word.len() < 3 {
+        return false;
+    }
+    let mut chars = word.chars();
+    let first = match chars.next() {
+        Some(c) => c,
+        None => return false,
+    };
+    if !first.is_uppercase() {
+        return false;
+    }
+    let mut has_lower = false;
+    let mut has_upper_after_first = false;
+    for c in chars {
+        if c.is_lowercase() {
+            has_lower = true;
+        } else if c.is_uppercase() {
+            has_upper_after_first = true;
+        }
+    }
+    // CamelCase requires both: at least one lowercase and one uppercase after first char
+    // This distinguishes "PostgreSQL" from "USA" (acronyms handled separately)
+    has_lower && has_upper_after_first
+}
+
+/// Check if a word is an acronym (2-5 uppercase letters, optionally with digits).
+fn is_acronym(word: &str) -> bool {
+    let len = word.len();
+    if !(2..=6).contains(&len) {
+        return false;
+    }
+    word.chars().all(|c| c.is_uppercase() || c.is_ascii_digit())
+        && word.chars().any(|c| c.is_uppercase())
+}
+
+/// Check if a string looks like a version number: v1.2.3, 2.0.0, 1.0.0-rc1, etc.
+fn is_version_number(s: &str) -> bool {
+    if s.is_empty() {
+        return false;
+    }
+    let digits_part = if s.starts_with('v') || s.starts_with('V') {
+        &s[1..]
+    } else {
+        s
+    };
+    if digits_part.is_empty() {
+        return false;
+    }
+    // Must start with a digit and contain at least one dot
+    let first = digits_part.chars().next().unwrap_or(' ');
+    if !first.is_ascii_digit() || !digits_part.contains('.') {
+        return false;
+    }
+    // Allow digits, dots, hyphens (for pre-release tags like -rc1, -beta.2)
+    digits_part
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1405,5 +1682,189 @@ mod tests {
                 "{city} should be Location"
             );
         }
+    }
+
+    // ==================== Cold-Start Extraction Tests ====================
+
+    #[test]
+    fn test_cold_start_mid_sentence_proper_nouns() {
+        let existing: Vec<String> = vec![];
+        let text = "Yesterday I met with Caroline at the Anthropic office in San Francisco.";
+        let entities = cold_start_extract_entities(text, &existing);
+
+        let lower: Vec<String> = entities.iter().map(|e| e.to_lowercase()).collect();
+        assert!(
+            lower.contains(&"caroline".to_string()),
+            "Should extract mid-sentence proper noun 'Caroline': {entities:?}"
+        );
+        assert!(
+            lower.contains(&"anthropic".to_string()),
+            "Should extract mid-sentence proper noun 'Anthropic': {entities:?}"
+        );
+    }
+
+    #[test]
+    fn test_cold_start_multi_word_entities() {
+        let existing: Vec<String> = vec![];
+        let text = "The project uses Bank of America and New York offices.";
+        let entities = cold_start_extract_entities(text, &existing);
+        let joined = entities.join(", ").to_lowercase();
+        assert!(
+            joined.contains("bank of america") || joined.contains("new york"),
+            "Should extract multi-word entities: {entities:?}"
+        );
+    }
+
+    #[test]
+    fn test_cold_start_emails() {
+        let existing: Vec<String> = vec![];
+        let text = "Contact john.doe@example.com or support@anthropic.com for help.";
+        let entities = cold_start_extract_entities(text, &existing);
+        let lower: Vec<String> = entities.iter().map(|e| e.to_lowercase()).collect();
+        assert!(
+            lower.contains(&"john.doe@example.com".to_string()),
+            "Should extract email: {entities:?}"
+        );
+        assert!(
+            lower.contains(&"support@anthropic.com".to_string()),
+            "Should extract email: {entities:?}"
+        );
+    }
+
+    #[test]
+    fn test_cold_start_urls() {
+        let existing: Vec<String> = vec![];
+        let text = "Check https://github.com/anthropic/shodh for details.";
+        let entities = cold_start_extract_entities(text, &existing);
+        assert!(
+            entities.iter().any(|e| e.starts_with("https://")),
+            "Should extract URL: {entities:?}"
+        );
+    }
+
+    #[test]
+    fn test_cold_start_file_paths() {
+        let existing: Vec<String> = vec![];
+        let text = "Edit the file at /src/main.rs and ./config/settings.toml for configuration.";
+        let entities = cold_start_extract_entities(text, &existing);
+        assert!(
+            entities.iter().any(|e| e.contains("/src/main.rs") || e.contains("./config/settings.toml")),
+            "Should extract file paths: {entities:?}"
+        );
+    }
+
+    #[test]
+    fn test_cold_start_version_numbers() {
+        let existing: Vec<String> = vec![];
+        let text = "Upgraded from v1.2.3 to 2.0.0-rc1 yesterday.";
+        let entities = cold_start_extract_entities(text, &existing);
+        assert!(
+            entities.iter().any(|e| e == "v1.2.3"),
+            "Should extract version v1.2.3: {entities:?}"
+        );
+        assert!(
+            entities.iter().any(|e| e == "2.0.0-rc1"),
+            "Should extract version 2.0.0-rc1: {entities:?}"
+        );
+    }
+
+    #[test]
+    fn test_cold_start_camel_case_tech() {
+        let existing: Vec<String> = vec![];
+        let text = "We use PostgreSQL with GraphQL and FastAPI for the backend.";
+        let entities = cold_start_extract_entities(text, &existing);
+        let lower: Vec<String> = entities.iter().map(|e| e.to_lowercase()).collect();
+        assert!(
+            lower.contains(&"postgresql".to_string()),
+            "Should extract CamelCase tech: {entities:?}"
+        );
+        assert!(
+            lower.contains(&"graphql".to_string()),
+            "Should extract CamelCase tech: {entities:?}"
+        );
+        assert!(
+            lower.contains(&"fastapi".to_string()),
+            "Should extract CamelCase tech: {entities:?}"
+        );
+    }
+
+    #[test]
+    fn test_cold_start_dedup_with_existing() {
+        let existing = vec!["PostgreSQL".to_string(), "Caroline".to_string()];
+        let text = "Caroline uses PostgreSQL and GraphQL at Anthropic.";
+        let entities = cold_start_extract_entities(text, &existing);
+
+        // Should NOT re-extract existing entities
+        let lower: Vec<String> = entities.iter().map(|e| e.to_lowercase()).collect();
+        assert!(
+            !lower.contains(&"postgresql".to_string()),
+            "Should not duplicate existing entity 'PostgreSQL': {entities:?}"
+        );
+        assert!(
+            !lower.contains(&"caroline".to_string()),
+            "Should not duplicate existing entity 'Caroline': {entities:?}"
+        );
+        // But should still extract new ones
+        assert!(
+            lower.contains(&"graphql".to_string()) || lower.contains(&"anthropic".to_string()),
+            "Should still extract new entities: {entities:?}"
+        );
+    }
+
+    #[test]
+    fn test_cold_start_skips_sentence_start_common_words() {
+        let existing: Vec<String> = vec![];
+        let text = "The system is running. However, it needs updates. Also check the logs.";
+        let entities = cold_start_extract_entities(text, &existing);
+
+        // Common words at sentence starts should NOT be extracted
+        let lower: Vec<String> = entities.iter().map(|e| e.to_lowercase()).collect();
+        assert!(
+            !lower.contains(&"the".to_string()),
+            "Should not extract 'The': {entities:?}"
+        );
+        assert!(
+            !lower.contains(&"however".to_string()),
+            "Should not extract 'However': {entities:?}"
+        );
+        assert!(
+            !lower.contains(&"also".to_string()),
+            "Should not extract 'Also': {entities:?}"
+        );
+    }
+
+    #[test]
+    fn test_is_camel_case() {
+        assert!(is_camel_case("PostgreSQL"));
+        assert!(is_camel_case("GraphQL"));
+        assert!(is_camel_case("FastAPI"));
+        assert!(is_camel_case("RocksDB"));
+        assert!(!is_camel_case("USA")); // All caps = acronym, not CamelCase
+        assert!(!is_camel_case("hello")); // All lowercase
+        assert!(!is_camel_case("Hi")); // Too short
+        assert!(!is_camel_case("CONSTANT")); // All uppercase
+    }
+
+    #[test]
+    fn test_is_acronym() {
+        assert!(is_acronym("USA"));
+        assert!(is_acronym("API"));
+        assert!(is_acronym("AWS"));
+        assert!(is_acronym("S3")); // Uppercase + digit
+        assert!(!is_acronym("A")); // Too short (1 char)
+        assert!(!is_acronym("TOOLONGACRONYM")); // Too long (>6)
+        assert!(!is_acronym("hello")); // Not uppercase
+    }
+
+    #[test]
+    fn test_is_version_number() {
+        assert!(is_version_number("v1.2.3"));
+        assert!(is_version_number("2.0.0"));
+        assert!(is_version_number("2.0.0-rc1"));
+        assert!(is_version_number("V1.0.0-beta.2"));
+        assert!(!is_version_number("hello"));
+        assert!(!is_version_number("v"));
+        assert!(!is_version_number("123"));  // No dot
+        assert!(!is_version_number(""));
     }
 }
