@@ -1692,6 +1692,13 @@ pub const SEMANTIC_CLUSTER_THRESHOLD: f32 = 0.75;
 /// - Longer windows would merge unrelated sessions
 pub const TEMPORAL_CLUSTER_WINDOW_SECS: i64 = 1800;
 
+/// Minimum inter-memory gap (seconds) marking a session boundary.
+/// Haar wavelet coefficient at this scale exceeds threshold iff gap > 7200s.
+pub const SESSION_GAP_THRESHOLD_SECS: i64 = 7200;
+
+/// Additive RRF boost for memories in an ordinal-resolved session.
+pub const ORDINAL_SESSION_BOOST: f32 = 0.30;
+
 /// Minimum memories required for temporal cluster trigger
 ///
 /// Justification:
