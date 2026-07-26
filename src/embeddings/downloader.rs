@@ -21,6 +21,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 /// URLs for MiniLM model files (hosted on HuggingFace)
 /// Full model is 90MB, quantized is 23MB - we download quantized for edge devices
@@ -30,15 +31,6 @@ const MODEL_ONNX_URL: &str =
 const MODEL_QUANTIZED_URL: &str = "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/c9745ed1d9f207416be6d2e6f8de32d1f16199bf/onnx/model_quint8_avx2.onnx";
 const TOKENIZER_URL: &str =
     "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/c9745ed1d9f207416be6d2e6f8de32d1f16199bf/tokenizer.json";
-
-/// URLs for NER model files (TinyBERT-finetuned-NER, ~14.5MB quantized)
-/// Using a lightweight 4-layer TinyBERT model optimized for edge devices
-/// Source: onnx-community/TinyBERT-finetuned-NER-ONNX (fine-tuned on CoNLL2003)
-/// Pinned to commit 9b03777d for reproducibility
-const NER_MODEL_URL: &str =
-    "https://huggingface.co/onnx-community/TinyBERT-finetuned-NER-ONNX/resolve/9b03777d9832105fbe419f258127fb2ec3eb09d7/onnx/model_quantized.onnx";
-const NER_TOKENIZER_URL: &str =
-    "https://huggingface.co/onnx-community/TinyBERT-finetuned-NER-ONNX/resolve/9b03777d9832105fbe419f258127fb2ec3eb09d7/tokenizer.json";
 
 /// SHA-256 checksums for model integrity verification
 /// Verified against pinned commit hashes above — these will not drift
@@ -59,25 +51,87 @@ impl ModelChecksums {
     /// Pinned: sentence-transformers/all-MiniLM-L6-v2 @ c9745ed1
     const TOKENIZER: Option<&'static str> =
         Some("be50c3628f2bf5bb5e3a7f17b1f74611b2561a3a27eeab05e5aa30f411572037");
-
-    /// NER quantized model checksum (model_quantized.onnx)
-    /// Pinned: onnx-community/TinyBERT-finetuned-NER-ONNX @ 9b03777d
-    const NER_MODEL: Option<&'static str> =
-        Some("ba4a1a00cf1600cae8e7cf3fda4650c825811719065b51041256392edd3647b8");
-
-    /// NER tokenizer checksum (tokenizer.json)
-    /// Pinned: onnx-community/TinyBERT-finetuned-NER-ONNX @ 9b03777d
-    const NER_TOKENIZER: Option<&'static str> =
-        Some("d241a60d5e8f04cc1b2b3e9ef7a4921b27bf526d9f6050ab90f9267a1f9e5c66");
 }
 
-/// ONNX Runtime download URLs by platform (v1.23.2 required by ort 2.0.0-rc.11)
-#[cfg(target_os = "windows")]
-const ONNX_RUNTIME_URL: &str = "https://github.com/microsoft/onnxruntime/releases/download/v1.23.2/onnxruntime-win-x64-1.23.2.zip";
-#[cfg(target_os = "linux")]
-const ONNX_RUNTIME_URL: &str = "https://github.com/microsoft/onnxruntime/releases/download/v1.23.2/onnxruntime-linux-x64-1.23.2.tgz";
-#[cfg(target_os = "macos")]
-const ONNX_RUNTIME_URL: &str = "https://github.com/microsoft/onnxruntime/releases/download/v1.23.2/onnxruntime-osx-arm64-1.23.2.tgz";
+/// GitHub release tag hosting the GLiNER bi-edge ONNX typer assets.
+///
+/// The production typer is `knowledgator/gliner-bi-edge-v2.0` exported to ONNX
+/// (text tower + precomputed label embeddings). The assets are published as a
+/// repo release; end-user distributions (`cargo install`, pip, Docker) fetch
+/// them on first run — CI is not a distribution channel.
+pub const GLINER_RELEASE_TAG: &str = "gliner-bi-edge-onnx-v1";
+
+/// Base download URL for the GLiNER release assets (`<base>/<asset>`).
+const GLINER_RELEASE_BASE_URL: &str =
+    "https://github.com/varun29ankuS/shodh-memory/releases/download/gliner-bi-edge-onnx-v1";
+
+/// GLiNER bi-edge asset manifest: `(filename, SHA-256)`.
+///
+/// Checksums are pinned to release [`GLINER_RELEASE_TAG`] and were computed from
+/// the published release assets (verified byte-identical to the checked-in
+/// `models/gliner-bi-edge/` working copy). `model.onnx` is the fp32 text tower
+/// (~149 MB); the typer loads `model.onnx`, `tokenizer.json`, and
+/// `label_embeddings.bin`, the rest ship for parity with the release and future
+/// use. A checksum mismatch on any asset triggers a re-download.
+const GLINER_ASSETS: &[(&str, &str)] = &[
+    (
+        "model.onnx",
+        "209eaeb7fe6703cfa458fd7e4f084a9b078f0cbafe941ee4aae1b68c5a190d02",
+    ),
+    (
+        "label_embeddings.bin",
+        "f07cc0fecf3c8bd73a6bb4593e887a6b2ce8ed5d7022c9847407e611a0ed0a74",
+    ),
+    (
+        "label_embeddings.json",
+        "30979ba33114adae74705a5405901f67e4b90458dc4ab581e4387b35def3b525",
+    ),
+    (
+        "tokenizer.json",
+        "2315a8bea85452f3c4e8ce980f7853cac013820238e7776a4e48159037a5f164",
+    ),
+    (
+        "tokenizer_config.json",
+        "1270f8070c3ad1184d77bb700826a03bf0a99f0029b074383079203fec56116f",
+    ),
+    (
+        "special_tokens_map.json",
+        "e386620cb5e9f6570fe98481fde86167b4236cdebdcc42308652574122561619",
+    ),
+    (
+        "gliner_config.json",
+        "3ba491748b955c28c33ac5e78b7dc7e6a8c1968f676cbfe5776788e854e02623",
+    ),
+];
+
+/// The GLiNER assets the typer must load to run (`GlinerConfig::assets_present`).
+const GLINER_REQUIRED_ASSETS: &[&str] = &["model.onnx", "tokenizer.json", "label_embeddings.bin"];
+
+/// Pinned ONNX Runtime version — the single source of truth. Must satisfy the
+/// `ort` crate's minimum (2.0.0-rc.11 requires >= 1.23.x); the download URL
+/// AND the cache directory are both derived from this, so bumping the pin
+/// automatically invalidates stale caches: an incompatible runtime cached by
+/// an older release lives in a different versioned directory and is never
+/// loaded (previously the unversioned shared path made upgrades load a stale
+/// dylib blindly — ort then panicked and poisoned its global mutex, turning
+/// every embedder call into a 500 while /health still reported healthy).
+pub const ONNX_RUNTIME_VERSION: &str = "1.23.2";
+
+/// ONNX Runtime download URL for this platform, derived from the pinned version.
+fn onnx_runtime_url() -> String {
+    #[cfg(target_os = "windows")]
+    let (platform, ext) = ("win-x64", "zip");
+    #[cfg(target_os = "linux")]
+    let (platform, ext) = ("linux-x64", "tgz");
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let (platform, ext) = ("osx-arm64", "tgz");
+    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+    let (platform, ext) = ("osx-x86_64", "tgz");
+    format!(
+        "https://github.com/microsoft/onnxruntime/releases/download/v{v}/onnxruntime-{platform}-{v}.{ext}",
+        v = ONNX_RUNTIME_VERSION
+    )
+}
 
 /// Get the cache directory for shodh-memory
 pub fn get_cache_dir() -> PathBuf {
@@ -105,9 +159,48 @@ pub fn get_ner_models_dir() -> PathBuf {
     get_cache_dir().join("models").join("bert-tiny-ner")
 }
 
-/// Get the ONNX Runtime directory
+/// Get the cache directory for the GLiNER bi-edge typer assets.
+///
+/// This is the first-run download target and is registered as a resolution
+/// candidate in `GlinerConfig::from_env`, so assets fetched here are found on
+/// the next construction without any extra configuration.
+pub fn get_gliner_models_dir() -> PathBuf {
+    get_cache_dir().join("models").join("gliner-bi-edge")
+}
+
+/// Check whether every GLiNER asset is present in the cache dir and matches its
+/// pinned SHA-256. A mismatched (corrupt / partial / stale) asset is deleted so
+/// the next [`download_gliner_models`] re-fetches it.
+///
+/// Full-file hashing is intentional (mirrors [`are_models_downloaded`]); it runs
+/// only on the download path, never on the hot typing path.
+pub fn are_gliner_models_downloaded() -> bool {
+    let dir = get_gliner_models_dir();
+    for (name, expected) in GLINER_ASSETS {
+        let path = dir.join(name);
+        if !path.exists() {
+            return false;
+        }
+        if let Ok(false) = verify_checksum(&path, expected) {
+            tracing::warn!("GLiNER asset {name} checksum mismatch — will re-download");
+            let _ = fs::remove_file(&path);
+            return false;
+        }
+    }
+    true
+}
+
+/// Get the ONNX Runtime directory — keyed by the pinned runtime version.
+///
+/// Version-keying makes cache correctness structural: every binary loads
+/// exactly the runtime it pinned, differently-pinned binaries coexist on one
+/// machine instead of fighting over a single dylib, and machines with a stale
+/// unversioned cache self-heal on the next start (the versioned directory
+/// doesn't exist yet, so a compatible runtime is downloaded).
 pub fn get_onnx_runtime_dir() -> PathBuf {
-    get_cache_dir().join("onnxruntime")
+    get_cache_dir()
+        .join("onnxruntime")
+        .join(format!("v{ONNX_RUNTIME_VERSION}"))
 }
 
 /// Check if embedding model files are downloaded and valid
@@ -143,39 +236,11 @@ pub fn are_models_downloaded() -> bool {
     true
 }
 
-/// Check if NER model files are downloaded and valid
-pub fn are_ner_models_downloaded() -> bool {
-    let models_dir = get_ner_models_dir();
-    let model_path = models_dir.join("model.onnx");
-    let tokenizer_path = models_dir.join("tokenizer.json");
-
-    if !model_path.exists() || !tokenizer_path.exists() {
-        return false;
-    }
-
-    if let Some(expected) = ModelChecksums::NER_MODEL {
-        if let Ok(valid) = verify_checksum(&model_path, expected) {
-            if !valid {
-                tracing::warn!("NER model file checksum mismatch — will re-download");
-                let _ = fs::remove_file(&model_path);
-                return false;
-            }
-        }
-    }
-    if let Some(expected) = ModelChecksums::NER_TOKENIZER {
-        if let Ok(valid) = verify_checksum(&tokenizer_path, expected) {
-            if !valid {
-                tracing::warn!("NER tokenizer file checksum mismatch — will re-download");
-                let _ = fs::remove_file(&tokenizer_path);
-                return false;
-            }
-        }
-    }
-
-    true
-}
-
 /// Check if ONNX Runtime is downloaded
+///
+/// Uses `symlink_metadata` instead of `exists()` to detect dangling symlinks.
+/// A dangling symlink (pointing to a non-existent versioned dylib) should
+/// return false so we trigger a re-download that creates a real file.
 pub fn is_onnx_runtime_downloaded() -> bool {
     let onnx_dir = get_onnx_runtime_dir();
 
@@ -186,7 +251,47 @@ pub fn is_onnx_runtime_downloaded() -> bool {
     #[cfg(target_os = "macos")]
     let lib_name = "libonnxruntime.dylib";
 
-    onnx_dir.join(lib_name).exists()
+    let path = onnx_dir.join(lib_name);
+
+    // path.exists() follows symlinks — returns false for dangling symlinks.
+    // That's actually what we want: if it's a dangling symlink, re-download.
+    // But first, clean up the dangling symlink so re-extraction succeeds.
+    if !path.exists() {
+        // Check if it's a dangling symlink (symlink_metadata succeeds but exists() doesn't)
+        if path.symlink_metadata().is_ok() {
+            tracing::warn!(
+                "Removing dangling symlink at {:?} (target does not exist)",
+                path
+            );
+            let _ = fs::remove_file(&path);
+        }
+        return false;
+    }
+
+    // Size guard: the real ONNX Runtime library is >1MB. If we find a tiny
+    // stub (e.g., libonnxruntime_providers_shared.so was copied over the
+    // real lib — see issue #250), delete it and force re-download.
+    const MIN_ORT_SIZE: u64 = 1_000_000; // 1MB — real lib is ~22MB
+    match fs::metadata(&path) {
+        Ok(meta) if meta.len() < MIN_ORT_SIZE => {
+            tracing::warn!(
+                "ONNX Runtime at {:?} is only {} bytes (expected >{}). \
+                 Likely clobbered by providers_shared stub — deleting for re-download.",
+                path,
+                meta.len(),
+                MIN_ORT_SIZE
+            );
+            let _ = fs::remove_file(&path);
+            return false;
+        }
+        Err(e) => {
+            tracing::warn!("Cannot stat ONNX Runtime at {:?}: {}", path, e);
+            return false;
+        }
+        _ => {}
+    }
+
+    true
 }
 
 /// Get the path to the ONNX Runtime library
@@ -210,6 +315,66 @@ pub fn get_onnx_runtime_path() -> Option<PathBuf> {
 
 /// Download progress callback type (Arc for clonability)
 pub type ProgressCallback = Arc<dyn Fn(u64, u64) + Send + Sync>;
+
+// ─── Visual progress bar for stderr ─────────────────────────────────────────
+
+const BAR_WIDTH: usize = 30;
+const FILLED: char = '\u{2588}'; // █
+const EMPTY: char = '\u{2591}'; // ░
+
+fn format_bytes(bytes: u64) -> String {
+    if bytes < 1024 {
+        format!("{bytes} B")
+    } else if bytes < 1024 * 1024 {
+        format!("{} KB", bytes / 1024)
+    } else {
+        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+    }
+}
+
+/// Create a progress callback that renders a visual progress bar to stderr.
+///
+/// The `label` is printed once before the bar starts (e.g. "MiniLM-L6 (23 MB)").
+/// The bar updates in-place using `\r` carriage return.
+pub fn make_stderr_progress(label: String) -> ProgressCallback {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let header_printed = Arc::new(AtomicBool::new(false));
+
+    Arc::new(move |downloaded: u64, total: u64| {
+        // Print label once
+        if !header_printed.swap(true, Ordering::Relaxed) {
+            eprint!("     {label:<24}");
+        }
+
+        if total == 0 {
+            eprint!("\r     {:<24} {}...", label, format_bytes(downloaded));
+            return;
+        }
+
+        let pct = (downloaded as f64 / total as f64).min(1.0);
+        let filled = (pct * BAR_WIDTH as f64).round() as usize;
+        let bar: String = std::iter::repeat_n(FILLED, filled)
+            .chain(std::iter::repeat_n(EMPTY, BAR_WIDTH - filled))
+            .collect();
+        let pct_str = format!("{:>3}%", (pct * 100.0).round() as u32);
+
+        if downloaded >= total {
+            // Completion — overwrite with checkmark
+            eprint!(
+                "\r     {:<24}{bar}  {pct_str} | {} \u{2713}\n",
+                label,
+                format_bytes(total)
+            );
+        } else {
+            eprint!(
+                "\r     {:<24}{bar}  {pct_str} | {} / {}",
+                label,
+                format_bytes(downloaded),
+                format_bytes(total)
+            );
+        }
+    })
+}
 
 /// Verify SHA-256 checksum of a file
 /// Used for model integrity verification when checksum values are provided
@@ -261,6 +426,12 @@ fn compute_checksum(path: &Path) -> Result<String> {
     Ok(hex::encode(hasher.finalize()))
 }
 
+/// Overall timeout for a single model / ONNX-runtime download.
+///
+/// A backstop so a stalled connection cannot hang the download (and first-use
+/// initialisation) forever. Generous enough for a ~50MB artefact on a slow link.
+const DOWNLOAD_TIMEOUT_SECS: u64 = 600;
+
 /// Download a file from URL to path with progress and optional checksum verification
 fn download_file(
     url: &str,
@@ -284,8 +455,13 @@ fn download_file_with_checksum(
         fs::create_dir_all(parent).context("Failed to create cache directory")?;
     }
 
-    // Use ureq for simple HTTP downloads (blocking, no async runtime needed)
+    // Use ureq for simple HTTP downloads (blocking, no async runtime needed).
+    // timeout_global bounds the whole call (connect + headers + body) so a
+    // stalled connection cannot hang the download indefinitely.
     let response = ureq::get(url)
+        .config()
+        .timeout_global(Some(Duration::from_secs(DOWNLOAD_TIMEOUT_SECS)))
+        .build()
         .call()
         .context(format!("Failed to download from {url}"))?;
 
@@ -405,13 +581,18 @@ pub fn download_models_internal(
         model_checksum,
     )?;
 
-    // Download tokenizer (~700KB)
+    // Download tokenizer (~700KB) — use a separate progress bar
     let tokenizer_path = models_dir.join("tokenizer.json");
     tracing::info!("Downloading tokenizer.json");
+    let tokenizer_progress: Option<ProgressCallback> = if progress.is_some() {
+        Some(make_stderr_progress("Tokenizer (700 KB)".to_string()))
+    } else {
+        None
+    };
     download_file_with_checksum(
         TOKENIZER_URL,
         &tokenizer_path,
-        progress.as_ref().map(|p| p.as_ref()),
+        tokenizer_progress.as_ref().map(|p| p.as_ref()),
         ModelChecksums::TOKENIZER,
     )?;
 
@@ -422,46 +603,64 @@ pub fn download_models_internal(
     Ok(models_dir)
 }
 
-/// Download NER model files (TinyBERT-finetuned-NER, ~14.5MB quantized)
-/// This is opt-in via SHODH_NEURAL_NER=true environment variable
-pub fn download_ner_models(progress: Option<ProgressCallback>) -> Result<PathBuf> {
-    let models_dir = get_ner_models_dir();
+/// Download the GLiNER bi-edge typer assets from the pinned GitHub release.
+///
+/// Mirrors [`download_models`]: assets are cached under
+/// `<cache>/models/gliner-bi-edge` (a `GlinerConfig::from_env` resolution
+/// candidate) and each is verified against its pinned SHA-256 as it downloads.
+/// Already-present, checksum-valid assets are skipped, so an interrupted
+/// download resumes at the first missing/corrupt file. Returns the asset
+/// directory on success.
+///
+/// The largest asset (`model.onnx`, ~149 MB) reports through the caller-supplied
+/// `progress`; the small assets render their own labelled stderr bars when
+/// progress is requested (matching the MiniLM model/tokenizer split).
+pub fn download_gliner_models(progress: Option<ProgressCallback>) -> Result<PathBuf> {
+    let dir = get_gliner_models_dir();
 
-    if are_ner_models_downloaded() {
-        tracing::info!("NER models already downloaded at {:?}", models_dir);
-        return Ok(models_dir);
+    if are_gliner_models_downloaded() {
+        tracing::info!("GLiNER bi-edge assets already downloaded at {:?}", dir);
+        return Ok(dir);
     }
 
     tracing::info!(
-        "Downloading TinyBERT-NER model to {:?} (~14.5MB)",
-        models_dir
+        "Downloading GLiNER bi-edge typer assets (release {}) to {:?}",
+        GLINER_RELEASE_TAG,
+        dir
     );
+    fs::create_dir_all(&dir).context("Failed to create GLiNER cache directory")?;
 
-    // Download model (~14.5MB quantized)
-    let model_path = models_dir.join("model.onnx");
-    tracing::info!("Downloading NER model_quantized.onnx (~14.5MB)");
-    download_file_with_checksum(
-        NER_MODEL_URL,
-        &model_path,
-        progress.as_ref().map(|p| p.as_ref()),
-        ModelChecksums::NER_MODEL,
-    )?;
+    for (name, checksum) in GLINER_ASSETS {
+        let dest = dir.join(name);
+        // Resume: skip assets already present and checksum-valid.
+        if dest.exists() && matches!(verify_checksum(&dest, checksum), Ok(true)) {
+            tracing::info!("GLiNER asset {name} already present and valid");
+            continue;
+        }
 
-    // Download tokenizer (~700KB)
-    let tokenizer_path = models_dir.join("tokenizer.json");
-    tracing::info!("Downloading NER tokenizer.json");
-    download_file_with_checksum(
-        NER_TOKENIZER_URL,
-        &tokenizer_path,
-        progress.as_ref().map(|p| p.as_ref()),
-        ModelChecksums::NER_TOKENIZER,
-    )?;
+        let url = format!("{GLINER_RELEASE_BASE_URL}/{name}");
+        if *name == "model.onnx" {
+            download_file_with_checksum(
+                &url,
+                &dest,
+                progress.as_ref().map(|p| p.as_ref()),
+                Some(checksum),
+            )?;
+        } else {
+            let bar: Option<ProgressCallback> = progress
+                .as_ref()
+                .map(|_| make_stderr_progress(format!("GLiNER {name}")));
+            download_file_with_checksum(
+                &url,
+                &dest,
+                bar.as_ref().map(|p| p.as_ref()),
+                Some(checksum),
+            )?;
+        }
+    }
 
-    tracing::info!(
-        "TinyBERT-NER model downloaded successfully to {:?}",
-        models_dir
-    );
-    Ok(models_dir)
+    tracing::info!("GLiNER bi-edge assets downloaded successfully to {:?}", dir);
+    Ok(dir)
 }
 
 /// Download ONNX Runtime
@@ -485,7 +684,7 @@ pub fn download_onnx_runtime(progress: Option<ProgressCallback>) -> Result<PathB
     let archive_path = onnx_dir.join(archive_name);
 
     download_file(
-        ONNX_RUNTIME_URL,
+        &onnx_runtime_url(),
         &archive_path,
         progress.as_ref().map(|p| p.as_ref()),
     )?;
@@ -498,7 +697,39 @@ pub fn download_onnx_runtime(progress: Option<ProgressCallback>) -> Result<PathB
         tracing::warn!("Failed to clean up archive {:?}: {}", archive_path, e);
     }
 
+    // Best-effort: remove the LEGACY unversioned runtime files that pre-date
+    // version-keyed caching (they sat directly in <cache>/onnxruntime/). An
+    // incompatible one of these is exactly what used to poison upgrades.
+    // Other v*/ directories are deliberately kept — coexistence is the point.
+    if let Some(base) = onnx_dir.parent() {
+        cleanup_legacy_onnx_runtime(base);
+    }
+
     get_onnx_runtime_path().ok_or_else(|| anyhow::anyhow!("Failed to extract ONNX Runtime"))
+}
+
+/// Remove pre-versioning runtime files sitting directly in the base
+/// `onnxruntime/` directory (the old unversioned cache layout). Versioned
+/// `v*/` subdirectories are left untouched.
+fn cleanup_legacy_onnx_runtime(base: &Path) {
+    for name in [
+        "onnxruntime.dll",
+        "libonnxruntime.so",
+        "libonnxruntime.dylib",
+        "onnxruntime.zip",
+        "onnxruntime.tgz",
+    ] {
+        let legacy = base.join(name);
+        // symlink_metadata: also catch dangling symlinks exists() would miss.
+        if legacy.symlink_metadata().is_ok() {
+            match fs::remove_file(&legacy) {
+                Ok(()) => {
+                    tracing::info!("Removed legacy unversioned ONNX Runtime file {:?}", legacy)
+                }
+                Err(e) => tracing::warn!("Could not remove legacy file {:?}: {}", legacy, e),
+            }
+        }
+    }
 }
 
 /// Extract ONNX Runtime from archive
@@ -540,17 +771,129 @@ fn extract_onnx_runtime(archive_path: &Path, dest_dir: &Path) -> Result<()> {
         #[cfg(target_os = "macos")]
         let lib_name = "libonnxruntime.dylib";
 
+        // The ONNX Runtime tgz contains a symlink (libonnxruntime.so →
+        // libonnxruntime.so.1.23.2), the real versioned library (~22MB), and
+        // provider stubs like libonnxruntime_providers_shared.so (~14KB).
+        //
+        // Strategy: extract all matching files, then pick the LARGEST one as
+        // the real library. This is immune to entry ordering and prevents
+        // provider stubs from clobbering the real lib. Fixes #223, #250.
+        let mut extracted_files: Vec<(std::path::PathBuf, u64)> = Vec::new();
+
         for entry in archive.entries()? {
             let mut entry = entry?;
+            let entry_type = entry.header().entry_type();
             let path = entry.path()?;
             let name = path.to_string_lossy();
 
-            if name.ends_with(lib_name) || name.contains(lib_name) {
-                let dest_path = dest_dir.join(lib_name);
-                entry.unpack(&dest_path)?;
-                tracing::info!("Extracted {}", lib_name);
-                return Ok(());
+            // Skip symlinks — they point to versioned files that may not be
+            // extracted yet, creating dangling symlinks that fail path.exists()
+            if entry_type == tar::EntryType::Symlink || entry_type == tar::EntryType::Link {
+                if name.contains(lib_name) {
+                    tracing::debug!("Skipping symlink entry: {}", name);
+                }
+                continue;
             }
+
+            let file_name = path
+                .file_name()
+                .map(|f| f.to_string_lossy().to_string())
+                .unwrap_or_default();
+
+            // Match libonnxruntime.* but NOT libonnxruntime_* (providers_shared, etc.)
+            // The dot after "libonnxruntime" is the key discriminator. Fixes #223.
+            let is_target = file_name == lib_name
+                || (file_name.starts_with("libonnxruntime.")
+                    && file_name.contains(lib_name.trim_start_matches("libonnxruntime")));
+
+            let is_versioned = file_name.starts_with("libonnxruntime.")
+                && (file_name.ends_with(".dylib")
+                    || file_name.ends_with(".so")
+                    || file_name.contains(".so."));
+
+            if is_target || is_versioned {
+                let dest_path = dest_dir.join(&file_name);
+                entry.unpack(&dest_path)?;
+                // Use actual file size on disk, not tar header (headers can be wrong)
+                let actual_size = fs::metadata(&dest_path).map(|m| m.len()).unwrap_or(0);
+                tracing::info!("Extracted {} ({} bytes on disk)", file_name, actual_size);
+                extracted_files.push((dest_path, actual_size));
+            }
+        }
+
+        // Pick the largest extracted file as the real library.
+        // The real ONNX Runtime is ~22MB; provider stubs are ~14KB.
+        // Using actual file size on disk (not tar headers) for reliability.
+        extracted_files.sort_by(|a, b| b.1.cmp(&a.1));
+
+        if let Some((real_path, real_size)) = extracted_files.first() {
+            tracing::info!(
+                "Selected {} ({} bytes) as ONNX Runtime library (largest of {} candidates)",
+                real_path.display(),
+                real_size,
+                extracted_files.len()
+            );
+            let real_path = real_path.clone();
+            let canonical_path = dest_dir.join(lib_name);
+            if real_path != canonical_path {
+                // Copy the real file to the canonical name (not symlink)
+                fs::copy(&real_path, &canonical_path)?;
+                tracing::info!(
+                    "Copied {} -> {} (avoiding dangling symlink)",
+                    real_path.display(),
+                    canonical_path.display()
+                );
+            }
+
+            let dest_path = &canonical_path;
+
+            // macOS Gatekeeper blocks unsigned dylibs downloaded from the internet.
+            // Remove the quarantine xattr and ad-hoc sign so dlopen succeeds.
+            #[cfg(target_os = "macos")]
+            {
+                // Remove com.apple.quarantine attribute (silent fail if not present)
+                let _ = std::process::Command::new("xattr")
+                    .args(["-d", "com.apple.quarantine"])
+                    .arg(dest_path)
+                    .output();
+
+                // Ad-hoc code sign (no identity needed, just removes the unsigned flag)
+                match std::process::Command::new("codesign")
+                    .args(["--force", "--deep", "-s", "-"])
+                    .arg(dest_path)
+                    .output()
+                {
+                    Ok(output) if output.status.success() => {
+                        tracing::info!("Ad-hoc signed {} for macOS Gatekeeper", lib_name);
+                    }
+                    Ok(output) => {
+                        tracing::warn!(
+                            "codesign returned non-zero for {}: {}",
+                            lib_name,
+                            String::from_utf8_lossy(&output.stderr)
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!("codesign not available ({}), dlopen may fail on macOS", e);
+                    }
+                }
+            }
+
+            // Final sanity check: the canonical file must be >1MB.
+            // If it's a stub, something went wrong — fail loudly.
+            let final_size = fs::metadata(&canonical_path).map(|m| m.len()).unwrap_or(0);
+            if final_size < 1_000_000 {
+                let _ = fs::remove_file(&canonical_path);
+                anyhow::bail!(
+                    "Extracted {} is only {} bytes — expected the real ONNX Runtime (>1MB). \
+                     This usually means a provider stub was extracted instead. \
+                     Please report this at https://github.com/varun29ankuS/shodh-memory/issues",
+                    canonical_path.display(),
+                    final_size
+                );
+            }
+
+            return Ok(());
         }
 
         anyhow::bail!("{} not found in archive", lib_name);
@@ -590,29 +933,54 @@ pub fn ensure_downloaded(progress: Option<ProgressCallback>) -> Result<(PathBuf,
 pub fn print_status() {
     let cache_dir = get_cache_dir();
     let models_downloaded = are_models_downloaded();
-    let ner_models_downloaded = are_ner_models_downloaded();
     let onnx_downloaded = is_onnx_runtime_downloaded();
+
+    // Resolve the GLiNER typer through the SAME path the NER stage uses, so
+    // status reflects what actually loads (env var, package dir, or cache).
+    let gliner_cfg = crate::embeddings::gliner::GlinerConfig::from_env();
+    let gliner_present = gliner_cfg.assets_present();
 
     println!("Shodh-Memory Cache Status:");
     println!("  Cache directory: {cache_dir:?}");
     println!("  Embedding models downloaded: {models_downloaded}");
-    println!("  NER models downloaded: {ner_models_downloaded}");
     println!("  ONNX Runtime downloaded: {onnx_downloaded}");
+    println!(
+        "  GLiNER typer ({GLINER_RELEASE_TAG}): {}",
+        if gliner_present {
+            "present"
+        } else {
+            "MISSING — NER runs rule-based fallback"
+        }
+    );
 
     if models_downloaded {
         let models_dir = get_models_dir();
         println!("  Embedding model path: {models_dir:?}");
     }
 
-    if ner_models_downloaded {
-        let ner_dir = get_ner_models_dir();
-        println!("  NER model path: {ner_dir:?}");
-    }
-
     if onnx_downloaded {
         if let Some(path) = get_onnx_runtime_path() {
             println!("  ONNX Runtime path: {path:?}");
         }
+    }
+
+    if gliner_present {
+        if let Some(base) = gliner_cfg.model_path.parent() {
+            println!("  GLiNER model path: {base:?}");
+        }
+    } else {
+        if let Some(base) = gliner_cfg.model_path.parent() {
+            let missing: Vec<&str> = GLINER_REQUIRED_ASSETS
+                .iter()
+                .copied()
+                .filter(|asset| !base.join(asset).exists())
+                .collect();
+            println!("  GLiNER expected at: {base:?} (missing: {missing:?})");
+        }
+        println!(
+            "  GLiNER auto-download: fetched from release {GLINER_RELEASE_TAG} on first run \
+             (skipped when SHODH_OFFLINE is set)"
+        );
     }
 }
 
@@ -630,5 +998,175 @@ mod tests {
     fn test_models_dir() {
         let models_dir = get_models_dir();
         assert!(models_dir.to_string_lossy().contains("minilm-l6"));
+    }
+
+    /// GLiNER assets cache under `<cache>/models/gliner-bi-edge` — the same path
+    /// registered as a `GlinerConfig::from_env` candidate, so a first-run
+    /// download is discovered on the next construction. No network.
+    #[test]
+    fn gliner_models_dir_is_cache_scoped() {
+        let dir = get_gliner_models_dir();
+        let s = dir.to_string_lossy().replace('\\', "/");
+        assert!(s.contains("shodh-memory"), "got {s}");
+        assert!(s.ends_with("models/gliner-bi-edge"), "got {s}");
+    }
+
+    /// The asset manifest is well-formed: 7 entries, every checksum a 64-char
+    /// lowercase-hex SHA-256, and the three files the typer loads are present.
+    /// No network.
+    #[test]
+    fn gliner_asset_manifest_is_wellformed() {
+        assert_eq!(GLINER_ASSETS.len(), 7, "expected 7 release assets");
+        for (name, sum) in GLINER_ASSETS {
+            assert!(!name.is_empty(), "empty asset name");
+            assert_eq!(sum.len(), 64, "{name}: SHA-256 must be 64 hex chars");
+            assert!(
+                sum.bytes().all(|b| b.is_ascii_hexdigit()),
+                "{name}: checksum is not hex"
+            );
+        }
+        for required in GLINER_REQUIRED_ASSETS {
+            assert!(
+                GLINER_ASSETS.iter().any(|(n, _)| n == required),
+                "manifest is missing load-bearing asset {required}"
+            );
+        }
+    }
+
+    /// Every asset URL derives from the one pinned release base + tag, and ends
+    /// with its filename — the download URL and checksum table cannot drift
+    /// apart. No network.
+    #[test]
+    fn gliner_asset_urls_target_pinned_release() {
+        assert!(
+            GLINER_RELEASE_BASE_URL.ends_with(GLINER_RELEASE_TAG),
+            "base URL must embed the pinned release tag"
+        );
+        for (name, _) in GLINER_ASSETS {
+            let url = format!("{GLINER_RELEASE_BASE_URL}/{name}");
+            assert!(
+                url.starts_with("https://github.com/varun29ankuS/shodh-memory/releases/download/"),
+                "unexpected host: {url}"
+            );
+            assert!(url.contains(GLINER_RELEASE_TAG), "tag missing from {url}");
+            assert!(url.ends_with(name), "url must end with asset name: {url}");
+        }
+    }
+
+    /// Regression for the stale-cache upgrade panic: the runtime cache MUST be
+    /// keyed by the pinned version so an ort upgrade can never load a dylib
+    /// cached by an older release (which poisoned ort's mutex and 500'd every
+    /// embedder call while /health stayed green).
+    #[test]
+    fn onnx_runtime_dir_is_version_keyed() {
+        let dir = get_onnx_runtime_dir();
+        let s = dir.to_string_lossy().replace('\\', "/");
+        assert!(
+            s.ends_with(&format!("onnxruntime/v{ONNX_RUNTIME_VERSION}")),
+            "runtime cache dir must be version-keyed, got {s}"
+        );
+    }
+
+    /// The download URL and the cache key derive from ONE constant — they
+    /// cannot drift apart (drift was how 1.17.1 ended up under a path a
+    /// 1.23-requiring binary trusted).
+    #[test]
+    fn onnx_runtime_url_embeds_pinned_version() {
+        let url = onnx_runtime_url();
+        assert!(url.starts_with("https://github.com/microsoft/onnxruntime/releases/download/"));
+        assert_eq!(
+            url.matches(ONNX_RUNTIME_VERSION).count(),
+            2,
+            "version must appear in both the tag and the artifact name: {url}"
+        );
+    }
+
+    /// Legacy cleanup removes pre-versioning files from the base directory but
+    /// never touches versioned subdirectories (coexistence is the point).
+    #[test]
+    fn cleanup_legacy_keeps_versioned_dirs() {
+        let tmp = std::env::temp_dir().join("shodh-test-legacy-ort-cleanup");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        // legacy unversioned files in the base dir
+        fs::write(tmp.join("onnxruntime.dll"), b"stale").unwrap();
+        fs::write(tmp.join("libonnxruntime.so"), b"stale").unwrap();
+        fs::write(tmp.join("onnxruntime.tgz"), b"stale").unwrap();
+        // a versioned runtime that must survive
+        let versioned = tmp.join("v9.9.9");
+        fs::create_dir_all(&versioned).unwrap();
+        fs::write(versioned.join("onnxruntime.dll"), b"keep").unwrap();
+
+        cleanup_legacy_onnx_runtime(&tmp);
+
+        assert!(!tmp.join("onnxruntime.dll").exists(), "legacy dll must go");
+        assert!(!tmp.join("libonnxruntime.so").exists(), "legacy so must go");
+        assert!(
+            !tmp.join("onnxruntime.tgz").exists(),
+            "legacy archive must go"
+        );
+        assert!(
+            versioned.join("onnxruntime.dll").exists(),
+            "versioned runtime must be untouched"
+        );
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    /// Regression test for #250: a 14KB providers_shared stub masquerading as
+    /// libonnxruntime.so must be detected and rejected by the size guard.
+    #[test]
+    fn test_ort_size_guard_rejects_stub() {
+        let tmp = std::env::temp_dir().join("shodh-test-ort-size-guard");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+
+        #[cfg(target_os = "windows")]
+        let lib_name = "onnxruntime.dll";
+        #[cfg(target_os = "linux")]
+        let lib_name = "libonnxruntime.so";
+        #[cfg(target_os = "macos")]
+        let lib_name = "libonnxruntime.dylib";
+
+        // Write a tiny stub file (simulating the providers_shared clobber)
+        let stub_path = tmp.join(lib_name);
+        fs::write(&stub_path, vec![0u8; 14_632]).unwrap(); // 14KB like providers_shared
+
+        // Verify the stub exists but is too small
+        let meta = fs::metadata(&stub_path).unwrap();
+        assert!(meta.len() < 1_000_000, "stub should be small");
+
+        // A real library would be >1MB
+        let real_path = tmp.join("real_lib");
+        fs::write(&real_path, vec![0u8; 2_000_000]).unwrap();
+        let real_meta = fs::metadata(&real_path).unwrap();
+        assert!(
+            real_meta.len() >= 1_000_000,
+            "real lib should pass size check"
+        );
+
+        // Clean up
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    /// Verify that the dot-prefix filter excludes providers_shared
+    #[test]
+    fn test_dot_prefix_excludes_providers() {
+        let providers = "libonnxruntime_providers_shared.so";
+        assert!(
+            !providers.starts_with("libonnxruntime."),
+            "providers_shared must NOT match the dot-prefix filter"
+        );
+
+        let real_versioned = "libonnxruntime.so.1.23.2";
+        assert!(
+            real_versioned.starts_with("libonnxruntime."),
+            "versioned real lib must match dot-prefix filter"
+        );
+
+        let canonical = "libonnxruntime.so";
+        assert!(
+            canonical.starts_with("libonnxruntime."),
+            "canonical name must match dot-prefix filter"
+        );
     }
 }

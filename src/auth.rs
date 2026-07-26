@@ -6,12 +6,9 @@ use axum::{
     Json,
 };
 use std::env;
+use subtle::ConstantTimeEq;
 
 use crate::errors::ErrorResponse;
-
-/// Default API key for development when no key env vars are configured.
-/// Visibility is crate-only — not exposed in the public API surface.
-pub(crate) const DEFAULT_DEV_API_KEY: &str = "sk-shodh-dev-default";
 
 /// Check if running in production mode
 pub fn is_production_mode() -> bool {
@@ -20,22 +17,10 @@ pub fn is_production_mode() -> bool {
         .unwrap_or(false)
 }
 
-/// Check if dev key should be hidden from error messages.
-///
-/// Returns true when SHODH_HIDE_DEV_KEY=true (opt-in).
-/// In production mode, always returns true regardless of the env var.
-fn should_hide_dev_key() -> bool {
-    if is_production_mode() {
-        return true;
-    }
-    env::var("SHODH_HIDE_DEV_KEY")
-        .map(|v| v.to_lowercase() == "true" || v == "1")
-        .unwrap_or(false)
-}
-
 /// Log security warnings at startup based on environment configuration
 pub fn log_security_status() {
     let has_api_keys = env::var("SHODH_API_KEYS")
+        .or_else(|_| env::var("SHODH_API_KEY"))
         .map(|k| !k.trim().is_empty())
         .unwrap_or(false);
     let has_dev_key = env::var("SHODH_DEV_API_KEY")
@@ -59,10 +44,8 @@ pub fn log_security_status() {
             tracing::warn!("║  Using SHODH_DEV_API_KEY for authentication.                  ║");
             tracing::warn!("║  DO NOT use this configuration in production!                 ║");
         } else if !has_api_keys {
-            tracing::warn!("║  No API keys configured. Using default dev key.              ║");
-            tracing::warn!("║  DEPRECATION: Default dev key will be removed in v0.2.0.     ║");
-            tracing::warn!("║  Set SHODH_DEV_API_KEY or SHODH_API_KEYS to override.        ║");
-            tracing::warn!("║  Set SHODH_HIDE_DEV_KEY=true to hide key from error msgs.    ║");
+            tracing::error!("║  No API keys configured. You must set SHODH_API_KEYS.        ║");
+            tracing::error!("║  Server will reject all authenticated requests.              ║");
         }
         tracing::warn!("║                                                                ║");
         tracing::warn!("║  For production, set:                                          ║");
@@ -106,30 +89,15 @@ impl IntoResponse for AuthError {
             AuthError::MissingApiKey => {
                 if is_prod {
                     "Missing X-API-Key header".to_string()
-                } else if should_hide_dev_key() {
-                    "Missing X-API-Key header. Set SHODH_DEV_API_KEY or SHODH_API_KEYS. \
-                     See docs for setup."
-                        .to_string()
                 } else {
-                    format!(
-                        "Missing X-API-Key header. Set the header in your request. \
-                         The server accepts keys from SHODH_API_KEYS (comma-separated) \
-                         or SHODH_DEV_API_KEY. Default dev key: '{}'",
-                        DEFAULT_DEV_API_KEY
-                    )
+                    "Missing X-API-Key header. Set SHODH_DEV_API_KEY or SHODH_API_KEYS.".to_string()
                 }
             }
             AuthError::InvalidApiKey => {
                 if is_prod {
                     "Invalid API key".to_string()
-                } else if should_hide_dev_key() {
-                    "Invalid API key. Check SHODH_DEV_API_KEY or SHODH_API_KEYS.".to_string()
                 } else {
-                    format!(
-                        "Invalid API key. Expected a key from SHODH_API_KEYS or \
-                         SHODH_DEV_API_KEY. Default dev key: '{}'",
-                        DEFAULT_DEV_API_KEY
-                    )
+                    "Invalid API key. Check SHODH_DEV_API_KEY or SHODH_API_KEYS.".to_string()
                 }
             }
             AuthError::NotConfigured => {
@@ -148,69 +116,59 @@ impl IntoResponse for AuthError {
     }
 }
 
-/// Constant-time string comparison to prevent timing attacks
-///
-/// Compares all bytes of both strings to prevent length-based timing leaks.
-/// The comparison time is constant regardless of where differences occur.
-fn constant_time_compare(a: &str, b: &str) -> bool {
-    let a_bytes = a.as_bytes();
-    let b_bytes = b.as_bytes();
-    let a_len = a_bytes.len();
-    let b_len = b_bytes.len();
-    let max_len = std::cmp::max(a_len, b_len);
-
-    // Track whether lengths match (0 if equal, non-zero otherwise)
-    // Use u32 to avoid truncation: (usize as u8) wraps at 256, so lengths
-    // differing by a multiple of 256 would falsely compare as equal.
-    let mut result: u32 = (a_len ^ b_len) as u32;
-
-    // Compare all bytes up to max_len, using 0 for out-of-bounds indices
-    // This ensures constant time regardless of actual lengths
-    for i in 0..max_len {
-        let byte_a = if i < a_len { a_bytes[i] } else { 0 };
-        let byte_b = if i < b_len { b_bytes[i] } else { 0 };
-        result |= (byte_a ^ byte_b) as u32;
-    }
-
-    result == 0
+/// Compiler-resistant constant-time comparison for equal-length key material.
+pub(crate) fn constant_time_compare(a: &str, b: &str) -> bool {
+    a.as_bytes().ct_eq(b.as_bytes()).into()
 }
 
-/// Validate API key against configured keys using constant-time comparison
-pub fn validate_api_key(provided_key: &str) -> Result<(), AuthError> {
-    // Get API keys from environment (comma-separated for multiple keys)
+/// Resolve API keys using the one precedence rule shared by HTTP and local IPC.
+pub(crate) fn configured_api_keys() -> Result<Vec<String>, AuthError> {
+    // Resolution order: SHODH_API_KEYS (plural, comma-separated) → SHODH_API_KEY (singular)
+    //                 → SHODH_DEV_API_KEY (dev mode) → NotConfigured error
     let valid_keys = match env::var("SHODH_API_KEYS") {
         Ok(keys) if !keys.trim().is_empty() => keys,
-        _ => {
-            // In production, refuse to start without API keys
-            let is_production = env::var("SHODH_ENV")
-                .map(|v| v.to_lowercase() == "production" || v.to_lowercase() == "prod")
-                .unwrap_or(false);
+        _ => match env::var("SHODH_API_KEY") {
+            Ok(key) if !key.trim().is_empty() => key,
+            _ => {
+                // In production, refuse to start without API keys
+                let is_production = env::var("SHODH_ENV")
+                    .map(|v| v.to_lowercase() == "production" || v.to_lowercase() == "prod")
+                    .unwrap_or(false);
 
-            if is_production {
-                tracing::error!("SHODH_API_KEYS not set in production mode");
-                return Err(AuthError::NotConfigured);
-            }
+                if is_production {
+                    tracing::error!("SHODH_API_KEYS not set in production mode");
+                    return Err(AuthError::NotConfigured);
+                }
 
-            // Development mode: use SHODH_DEV_API_KEY, or fall back to built-in default
-            match env::var("SHODH_DEV_API_KEY") {
-                Ok(key) if !key.trim().is_empty() => {
-                    tracing::warn!("Using SHODH_DEV_API_KEY for development (not for production!)");
-                    key
-                }
-                _ => {
-                    tracing::warn!(
-                        "No API key configured. Falling back to default dev key. \
-                         Set SHODH_DEV_API_KEY to override."
-                    );
-                    DEFAULT_DEV_API_KEY.to_string()
+                // Development mode: use SHODH_DEV_API_KEY, or fall back to built-in default
+                match env::var("SHODH_DEV_API_KEY") {
+                    Ok(key) if !key.trim().is_empty() => {
+                        tracing::warn!(
+                            "Using SHODH_DEV_API_KEY for development (not for production!)"
+                        );
+                        key
+                    }
+                    _ => {
+                        tracing::error!("SHODH_API_KEYS or SHODH_DEV_API_KEY not set");
+                        return Err(AuthError::NotConfigured);
+                    }
                 }
             }
-        }
+        },
     };
 
-    let keys: Vec<&str> = valid_keys.split(',').map(|k| k.trim()).collect();
+    Ok(valid_keys
+        .split(',')
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
+        .map(str::to_owned)
+        .collect())
+}
 
-    // Use constant-time comparison to prevent timing attacks
+/// Validate API key against configured keys using constant-time comparison.
+pub fn validate_api_key(provided_key: &str) -> Result<(), AuthError> {
+    let keys = configured_api_keys()?;
+
     let mut found = false;
     for key in &keys {
         if constant_time_compare(key, provided_key) {
@@ -256,9 +214,21 @@ pub async fn auth_middleware(request: Request, next: Next) -> Response {
                 .map(|s| s.to_string())
         })
         .or_else(|| {
-            // WebSocket fallback: check query parameter for api_key
-            // Node.js WebSocket API doesn't support custom headers, so
-            // clients can pass ?api_key=... in the URL instead
+            // Query-parameter fallback: browsers cannot attach custom headers to
+            // WebSocket (`new WebSocket`) or Server-Sent Events (`new EventSource`)
+            // connections, so those clients pass ?api_key=... in the URL instead.
+            // Restricted to those two channels to limit API-key leakage via URLs in
+            // server logs, browser history, and referrer headers.
+            let is_websocket = request
+                .headers()
+                .get("upgrade")
+                .and_then(|v| v.to_str().ok())
+                .map(|v| v.eq_ignore_ascii_case("websocket"))
+                .unwrap_or(false);
+            let is_event_stream = path == "/api/events" || path == "/api/events/sse";
+            if !is_websocket && !is_event_stream {
+                return None;
+            }
             request.uri().query().and_then(|q| {
                 q.split('&')
                     .find_map(|pair| pair.strip_prefix("api_key=").map(|v| v.to_string()))
@@ -277,16 +247,18 @@ pub async fn auth_middleware(request: Request, next: Next) -> Response {
     next.run(request).await
 }
 
+/// Process-global lock for tests that manipulate environment variables.
+/// `env::set_var` / `env::remove_var` are not thread-safe, so every test across the
+/// crate that touches auth env vars must hold this one lock for its duration. It is
+/// `pub(crate)` so the `local_ipc` auth tests serialize against auth.rs's own env
+/// tests rather than racing them.
+#[cfg(test)]
+pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use axum::body::to_bytes;
-    use std::sync::Mutex;
-
-    /// Process-global lock for tests that manipulate environment variables.
-    /// `env::set_var` / `env::remove_var` are not thread-safe, so all tests
-    /// that touch auth env vars must hold this lock for the duration of the test.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     /// Clear all auth-related env vars to isolate tests.
     /// Caller MUST hold `ENV_LOCK` — this is not enforced at compile time.
@@ -294,7 +266,6 @@ mod tests {
         env::remove_var("SHODH_API_KEYS");
         env::remove_var("SHODH_DEV_API_KEY");
         env::remove_var("SHODH_ENV");
-        env::remove_var("SHODH_HIDE_DEV_KEY");
     }
 
     // ── constant_time_compare ──
@@ -412,17 +383,6 @@ mod tests {
         clear_auth_env();
     }
 
-    // ── validate_api_key: default dev key ──
-
-    #[test]
-    fn validate_with_default_dev_key_when_no_env_set() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        clear_auth_env();
-        assert!(validate_api_key(DEFAULT_DEV_API_KEY).is_ok());
-        assert!(validate_api_key("wrong-key").is_err());
-        clear_auth_env();
-    }
-
     // ── validate_api_key: production mode ──
 
     #[test]
@@ -457,17 +417,7 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap();
         clear_auth_env();
         env::set_var("SHODH_API_KEYS", "  ");
-        // Empty SHODH_API_KEYS falls through to dev key / default
-        assert!(validate_api_key(DEFAULT_DEV_API_KEY).is_ok());
-        clear_auth_env();
-    }
-
-    #[test]
-    fn validate_empty_dev_key_uses_default() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        clear_auth_env();
-        env::set_var("SHODH_DEV_API_KEY", "  ");
-        assert!(validate_api_key(DEFAULT_DEV_API_KEY).is_ok());
+        assert!(validate_api_key("anything").is_err());
         clear_auth_env();
     }
 
@@ -540,10 +490,7 @@ mod tests {
             parsed.message.contains("SHODH_DEV_API_KEY"),
             "Should mention SHODH_DEV_API_KEY"
         );
-        assert!(
-            parsed.message.contains(DEFAULT_DEV_API_KEY),
-            "Should show the default dev key"
-        );
+
         clear_auth_env();
     }
 
@@ -558,10 +505,7 @@ mod tests {
             parsed.message.contains("SHODH_API_KEYS"),
             "Should mention SHODH_API_KEYS"
         );
-        assert!(
-            parsed.message.contains(DEFAULT_DEV_API_KEY),
-            "Should show the default dev key"
-        );
+
         clear_auth_env();
     }
 
@@ -590,10 +534,7 @@ mod tests {
         let body = to_bytes(resp.into_body(), 2048).await.unwrap();
         let parsed: ErrorResponse = serde_json::from_slice(&body).unwrap();
         assert_eq!(parsed.message, "Invalid API key");
-        assert!(
-            !parsed.message.contains(DEFAULT_DEV_API_KEY),
-            "Prod must not leak default key"
-        );
+
         clear_auth_env();
     }
 
@@ -607,88 +548,10 @@ mod tests {
         assert!(parsed.message.contains("SHODH_API_KEYS"));
     }
 
-    // ── SHODH_HIDE_DEV_KEY ──
-
-    #[tokio::test]
-    async fn hide_dev_key_suppresses_key_in_missing_key_error() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        clear_auth_env();
-        env::set_var("SHODH_HIDE_DEV_KEY", "true");
-
-        let resp = AuthError::MissingApiKey.into_response();
-        let body = to_bytes(resp.into_body(), 2048).await.unwrap();
-        let parsed: ErrorResponse = serde_json::from_slice(&body).unwrap();
-
-        assert!(
-            !parsed.message.contains(DEFAULT_DEV_API_KEY),
-            "SHODH_HIDE_DEV_KEY=true should suppress key in error: {}",
-            parsed.message
-        );
-        assert!(
-            parsed.message.contains("SHODH_DEV_API_KEY"),
-            "Should still mention env var name: {}",
-            parsed.message
-        );
-        clear_auth_env();
-    }
-
-    #[tokio::test]
-    async fn hide_dev_key_suppresses_key_in_invalid_key_error() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        clear_auth_env();
-        env::set_var("SHODH_HIDE_DEV_KEY", "true");
-
-        let resp = AuthError::InvalidApiKey.into_response();
-        let body = to_bytes(resp.into_body(), 2048).await.unwrap();
-        let parsed: ErrorResponse = serde_json::from_slice(&body).unwrap();
-
-        assert!(
-            !parsed.message.contains(DEFAULT_DEV_API_KEY),
-            "SHODH_HIDE_DEV_KEY=true should suppress key in error: {}",
-            parsed.message
-        );
-        clear_auth_env();
-    }
-
-    #[test]
-    fn should_hide_dev_key_defaults_to_false() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        clear_auth_env();
-        assert!(!should_hide_dev_key());
-        clear_auth_env();
-    }
-
-    #[test]
-    fn should_hide_dev_key_respects_env_var() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        clear_auth_env();
-
-        env::set_var("SHODH_HIDE_DEV_KEY", "true");
-        assert!(should_hide_dev_key());
-
-        env::set_var("SHODH_HIDE_DEV_KEY", "1");
-        assert!(should_hide_dev_key());
-
-        env::set_var("SHODH_HIDE_DEV_KEY", "false");
-        assert!(!should_hide_dev_key());
-
-        clear_auth_env();
-    }
-
-    #[test]
-    fn should_hide_dev_key_always_true_in_production() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        clear_auth_env();
-        env::set_var("SHODH_ENV", "production");
-        // Even without SHODH_HIDE_DEV_KEY, production always hides
-        assert!(should_hide_dev_key());
-        clear_auth_env();
-    }
-
     // ── Query parameter auth (WebSocket fallback) ──
 
     #[tokio::test]
-    async fn auth_middleware_accepts_query_param_api_key() {
+    async fn auth_middleware_accepts_query_param_for_websocket() {
         use axum::body::Body;
         use axum::http::Request as HttpRequest;
         use axum::middleware::from_fn;
@@ -704,23 +567,88 @@ mod tests {
             .route("/api/stream", get(|| async { "ok" }))
             .layer(from_fn(auth_middleware));
 
-        // Request with API key in query parameter (WebSocket fallback)
+        // WebSocket upgrade with API key in query parameter
         let req = HttpRequest::builder()
             .uri("/api/stream?api_key=test-ws-key")
+            .header("upgrade", "websocket")
             .body(Body::empty())
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(
             resp.status(),
             StatusCode::OK,
-            "Should accept API key from query parameter"
+            "Should accept API key from query parameter on WebSocket upgrade"
         );
 
         clear_auth_env();
     }
 
     #[tokio::test]
-    async fn auth_middleware_rejects_invalid_query_param() {
+    async fn auth_middleware_accepts_query_param_for_event_stream() {
+        use axum::body::Body;
+        use axum::http::Request as HttpRequest;
+        use axum::middleware::from_fn;
+        use axum::routing::get;
+        use axum::Router;
+        use tower::ServiceExt;
+
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_auth_env();
+        env::set_var("SHODH_API_KEYS", "test-sse-key");
+
+        let app = Router::new()
+            .route("/api/events", get(|| async { "ok" }))
+            .layer(from_fn(auth_middleware));
+
+        // SSE EventSource cannot set headers, so the key arrives as a query parameter.
+        let req = HttpRequest::builder()
+            .uri("/api/events?user_id=u&api_key=test-sse-key")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "Should accept API key from query parameter on the SSE event stream"
+        );
+
+        clear_auth_env();
+    }
+
+    #[tokio::test]
+    async fn auth_middleware_ignores_query_param_without_websocket_upgrade() {
+        use axum::body::Body;
+        use axum::http::Request as HttpRequest;
+        use axum::middleware::from_fn;
+        use axum::routing::get;
+        use axum::Router;
+        use tower::ServiceExt;
+
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_auth_env();
+        env::set_var("SHODH_API_KEYS", "test-ws-key");
+
+        let app = Router::new()
+            .route("/api/remember", get(|| async { "ok" }))
+            .layer(from_fn(auth_middleware));
+
+        // Non-WebSocket request with API key in query parameter — should be ignored
+        let req = HttpRequest::builder()
+            .uri("/api/remember?api_key=test-ws-key")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "Query param auth should be ignored for non-WebSocket requests"
+        );
+
+        clear_auth_env();
+    }
+
+    #[tokio::test]
+    async fn auth_middleware_rejects_invalid_websocket_query_param() {
         use axum::body::Body;
         use axum::http::Request as HttpRequest;
         use axum::middleware::from_fn;
@@ -738,13 +666,14 @@ mod tests {
 
         let req = HttpRequest::builder()
             .uri("/api/stream?api_key=wrong-key")
+            .header("upgrade", "websocket")
             .body(Body::empty())
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(
             resp.status(),
             StatusCode::UNAUTHORIZED,
-            "Should reject invalid query parameter API key"
+            "Should reject invalid query parameter API key on WebSocket"
         );
 
         clear_auth_env();

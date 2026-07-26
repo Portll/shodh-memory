@@ -13,6 +13,7 @@ use std::collections::HashMap;
 use super::state::MultiUserMemoryManager;
 use super::types::{ContextStatus, MemoryEvent};
 use crate::metrics;
+use crate::system_memory::SystemMemoryDiagnostics;
 
 /// Application state type alias
 pub type AppState = std::sync::Arc<MultiUserMemoryManager>;
@@ -26,12 +27,25 @@ pub struct HealthResponse {
     pub users_in_cache: usize,
     pub user_evictions: usize,
     pub max_cache_size: usize,
+    pub write_failures: u64,
+    pub pending_retries: usize,
+    pub system_memory: SystemMemoryDiagnostics,
+    pub rocksdb_memory: crate::system_memory::RocksDbMemoryDiagnostics,
 }
 
 /// Main health check endpoint
 pub async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
     let users_in_cache = state.users_in_cache();
     let user_evictions = state.user_evictions();
+
+    // Aggregate write failure metrics across all cached users
+    let (write_failures, pending_retries) = state.write_failure_metrics();
+    let system_memory = crate::system_memory::read_system_memory_diagnostics();
+    metrics::update_system_memory_metrics(&system_memory);
+    // RocksDB decomposition (#90): shared cache read once from the manager's
+    // handle; per-CF sums over CACHED users only (cold users stay cold).
+    let rocksdb_memory = state.rocksdb_memory_diagnostics();
+    metrics::update_rocksdb_memory_metrics(&rocksdb_memory);
 
     Json(HealthResponse {
         status: "healthy".to_string(),
@@ -40,6 +54,10 @@ pub async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
         users_in_cache,
         user_evictions,
         max_cache_size: state.server_config().max_users_in_memory,
+        write_failures,
+        pending_retries,
+        system_memory,
+        rocksdb_memory,
     })
 }
 
@@ -84,11 +102,9 @@ pub async fn health_index(
             // open RocksDB for every user on disk, wasting FDs and memory.
             let users: Vec<(String, crate::memory::retrieval::IndexHealth)> = {
                 let mut results = Vec::new();
-                for user_id in state.list_cached_users() {
-                    if let Ok(memory) = state.get_user_memory(&user_id) {
-                        let guard = memory.read();
-                        results.push((user_id, guard.index_health()));
-                    }
+                for (user_id, memory) in state.cached_user_memories() {
+                    let guard = memory.read();
+                    results.push((user_id, guard.index_health()));
                 }
                 results
             };
@@ -158,21 +174,21 @@ pub async fn metrics_endpoint(State(state): State<AppState>) -> Result<String, S
     let users_in_cache = state.users_in_cache();
     metrics::ACTIVE_USERS.set(users_in_cache as i64);
 
-    // Aggregate metrics across all users
+    // Aggregate metrics across currently cached users only.
+    // list_users() returns filesystem directories; get_user_memory() would open
+    // RocksDB for cold users and make a metrics scrape increase memory/FD usage.
     let (mut total_working, mut total_session, mut total_longterm, mut total_heap) =
         (0i64, 0i64, 0i64, 0i64);
     let mut total_vectors = 0i64;
 
-    for user_id in state.list_users().iter().take(100) {
-        if let Ok(memory_sys) = state.get_user_memory(user_id) {
-            if let Some(guard) = memory_sys.try_read() {
-                let stats = guard.stats();
-                total_working += stats.working_memory_count as i64;
-                total_session += stats.session_memory_count as i64;
-                total_longterm += stats.long_term_memory_count as i64;
-                total_heap += (stats.total_memories * 250) as i64;
-                total_vectors += stats.total_memories as i64;
-            }
+    for (_user_id, memory_sys) in state.cached_user_memories() {
+        if let Some(guard) = memory_sys.try_read() {
+            let stats = guard.stats();
+            total_working += stats.working_memory_count as i64;
+            total_session += stats.session_memory_count as i64;
+            total_longterm += stats.long_term_memory_count as i64;
+            total_heap += (stats.total_memories * 250) as i64;
+            total_vectors += stats.total_memories as i64;
         }
     }
 
@@ -188,6 +204,11 @@ pub async fn metrics_endpoint(State(state): State<AppState>) -> Result<String, S
         .set(total_longterm);
     metrics::MEMORY_HEAP_BYTES_TOTAL.set(total_heap);
     metrics::VECTOR_INDEX_SIZE_TOTAL.set(total_vectors);
+    let system_memory = crate::system_memory::read_system_memory_diagnostics();
+    metrics::update_system_memory_metrics(&system_memory);
+    // RocksDB decomposition (#90) — cached users only, shared cache read once.
+    let rocksdb_memory = state.rocksdb_memory_diagnostics();
+    metrics::update_rocksdb_memory_metrics(&rocksdb_memory);
 
     // Gather and encode metrics
     let encoder = prometheus::TextEncoder::new();
@@ -250,6 +271,7 @@ pub async fn update_context_status(
         memory_type: Some("Context".to_string()),
         importance: None,
         count: None,
+        entities: None,
         results: None,
     });
 
@@ -282,4 +304,72 @@ pub async fn get_context_status(State(state): State<AppState>) -> Json<Vec<Conte
         .collect();
     sessions.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
     Json(sessions)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::ServerConfig;
+    use crate::handlers::state::MultiUserMemoryManager;
+    use std::sync::Arc;
+    use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn rocksdb_diagnostics_do_not_load_cold_disk_users() {
+        let temp_dir = TempDir::new().expect("failed to create temp dir");
+        std::fs::create_dir(temp_dir.path().join("cold-user"))
+            .expect("failed to create cold user dir");
+        let config = ServerConfig {
+            storage_path: temp_dir.path().to_path_buf(),
+            backup_enabled: false,
+            ..ServerConfig::default()
+        };
+        let state = Arc::new(
+            MultiUserMemoryManager::new(temp_dir.path().to_path_buf(), config)
+                .expect("failed to create test manager"),
+        );
+        assert_eq!(state.users_in_cache(), 0);
+
+        let d = state.rocksdb_memory_diagnostics();
+
+        assert_eq!(
+            state.users_in_cache(),
+            0,
+            "the diagnostic must not open cold user RocksDB instances"
+        );
+        assert_eq!(d.users_counted, 0, "no cached users → nothing counted");
+        assert!(
+            d.shared_block_cache_capacity_bytes > 0,
+            "shared cache capacity must report the configured ceiling"
+        );
+    }
+
+    #[tokio::test]
+    async fn metrics_endpoint_does_not_load_cold_disk_users() {
+        let temp_dir = TempDir::new().expect("failed to create temp dir");
+        std::fs::create_dir(temp_dir.path().join("cold-user"))
+            .expect("failed to create cold user dir");
+        let config = ServerConfig {
+            storage_path: temp_dir.path().to_path_buf(),
+            backup_enabled: false,
+            ..ServerConfig::default()
+        };
+        let state = Arc::new(
+            MultiUserMemoryManager::new(temp_dir.path().to_path_buf(), config)
+                .expect("failed to create test manager"),
+        );
+
+        assert_eq!(state.list_users(), vec!["cold-user".to_string()]);
+        assert_eq!(state.users_in_cache(), 0);
+
+        metrics_endpoint(State(state.clone()))
+            .await
+            .expect("metrics endpoint failed");
+
+        assert_eq!(
+            state.users_in_cache(),
+            0,
+            "metrics scrape must not open cold user RocksDB instances"
+        );
+    }
 }

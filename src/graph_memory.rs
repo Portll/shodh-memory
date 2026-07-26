@@ -9,7 +9,7 @@ use rocksdb::{ColumnFamily, ColumnFamilyDescriptor, Options, WriteBatch, DB};
 use rust_stemmers::{Algorithm, Stemmer};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering as CmpOrdering;
-use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -29,6 +29,12 @@ const CF_ENTITY_EPISODES: &str = "entity_episodes";
 const CF_NAME_INDEX: &str = "name_index";
 const CF_LOWERCASE_INDEX: &str = "lowercase_index";
 const CF_STEMMED_INDEX: &str = "stemmed_index";
+const CF_RELATION_STATS: &str = "relation_stats";
+/// Alias index: a surface form (lowercased) -> the canonical entity UUID it
+/// resolves to. Seeded by the entity resolver (ER Phase 1.2/1.3); consulted first
+/// in `find_entity_by_name` so `container ship`/`cargo ship`/`the Dali` all land
+/// on one canonical node instead of minting parallel mention nodes.
+const CF_ALIAS: &str = "entity_alias";
 
 const GRAPH_CF_NAMES: &[&str] = &[
     CF_ENTITIES,
@@ -40,7 +46,60 @@ const GRAPH_CF_NAMES: &[&str] = &[
     CF_NAME_INDEX,
     CF_LOWERCASE_INDEX,
     CF_STEMMED_INDEX,
+    CF_RELATION_STATS,
+    CF_ALIAS,
 ];
+
+/// Per-(label-pair, relation) evidence counter for the learned pair table
+/// (Stanford-1, PMI² relation mapping). `src_is_a` counts observations where
+/// the relation's SOURCE entity carried the canonically-first label.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PairRelationStat {
+    relation: RelationType,
+    count: u64,
+    src_is_a: u64,
+}
+
+impl PairRelationStat {
+    fn new(relation: RelationType) -> Self {
+        Self {
+            relation,
+            count: 0,
+            src_is_a: 0,
+        }
+    }
+}
+
+/// Stable key string for an entity label in relation-stats keys.
+fn label_key(label: &EntityLabel) -> String {
+    format!("{label:?}")
+}
+
+/// Labels too generic to carry a learned relation default. The first
+/// measurement (batched guard run 27348362950) showed one label-pair
+/// mass-applying CreatedBy to 344 cue-less co-mentions (open_domain -0.067):
+/// catch-all labels make every co-mention look like the same "pair", so the
+/// purity gate sees a clean signal that is actually label poverty. Learned
+/// mappings require both endpoints to carry a SPECIFIC label.
+fn label_is_generic(label: &EntityLabel) -> bool {
+    matches!(
+        label,
+        EntityLabel::Concept | EntityLabel::Keyword | EntityLabel::Other(_)
+    )
+}
+
+/// Canonicalize an unordered label pair for stats keys. Returns
+/// (first, second, input_src_is_first): the two label keys in lexicographic
+/// order plus whether the FIRST argument landed in the first slot.
+fn canonical_label_pair(a: &EntityLabel, b: &EntityLabel) -> (String, String, bool) {
+    let ka = label_key(a);
+    let kb = label_key(b);
+    if ka <= kb {
+        (ka, kb, true)
+    } else {
+        (kb, ka, false)
+    }
+}
 
 /// Entity node in the knowledge graph
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -82,13 +141,44 @@ pub struct EntityNode {
     /// Proper nouns have higher base salience than common nouns
     #[serde(default)]
     pub is_proper_noun: bool,
+
+    /// Curvature selectivity: stdev(incident edge curvatures) / degree
+    ///
+    /// Measures whether this entity participates in specific communities
+    /// (high selectivity) or connects to everything uniformly (low selectivity).
+    ///
+    /// High selectivity → concept (e.g., "Hebbian learning" connects within neuroscience)
+    /// Low selectivity  → stop word (e.g., "impl" connects to everything equally)
+    ///
+    /// Used to gate LTP protection: low-selectivity entities cannot earn
+    /// permanent LTP regardless of activation count, mimicking habituation
+    /// in biological neural systems.
+    ///
+    /// Computed during Forman-Ricci curvature pass. None = not yet computed.
+    #[serde(default)]
+    pub selectivity: Option<f32>,
+
+    /// Fine-grained schema leaf type (e.g. `"bridge"`, `"malware"`), one level
+    /// more specific than the coarse [`EntityLabel`]. Populated by the GLiNER
+    /// schema-driven typer (`crate::entity_type`); `None` for entities typed
+    /// only at coarse granularity (regex/tag/heuristic extraction paths, or
+    /// records written before this field existed).
+    #[serde(default)]
+    pub fine_type: Option<String>,
 }
 
 fn default_salience() -> f32 {
     0.5 // Default middle salience
 }
 
-/// Entity labels following Graphiti's categorization
+/// Entity labels for ontological classification of graph nodes.
+///
+/// Extends Graphiti's base categorization with DevOps, software engineering,
+/// and robotics domain types. Used by spreading activation (Layer 2) and
+/// post-RRF re-ranking (Layer 4.9) for type-aware retrieval.
+///
+/// New variants are additive only — never remove existing variants to
+/// maintain backward compatibility with MessagePack-serialized data.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum EntityLabel {
     Person,
@@ -103,6 +193,56 @@ pub enum EntityLabel {
     /// YAKE-extracted discriminative keyword (not a named entity)
     /// Used for graph-based retrieval of rare/important terms like "sunrise"
     Keyword,
+    /// Git repos, Jira projects, feature work, mission plans
+    Project,
+    /// Issues, tickets, work items, action items
+    Task,
+    /// READMEs, specs, design docs, RFCs, runbooks
+    Document,
+    /// Git repositories, container registries
+    Repository,
+    /// Microservices, APIs, daemons, ROS2 nodes
+    Service,
+    /// PostgreSQL, Redis, RocksDB, DynamoDB instances
+    Database,
+    /// Latency p99, error rate, SLOs, telemetry signals
+    Metric,
+    /// Env vars, feature flags, config files, parameters
+    Configuration,
+    /// staging, production, dev, CI, robot deployment zones
+    Environment,
+    /// CI/CD pipelines, data pipelines, ETL, mission workflows
+    Pipeline,
+    /// Engineering squads, SRE teams, robot fleet groups
+    Team,
+    /// SRE, tech lead, PM, architect, operator
+    Role,
+    /// Code modules, packages, crates, libraries, ROS2 packages
+    Module,
+    /// Nationalities, religious, or political groups (schema coarse: `norp`)
+    Norp,
+    /// Geopolitical entity — countries, cities, states as political actors (schema coarse: `gpe`)
+    Gpe,
+    /// Buildings, airports, highways, bridges (schema coarse: `facility`)
+    Facility,
+    /// Cars, trains, ships, aircraft (schema coarse: `vehicle`)
+    Vehicle,
+    /// Weapons and munitions (schema coarse: `weapon`)
+    Weapon,
+    /// Titled creative works — books, films, songs, artworks (schema coarse: `work`)
+    Work,
+    /// Named laws, treaties, regulations, court cases (schema coarse: `law`)
+    Law,
+    /// Honorifics and named positions — "President", "CEO" (schema coarse: `title`)
+    Title,
+    /// Malware, CVEs, threat actors, cyber campaigns (schema coarse: `cyber`)
+    Cyber,
+    /// Monetary amounts (schema coarse: `money`)
+    Money,
+    /// Non-monetary measurements — distance, weight, percentages (schema coarse: `quantity`)
+    Quantity,
+    /// Times of day / durations, distinct from calendar `Date` (schema coarse: `time`)
+    Time,
     Other(String),
 }
 
@@ -121,9 +261,226 @@ impl EntityLabel {
             Self::Product => "Product",
             Self::Skill => "Skill",
             Self::Keyword => "Keyword",
+            Self::Project => "Project",
+            Self::Task => "Task",
+            Self::Document => "Document",
+            Self::Repository => "Repository",
+            Self::Service => "Service",
+            Self::Database => "Database",
+            Self::Metric => "Metric",
+            Self::Configuration => "Configuration",
+            Self::Environment => "Environment",
+            Self::Pipeline => "Pipeline",
+            Self::Team => "Team",
+            Self::Role => "Role",
+            Self::Module => "Module",
+            Self::Norp => "Norp",
+            Self::Gpe => "Gpe",
+            Self::Facility => "Facility",
+            Self::Vehicle => "Vehicle",
+            Self::Weapon => "Weapon",
+            Self::Work => "Work",
+            Self::Law => "Law",
+            Self::Title => "Title",
+            Self::Cyber => "Cyber",
+            Self::Money => "Money",
+            Self::Quantity => "Quantity",
+            Self::Time => "Time",
             Self::Other(s) => s.as_str(),
         }
     }
+
+    /// Map a schema coarse id (from `crate::entity_type::schema().coarse`) to the
+    /// matching `EntityLabel` variant.
+    ///
+    /// All 18 coarse ids in the entity-type schema resolve to a real variant —
+    /// GLiNER typing must never degrade a schema-recognized coarse class to
+    /// `Other(String)`. An id outside the schema (e.g. a stale/foreign value)
+    /// still falls back to `Other` rather than panicking.
+    pub fn from_coarse_id(id: &str) -> EntityLabel {
+        match id {
+            "person" => EntityLabel::Person,
+            "organization" => EntityLabel::Organization,
+            "location" => EntityLabel::Location,
+            "product" => EntityLabel::Product,
+            "event" => EntityLabel::Event,
+            "date" => EntityLabel::Date,
+            "norp" => EntityLabel::Norp,
+            "gpe" => EntityLabel::Gpe,
+            "facility" => EntityLabel::Facility,
+            "vehicle" => EntityLabel::Vehicle,
+            "weapon" => EntityLabel::Weapon,
+            "work" => EntityLabel::Work,
+            "law" => EntityLabel::Law,
+            "title" => EntityLabel::Title,
+            "cyber" => EntityLabel::Cyber,
+            "money" => EntityLabel::Money,
+            "quantity" => EntityLabel::Quantity,
+            "time" => EntityLabel::Time,
+            other => EntityLabel::Other(other.to_string()),
+        }
+    }
+
+    /// Static type hierarchy: returns parent labels for ontological matching.
+    ///
+    /// Enables hierarchical type matching so "who manages" can match Team
+    /// (because Team is_a Organization-like group entity) and "what technology"
+    /// can match Service (because Service is_a Technology subtype).
+    ///
+    /// Hierarchy is shallow (max depth 1) and fixed at compile time.
+    /// No graph storage, no runtime cost beyond a match.
+    ///
+    /// Reference: Collins & Quillian (1969) "Retrieval time from semantic memory"
+    /// — type hierarchies reduce retrieval time for plausible paths.
+    pub fn parent_labels(&self) -> &'static [EntityLabel] {
+        match self {
+            // Organizational subtypes
+            Self::Team => &[EntityLabel::Organization],
+            Self::Role => &[EntityLabel::Concept],
+            // Technical subtypes
+            Self::Service | Self::Database | Self::Repository | Self::Module | Self::Pipeline => {
+                &[EntityLabel::Technology]
+            }
+            // Work / knowledge subtypes
+            Self::Task => &[EntityLabel::Event],
+            Self::Document
+            | Self::Configuration
+            | Self::Metric
+            | Self::Environment
+            | Self::Project => &[EntityLabel::Concept],
+            // GLiNER coarse subtypes (schema-driven typing)
+            Self::Gpe | Self::Facility => &[EntityLabel::Location],
+            Self::Vehicle | Self::Weapon => &[EntityLabel::Product],
+            Self::Title => &[EntityLabel::Role],
+            Self::Work | Self::Law | Self::Cyber => &[EntityLabel::Concept],
+            Self::Norp => &[EntityLabel::Organization],
+            // Base types and Other have no parents
+            _ => &[],
+        }
+    }
+
+    /// Check if this label matches the expected label, considering type hierarchy.
+    ///
+    /// Returns true if:
+    /// - Direct match (self == expected)
+    /// - Self's parent matches expected (Team matches Organization)
+    ///
+    /// Used by spreading activation (Layer 2 entity penalty) and
+    /// Layer 4.9 (ontological re-ranking) for hierarchical type matching.
+    pub fn matches_with_hierarchy(&self, expected: &EntityLabel) -> bool {
+        if self == expected {
+            return true;
+        }
+        self.parent_labels().contains(expected)
+    }
+}
+
+/// Classify a tag string into a richer `EntityLabel`.
+///
+/// Tags are short, user-supplied descriptors (e.g. "production", "rocksdb",
+/// "config.toml"). This maps them onto the ontology so they participate in
+/// type-aware spreading activation and hierarchy matching during retrieval.
+/// Shared by every ingest path so a tag receives the same label whether it
+/// arrives via `remember`, an integration sync, or an `upsert`.
+pub fn classify_tag_label(tag: &str) -> EntityLabel {
+    let lower = tag.to_lowercase();
+
+    // Deployment / environment indicators
+    if matches!(
+        lower.as_str(),
+        "production"
+            | "staging"
+            | "dev"
+            | "development"
+            | "ci"
+            | "cd"
+            | "kubernetes"
+            | "k8s"
+            | "docker"
+            | "container"
+            | "aws"
+            | "gcp"
+            | "azure"
+    ) {
+        return EntityLabel::Environment;
+    }
+
+    // Pipeline / workflow indicators
+    if lower.contains("pipeline")
+        || lower.contains("workflow")
+        || lower.contains("ci-cd")
+        || lower.contains("cicd")
+    {
+        return EntityLabel::Pipeline;
+    }
+
+    // Database / storage indicators
+    if matches!(
+        lower.as_str(),
+        "rocksdb"
+            | "postgres"
+            | "postgresql"
+            | "redis"
+            | "sqlite"
+            | "mongodb"
+            | "mysql"
+            | "dynamodb"
+            | "s3"
+            | "cassandra"
+            | "elasticsearch"
+    ) || lower.ends_with("db")
+        || lower.ends_with("-db")
+        || lower.ends_with("_db")
+    {
+        return EntityLabel::Database;
+    }
+
+    // Service / API indicators (suffix-only to avoid "my-api-docs" false positives)
+    if lower.ends_with("-service")
+        || lower.ends_with("_service")
+        || lower.ends_with("-api")
+        || lower.ends_with("_api")
+        || lower.ends_with("-server")
+        || lower.ends_with("_server")
+        || lower.ends_with("-daemon")
+    {
+        return EntityLabel::Service;
+    }
+
+    // Documentation indicators (check before module — README.md is a doc, not a module)
+    if lower.ends_with(".md")
+        || lower.contains("readme")
+        || lower.contains("runbook")
+        || lower.ends_with("-rfc")
+        || lower.ends_with("-spec")
+    {
+        return EntityLabel::Document;
+    }
+
+    // Configuration indicators
+    if lower.ends_with(".toml")
+        || lower.ends_with(".yaml")
+        || lower.ends_with(".yml")
+        || lower.ends_with(".env")
+        || lower.ends_with(".json")
+        || lower.contains("config")
+    {
+        return EntityLabel::Configuration;
+    }
+
+    // Module / library indicators
+    if lower.ends_with(".rs")
+        || lower.ends_with(".ts")
+        || lower.ends_with(".js")
+        || lower.ends_with(".py")
+        || lower.ends_with("-lib")
+        || lower.ends_with("_lib")
+    {
+        return EntityLabel::Module;
+    }
+
+    // Default: Technology (reasonable fallback for unknown tags)
+    EntityLabel::Technology
 }
 
 /// Memory tier for edge consolidation
@@ -182,16 +539,6 @@ impl EdgeTier {
             Self::L3Semantic => None,
         }
     }
-
-    /// Get target density for this tier
-    pub fn target_density(&self) -> f32 {
-        use crate::constants::*;
-        match self {
-            Self::L1Working => L1_TARGET_DENSITY,
-            Self::L2Episodic => L2_TARGET_DENSITY,
-            Self::L3Semantic => L3_TARGET_DENSITY,
-        }
-    }
 }
 
 /// Long-Term Potentiation status for edges (PIPE-4)
@@ -235,8 +582,13 @@ impl LtpStatus {
         match self {
             Self::None => 1.0,
             Self::Burst { detected_at } => {
-                // Check if burst has expired
-                let hours_since = (Utc::now() - *detected_at).num_hours();
+                // Check if burst has expired. Uses the frozen scoring clock
+                // (SHODH_EVAL_NOW) because this feeds effective_strength() on
+                // the read path: a live clock makes the burst-protection factor
+                // flip between recall repeats minutes apart, wobbling edge
+                // strength and graph activation. Production leaves the env
+                // unset, so this is Utc::now() there.
+                let hours_since = (crate::memory::scoring_now() - *detected_at).num_hours();
                 if hours_since > LTP_BURST_DURATION_HOURS {
                     1.0 // Expired, normal decay
                 } else {
@@ -258,7 +610,8 @@ impl LtpStatus {
         use crate::constants::LTP_BURST_DURATION_HOURS;
         match self {
             Self::Burst { detected_at } => {
-                (Utc::now() - *detected_at).num_hours() > LTP_BURST_DURATION_HOURS
+                // Frozen scoring clock on the read path (see decay_factor).
+                (crate::memory::scoring_now() - *detected_at).num_hours() > LTP_BURST_DURATION_HOURS
             }
             _ => false,
         }
@@ -353,6 +706,242 @@ pub struct RelationshipEdge {
     /// Based on synaptic tagging: behaviorally relevant synapses consolidate faster.
     #[serde(default)]
     pub entity_confidence: Option<f32>,
+
+    /// Minimum curvature selectivity of the two endpoint entities.
+    ///
+    /// Cached from EntityNode.selectivity during curvature computation.
+    /// Used by decay() to gate LTP protection: if the weakest endpoint
+    /// is a stop word (low selectivity), LTP protection is reduced,
+    /// allowing curvature-accelerated decay to clean up noise edges
+    /// even if they're frequently co-activated.
+    ///
+    /// None = not yet computed (full LTP protection applies).
+    #[serde(default)]
+    pub endpoint_selectivity: Option<f32>,
+
+    /// Forman-Ricci curvature of this edge (Leal, Restrepo, Stadler, Jost 2018)
+    ///
+    /// For directed graphs:
+    ///   F(→e→) = 2 - in_deg(source) - out_deg(target)   [flow-through]
+    ///   F(←e←) = 2 - out_deg(source) - in_deg(target)   [flow-loss]
+    ///   F(e)   = F(→e→) + F(←e←) = 4 - deg(source) - deg(target)
+    ///
+    /// Interpretation:
+    ///   Positive: edge connects low-degree nodes (tight community interior)
+    ///   Near zero: neutral / transitional
+    ///   Negative: edge bridges high-degree hubs (information bottleneck)
+    ///
+    /// Computed during heavy maintenance cycle. None = not yet computed.
+    ///
+    /// Reference: arXiv:1811.07825 — "Forman-Ricci curvature for hypergraphs"
+    #[serde(default)]
+    pub forman_curvature: Option<f32>,
+
+    /// Provenance trail: every source episode that attested this edge.
+    ///
+    /// Increment 1 (robust edge provenance): an edge is rarely attested by a
+    /// single observation. Each `ProvenanceRecord` records one source episode
+    /// that contributed to this edge, with its mention count, observation
+    /// window, optional confidence, an optional char-span REFERENCE into that
+    /// episode's content, and the typing method that decided the relation type
+    /// for that attestation. This is the capture foundation for
+    /// provenance-driven corroboration and multi-hop recall.
+    ///
+    /// `#[serde(default)]` lets legacy edges (serialized before this field
+    /// existed) deserialize to an empty trail. Bounded by
+    /// `SHODH_PROVENANCE_MAX_SOURCES` (default 8) at write time.
+    #[serde(default)]
+    pub provenance: Vec<ProvenanceRecord>,
+}
+
+/// How an edge's relation type was decided for a given attestation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TypingMethod {
+    Cue,
+    Semantic,
+    LabelPair,
+    Learned,
+    CoOccurrence,
+    Glirel,
+    OpenIe,
+    /// Event→event causal link from the CATENA event arm (signal + temporal order).
+    Catena,
+}
+
+/// One source episode that attested an edge — the unit of provenance/corroboration.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProvenanceRecord {
+    pub source_episode_id: Uuid,
+    pub mention_count: u32,
+    pub first_observed: DateTime<Utc>,
+    pub last_observed: DateTime<Utc>,
+    #[serde(default)]
+    pub confidence: Option<f32>,
+    /// Char span (start,end) into the source episode's content — a REFERENCE, not raw text (keeps edges small).
+    #[serde(default)]
+    pub evidence_span: Option<(u32, u32)>,
+    #[serde(default)]
+    pub typed_by: Option<TypingMethod>,
+}
+
+/// Default cap on the number of provenance sources retained per edge.
+const PROVENANCE_MAX_SOURCES_DEFAULT: usize = 8;
+
+/// Resolve the provenance source cap from the environment.
+///
+/// `SHODH_PROVENANCE_MAX_SOURCES` overrides the default of 8. A value of 0 or
+/// an unparseable value falls back to the default (a cap of 0 would discard all
+/// provenance, defeating the feature).
+fn provenance_max_sources() -> usize {
+    std::env::var("SHODH_PROVENANCE_MAX_SOURCES")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(PROVENANCE_MAX_SOURCES_DEFAULT)
+}
+
+/// Default minimum number of distinct attesting episodes for corroboration to
+/// shield an edge from strength-based pruning (used when `SHODH_PROVENANCE_AWARE_PRUNE=1`).
+const PROVENANCE_PRUNE_CORROBORATION_MIN_DEFAULT: usize = 3;
+
+/// Resolve the provenance-aware-pruning corroboration threshold from the env.
+///
+/// `SHODH_PROVENANCE_AWARE_PRUNE` gates the whole feature and is cached (read
+/// once per process; eval/production set it before start):
+/// - unset / `0` / `false` / empty → `None` (feature OFF — only LTP protects,
+///   exactly the pre-existing behavior),
+/// - `1` / `true` → `Some(PROVENANCE_PRUNE_CORROBORATION_MIN_DEFAULT)`,
+/// - an explicit integer `N ≥ 1` → `Some(N)` (lets an A/B sweep the threshold).
+///
+/// When `Some(min)`, an edge attested by at least `min` distinct episodes is
+/// protected from STRENGTH-based pruning only — age-based reaping still applies,
+/// so there are no immortal edges.
+fn provenance_prune_min() -> Option<usize> {
+    static FLAG: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| match std::env::var("SHODH_PROVENANCE_AWARE_PRUNE") {
+        Ok(v) => {
+            let v = v.trim();
+            if v.is_empty() || v == "0" || v.eq_ignore_ascii_case("false") {
+                None
+            } else if v == "1" || v.eq_ignore_ascii_case("true") {
+                Some(PROVENANCE_PRUNE_CORROBORATION_MIN_DEFAULT)
+            } else {
+                v.parse::<usize>().ok().filter(|&n| n > 0)
+            }
+        }
+        Err(_) => None,
+    })
+}
+
+/// Pure corroboration decision, separated from the cached env read so it is
+/// deterministically unit-testable: an edge with `provenance_len` distinct
+/// attesting episodes is protected iff the feature is enabled (`Some(min)`) and
+/// the count meets `min`.
+fn corroboration_meets(provenance_len: usize, min: Option<usize>) -> bool {
+    matches!(min, Some(m) if provenance_len >= m)
+}
+
+/// #8 measurement: total CAUSAL edges that collapsed into an existing edge in the
+/// REVERSE direction (incoming from/to is the swap of the stored edge) since
+/// process start. The order-independent typed pair key merges these silently,
+/// keeping the first-observed arrow. A high count means direction is being lost
+/// and a direction-sensitive key is justified; near-zero means it is not worth
+/// the index migration. Printed by the recall harness (grep
+/// "DIRECTED_REVERSE_COLLAPSE=").
+static DIRECTED_REVERSE_COLLAPSE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Count of causal reverse-direction collapses since process start (see above).
+pub fn directed_reverse_collapse_count() -> u64 {
+    DIRECTED_REVERSE_COLLAPSE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Merge a single observation into a provenance trail, deduplicating by episode.
+///
+/// - If `record.source_episode_id` is already present, its `mention_count` is
+///   incremented (saturating), the observation window is widened, and
+///   `confidence`/`evidence_span`/`typed_by` are filled in only when the
+///   existing value is `None` and the incoming value is `Some` (never overwrite
+///   an already-known attribute).
+/// - Otherwise the record is appended.
+///
+/// After merging, the trail is capped to `provenance_max_sources()` entries,
+/// retaining the records with the highest `mention_count` (tiebreak: most recent
+/// `last_observed`). The just-merged episode is guaranteed to survive the cap.
+fn merge_provenance(trail: &mut Vec<ProvenanceRecord>, record: ProvenanceRecord) {
+    let merged_episode = record.source_episode_id;
+
+    if let Some(existing) = trail
+        .iter_mut()
+        .find(|p| p.source_episode_id == record.source_episode_id)
+    {
+        existing.mention_count = existing.mention_count.saturating_add(record.mention_count);
+        if record.last_observed > existing.last_observed {
+            existing.last_observed = record.last_observed;
+        }
+        if record.first_observed < existing.first_observed {
+            existing.first_observed = record.first_observed;
+        }
+        if existing.confidence.is_none() {
+            existing.confidence = record.confidence;
+        }
+        if existing.evidence_span.is_none() {
+            existing.evidence_span = record.evidence_span;
+        }
+        if existing.typed_by.is_none() {
+            existing.typed_by = record.typed_by;
+        }
+    } else {
+        trail.push(record);
+    }
+
+    let cap = provenance_max_sources();
+    if trail.len() > cap {
+        // Keep the strongest records (highest mention_count, then most recent),
+        // but always keep the episode we just merged in.
+        trail.sort_by(|a, b| {
+            let a_keep = a.source_episode_id == merged_episode;
+            let b_keep = b.source_episode_id == merged_episode;
+            b_keep
+                .cmp(&a_keep)
+                .then_with(|| b.mention_count.cmp(&a.mention_count))
+                .then_with(|| b.last_observed.cmp(&a.last_observed))
+        });
+        trail.truncate(cap);
+    }
+}
+
+/// Postcard defaults for every trailing `RelationshipEdge` field added after the
+/// postcard cutover (#192), in field order: `endpoint_selectivity: Option` (None
+/// = `0x00`), `forman_curvature: Option` (None = `0x00`), `provenance: Vec` (empty
+/// = varint `0x00`). `try_decode_compat` appends these one at a time, so a record
+/// missing any suffix of these fields decodes (postcard has no `#[serde(default)]`
+/// EOF tolerance). Keep in sync with any new trailing field.
+const EDGE_PROVENANCE_DEFAULT_SUFFIX: &[u8] = &[0x00, 0x00, 0x00];
+
+/// Decode a stored `RelationshipEdge`, tolerating legacy records written before
+/// the `provenance` field existed. See [`crate::serialization::try_decode_compat`].
+///
+/// Returns `(edge, needs_migration)` where `needs_migration = true` means the
+/// record was in an older format and would benefit from being rewritten.
+fn decode_relationship_edge(data: &[u8]) -> Result<(RelationshipEdge, bool)> {
+    crate::serialization::try_decode_compat::<RelationshipEdge>(
+        data,
+        EDGE_PROVENANCE_DEFAULT_SUFFIX,
+    )
+}
+
+/// Postcard defaults for trailing `EntityNode` fields added after the postcard
+/// cutover (#192), in declaration order: `selectivity: Option` (None = `0x00`),
+/// `fine_type: Option<String>` (None = `0x00`). Keep in sync with any new
+/// trailing field — append one `0x00` (or the field's postcard-encoded default)
+/// per field, in the order the fields appear in the struct.
+const ENTITY_NODE_DEFAULT_SUFFIX: &[u8] = &[0x00, 0x00];
+
+/// Decode a stored `EntityNode`, tolerating legacy records written before trailing
+/// fields (e.g. `selectivity`, `fine_type`) existed. See [`crate::serialization::try_decode_compat`].
+fn decode_entity_node(data: &[u8]) -> Result<(EntityNode, bool)> {
+    crate::serialization::try_decode_compat::<EntityNode>(data, ENTITY_NODE_DEFAULT_SUFFIX)
 }
 
 fn default_last_activated() -> DateTime<Utc> {
@@ -489,6 +1078,111 @@ impl RelationshipEdge {
         // PIPE-5: L3 auto-LTP removed - now handled by unified ltp_readiness()
         // The readiness formula combines strength + activation count + entity confidence,
         // ensuring both intensity and repetition evidence are required for Full LTP.
+
+        promotion_result
+    }
+
+    /// Importance-gated Hebbian strengthening.
+    ///
+    /// Identical to `strengthen()` but scales the Hebbian boost by source memory
+    /// importance. The importance is mapped to [`STRENGTHEN_IMPORTANCE_FLOOR`, 1.0],
+    /// so even low-importance memories still strengthen edges (preventing starvation),
+    /// but high-importance memories get disproportionately stronger edges — making
+    /// them win during spreading activation traversal.
+    ///
+    /// Use this instead of `strengthen()` when the source memory importance is known
+    /// (e.g., in `reinforce_recall` where recalled memory IDs are available).
+    pub fn strengthen_with_importance(&mut self, importance: f32) -> Option<(String, String)> {
+        use crate::constants::*;
+
+        let scale = STRENGTHEN_IMPORTANCE_FLOOR + importance * (1.0 - STRENGTHEN_IMPORTANCE_FLOOR);
+
+        let now = Utc::now();
+        self.activation_count += 1;
+        self.last_activated = now;
+
+        self.record_activation_timestamp(now);
+
+        let tier_boost = match self.tier {
+            EdgeTier::L1Working => TIER_CO_ACCESS_BOOST,
+            EdgeTier::L2Episodic => TIER_CO_ACCESS_BOOST * 0.8,
+            EdgeTier::L3Semantic => TIER_CO_ACCESS_BOOST * 0.5,
+        };
+        // Scale the boost by importance: high-importance → full boost, low → 20% floor
+        let boost = (LTP_LEARNING_RATE + tier_boost) * (1.0 - self.strength) * scale;
+        self.strength = (self.strength + boost).min(1.0);
+
+        // LTP detection (same as strengthen — only upgrade, never downgrade)
+        let new_ltp_status = self.detect_ltp_status(now);
+        if new_ltp_status.priority() > self.ltp_status.priority() {
+            let old_status = self.ltp_status;
+            self.ltp_status = new_ltp_status;
+
+            let bonus = match new_ltp_status {
+                LtpStatus::Burst { .. } => 0.05,
+                LtpStatus::Weekly => 0.1,
+                LtpStatus::Full => 0.2,
+                LtpStatus::None => 0.0,
+            };
+            self.strength = (self.strength + bonus).min(1.0);
+
+            tracing::debug!(
+                "Edge {} LTP upgrade: {:?} → {:?} (activations: {}, age: {} days)",
+                self.uuid,
+                old_status,
+                self.ltp_status,
+                self.activation_count,
+                (now - self.created_at).num_days()
+            );
+        }
+
+        if self.ltp_status.is_burst_expired() {
+            let weekly_check = self.detect_weekly_pattern();
+            if weekly_check {
+                self.ltp_status = LtpStatus::Weekly;
+            } else {
+                self.ltp_status = LtpStatus::None;
+            }
+        }
+
+        // Tier promotion
+        let mut promotion_result = None;
+        if let Some(threshold) = self.tier.promotion_threshold() {
+            if self.strength >= threshold {
+                if let Some(next_tier) = self.tier.next_tier() {
+                    let old_tier = self.tier;
+                    self.tier = next_tier;
+                    self.strength = self.strength.max(next_tier.initial_weight());
+
+                    if old_tier == EdgeTier::L1Working {
+                        self.activation_timestamps =
+                            Some(VecDeque::with_capacity(ACTIVATION_HISTORY_L2_CAPACITY));
+                        if let Some(ref mut ts) = self.activation_timestamps {
+                            ts.push_back(now);
+                        }
+                    }
+
+                    if old_tier == EdgeTier::L2Episodic {
+                        if let Some(ref mut ts) = self.activation_timestamps {
+                            let current = ts.capacity();
+                            if current < ACTIVATION_HISTORY_L3_CAPACITY {
+                                ts.reserve(ACTIVATION_HISTORY_L3_CAPACITY - current);
+                            }
+                        }
+                    }
+
+                    tracing::debug!(
+                        "Edge {} promoted: {:?} → {:?}",
+                        self.uuid,
+                        old_tier,
+                        self.tier
+                    );
+
+                    promotion_result =
+                        Some((format!("{:?}", old_tier), format!("{:?}", self.tier)));
+                }
+            }
+        }
 
         promotion_result
     }
@@ -635,27 +1329,6 @@ impl RelationshipEdge {
         }
     }
 
-    /// Check if edge was active at similar time of day (for temporal retrieval)
-    pub fn time_of_day_match(&self, target_hour: u32, window_hours: u32) -> usize {
-        use chrono::Timelike;
-
-        match &self.activation_timestamps {
-            Some(ts) => ts
-                .iter()
-                .filter(|t| {
-                    let hour = t.hour();
-                    let diff = if hour > target_hour {
-                        (hour - target_hour).min(24 + target_hour - hour)
-                    } else {
-                        (target_hour - hour).min(24 + hour - target_hour)
-                    };
-                    diff <= window_hours
-                })
-                .count(),
-            None => 0,
-        }
-    }
-
     /// Apply time-based decay to this synapse
     ///
     /// Uses tier-aware decay model (3-tier memory consolidation):
@@ -672,10 +1345,40 @@ impl RelationshipEdge {
     /// repeated calls.
     ///
     /// Returns true if synapse should be pruned (below tier's threshold)
+    /// True when multi-source corroboration should shield this edge from
+    /// STRENGTH-based pruning. Off by default; enabled via
+    /// `SHODH_PROVENANCE_AWARE_PRUNE`. Age-based reaping is unaffected, so a
+    /// corroborated edge is never immortal.
+    fn corroboration_protected(&self) -> bool {
+        corroboration_meets(self.provenance.len(), provenance_prune_min())
+    }
+
+    /// True when this edge is shielded from strength-based pruning by either LTP
+    /// potentiation or (when enabled) multi-source corroboration. Used by the
+    /// strength-only prune-queue paths, which carry no age dimension.
+    pub fn is_prune_protected(&self) -> bool {
+        self.ltp_status.is_potentiated() || self.corroboration_protected()
+    }
+
     pub fn decay(&mut self) -> bool {
+        self.decay_at(Utc::now())
+    }
+
+    /// Apply time-decay as of an explicit `now`, returning whether the edge
+    /// should be pruned.
+    ///
+    /// `decay()` is the production entry point (`now = Utc::now()`); this
+    /// variant takes the clock as a parameter so decay is deterministically
+    /// testable and so the decay-simulation harness can drive an edge through
+    /// many cycles at a controlled cadence. The cadence is load-bearing:
+    /// because each call resets `last_activated = now`, the *per-cycle* elapsed
+    /// time is what `hybrid_decay_factor` sees. Simulating one large jump would
+    /// land directly in the power-law phase and hide the periodic dynamics that
+    /// production actually exhibits (every ~6h), so faithful evaluation must
+    /// step at the real cadence.
+    pub fn decay_at(&mut self, now: DateTime<Utc>) -> bool {
         use crate::decay::tier_decay_factor;
 
-        let now = Utc::now();
         let elapsed = now.signed_duration_since(self.last_activated);
         let hours_elapsed = elapsed.num_seconds() as f64 / 3600.0;
 
@@ -687,14 +1390,54 @@ impl RelationshipEdge {
         let hours_elapsed = hours_elapsed.min(8760.0);
 
         // Tier-aware decay with PIPE-4 multi-scale LTP
-        let tier_num = match self.tier {
-            EdgeTier::L1Working => 0,
-            EdgeTier::L2Episodic => 1,
-            EdgeTier::L3Semantic => 2,
+        let raw_ltp_factor = self.ltp_status.decay_factor();
+
+        // Gate LTP protection by endpoint selectivity (habituation mechanism).
+        // Low-selectivity edges (connecting stop-word entities) get reduced
+        // LTP protection regardless of activation count, because high-frequency
+        // low-information signals should habituate, not potentiate.
+        //
+        // effective_ltp = raw_ltp * (selectivity / (selectivity + half_sat))
+        //
+        // selectivity=0.0 → effective_ltp=raw_ltp*0.0 = 1.0 (no protection)
+        // selectivity=0.5 → effective_ltp=raw_ltp*0.5 (half protection)
+        // selectivity=5.0 → effective_ltp=raw_ltp*0.91 (nearly full protection)
+        // selectivity=None → full protection (not yet computed, conservative)
+        let ltp_factor = match self.endpoint_selectivity {
+            Some(sel) if sel < crate::constants::SELECTIVITY_STOP_WORD_THRESHOLD => {
+                // Blend toward 1.0 (no protection) as selectivity → 0
+                let gate = sel / (sel + crate::constants::SELECTIVITY_HALF_SAT);
+                // ltp_factor is in (0, 1]: 0.1 = Full LTP, 1.0 = no LTP
+                // gate → 0 means override toward 1.0 (no protection)
+                raw_ltp_factor + (1.0 - raw_ltp_factor) * (1.0 - gate)
+            }
+            _ => raw_ltp_factor, // Not computed yet or above threshold: full protection
         };
-        let ltp_factor = self.ltp_status.decay_factor();
-        let (decay_factor, exceeded_max_age) =
-            tier_decay_factor(hours_elapsed, tier_num, ltp_factor);
+
+        let (decay_factor, exceeded_max_age) = match self.tier {
+            EdgeTier::L1Working => {
+                // L1: aggressive exponential — correct for working memory
+                tier_decay_factor(hours_elapsed, 0, ltp_factor)
+            }
+            EdgeTier::L2Episodic | EdgeTier::L3Semantic => {
+                // L2/L3: Wixted 2004 hybrid (exponential consolidation → power-law long-term)
+                let days = hours_elapsed / 24.0;
+                // Burst/Weekly/Full LTP all use the potentiated (slower) power-law.
+                // decay_factor() returns exactly 0.5 for Burst, so `<` would exclude it
+                // (off-by-one) and decay Burst edges at the non-potentiated rate.
+                let is_potentiated = ltp_factor <= 0.5;
+                let decay = crate::decay::hybrid_decay_factor(days, is_potentiated);
+                let prune_threshold = self.tier.prune_threshold();
+                // Min age before pruning: 30 days for L2, 90 days for L3
+                let min_prune_hours = if matches!(self.tier, EdgeTier::L3Semantic) {
+                    2160.0
+                } else {
+                    720.0
+                };
+                let should_prune = decay < prune_threshold && hours_elapsed > min_prune_hours;
+                (decay, should_prune)
+            }
+        };
         self.strength *= decay_factor;
 
         // Update last_activated to prevent double-decay on repeated calls
@@ -723,12 +1466,54 @@ impl RelationshipEdge {
             self.ltp_status = LtpStatus::None;
         }
 
-        // Return whether this synapse should be pruned
-        // Prune if: exceeded max age OR below prune threshold (unless any LTP protection)
+        // Return whether this synapse should be pruned.
+        // - LTP potentiation protects from everything (age AND strength).
+        // - Age forces a prune next (no immortal edges).
+        // - Multi-source corroboration (opt-in) protects from strength-only decay:
+        //   a relationship independently attested by several episodes survives the
+        //   decay of its activation strength, but not old age.
+        // - Otherwise, prune once strength falls to the tier threshold.
         if self.ltp_status.is_potentiated() {
             false
+        } else if exceeded_max_age {
+            true
+        } else if self.corroboration_protected() {
+            false
         } else {
-            exceeded_max_age || self.strength <= prune_threshold
+            self.strength <= prune_threshold
+        }
+    }
+
+    /// Construct a synthetic, non-persisted edge for the decay-simulation
+    /// harness. `created_at`/`valid_at`/`last_activated` are anchored at
+    /// `origin` so a harness can then drive `decay_at` forward from a known
+    /// point. Entity UUIDs are random; this is never written to storage.
+    pub(crate) fn synthetic_for_sim(
+        strength: f32,
+        tier: EdgeTier,
+        ltp_status: LtpStatus,
+        origin: DateTime<Utc>,
+    ) -> Self {
+        Self {
+            uuid: Uuid::new_v4(),
+            from_entity: Uuid::new_v4(),
+            to_entity: Uuid::new_v4(),
+            relation_type: RelationType::RelatedTo,
+            strength,
+            created_at: origin,
+            valid_at: origin,
+            invalidated_at: None,
+            source_episode_id: None,
+            context: String::new(),
+            last_activated: origin,
+            activation_count: 0,
+            ltp_status,
+            activation_timestamps: None,
+            tier,
+            entity_confidence: None,
+            forman_curvature: None,
+            endpoint_selectivity: None,
+            provenance: Vec::new(),
         }
     }
 
@@ -740,7 +1525,13 @@ impl RelationshipEdge {
     pub fn effective_strength(&self) -> f32 {
         use crate::decay::tier_decay_factor;
 
-        let now = Utc::now();
+        // Use the frozen scoring clock (SHODH_EVAL_NOW) on the eval path: this
+        // read-only decay feeds spreading-activation strength, and a live clock
+        // makes edges decay measurably between recall repeats minutes apart
+        // (L1Working edges decay over hours), wobbling episode activations and
+        // flipping near-tie graph-leg ranks. Production leaves SHODH_EVAL_NOW
+        // unset, so this is `Utc::now()` there — identical behaviour.
+        let now = crate::memory::scoring_now();
         let elapsed = now.signed_duration_since(self.last_activated);
         let hours_elapsed = elapsed.num_seconds() as f64 / 3600.0;
 
@@ -748,13 +1539,20 @@ impl RelationshipEdge {
             return self.strength;
         }
 
-        let tier_num = match self.tier {
-            EdgeTier::L1Working => 0,
-            EdgeTier::L2Episodic => 1,
-            EdgeTier::L3Semantic => 2,
-        };
         let ltp_factor = self.ltp_status.decay_factor();
-        let (decay_factor, _) = tier_decay_factor(hours_elapsed, tier_num, ltp_factor);
+        let (decay_factor, _) = match self.tier {
+            EdgeTier::L1Working => tier_decay_factor(hours_elapsed, 0, ltp_factor),
+            EdgeTier::L2Episodic | EdgeTier::L3Semantic => {
+                // Wixted 2004 hybrid: exponential consolidation → power-law long-term
+                let days = hours_elapsed / 24.0;
+                // Inclusive: Burst decay_factor() == 0.5 must take the potentiated path.
+                let is_potentiated = ltp_factor <= 0.5;
+                (
+                    crate::decay::hybrid_decay_factor(days, is_potentiated),
+                    false,
+                )
+            }
+        };
         (self.strength * decay_factor).max(LTP_MIN_STRENGTH)
     }
 
@@ -845,7 +1643,13 @@ impl RelationshipEdge {
     }
 }
 
-/// Relationship types following Graphiti's semantic model
+/// Relationship types for ontological edge classification.
+///
+/// Extends Graphiti's semantic model with management, operational, and
+/// evolution relationships for DevOps, software engineering, and robotics.
+///
+/// New variants are additive only — never remove existing variants to
+/// maintain backward compatibility with MessagePack-serialized data.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum RelationType {
     /// Work relationships
@@ -876,7 +1680,7 @@ pub enum RelationType {
     Knows,
     Teaches,
 
-    /// Generic relationships
+    /// Generic relationships (never penalized by ontological filtering)
     RelatedTo,
     AssociatedWith,
 
@@ -886,6 +1690,51 @@ pub enum RelationType {
     /// Sentence co-occurrence (entities appearing in same sentence)
     /// Key for multi-hop: "Melanie" <-> "sunrise" when "Melanie painted a sunrise"
     CoOccurs,
+
+    // =========================================================================
+    // Extended ontological relations (added 2026-03)
+    // =========================================================================
+    /// Management / Governance
+    /// Person/Team manages Project/Service/Team
+    Manages,
+    /// Service/Module depends on Service/Module
+    DependsOn,
+    /// Task requires Skill/Technology
+    Requires,
+    /// Configuration configures Service/Environment
+    Configures,
+
+    /// Preference / Recommendation
+    /// Person prefers Technology/Configuration/Approach
+    Prefers,
+    /// Person/Role recommends Technology/Approach
+    Recommends,
+
+    /// Document / Knowledge
+    /// Document documents Service/API/Project
+    Documents,
+    /// Module/Service implements Concept/Spec
+    Implements,
+
+    /// Operational
+    /// Pipeline deploys Service to Environment
+    DeploysTo,
+    /// Metric/Service monitors Service/Pipeline
+    Monitors,
+    /// Event/Pipeline triggers Pipeline/Task
+    Triggers,
+
+    /// Comparison / Evolution
+    /// Technology/Config superseded by newer version
+    SupersededBy,
+    /// Technology is alternative to Technology
+    AlternativeTo,
+
+    /// Assignment
+    /// Task assigned to Person/Team
+    AssignedTo,
+    /// Person/Role approves Task/Document
+    Approves,
 
     /// Custom relationship
     Custom(String),
@@ -916,8 +1765,314 @@ impl RelationType {
             Self::AssociatedWith => "AssociatedWith",
             Self::CoRetrieved => "CoRetrieved",
             Self::CoOccurs => "CoOccurs",
+            Self::Manages => "Manages",
+            Self::DependsOn => "DependsOn",
+            Self::Requires => "Requires",
+            Self::Configures => "Configures",
+            Self::Prefers => "Prefers",
+            Self::Recommends => "Recommends",
+            Self::Documents => "Documents",
+            Self::Implements => "Implements",
+            Self::DeploysTo => "DeploysTo",
+            Self::Monitors => "Monitors",
+            Self::Triggers => "Triggers",
+            Self::SupersededBy => "SupersededBy",
+            Self::AlternativeTo => "AlternativeTo",
+            Self::AssignedTo => "AssignedTo",
+            Self::Approves => "Approves",
             Self::Custom(s) => s.as_str(),
         }
+    }
+
+    /// Intrinsic spreading-activation weight for this relation type — lever-1
+    /// prototype, gated at the call site by `SHODH_GRAPH_PREDICATE_WEIGHTS`.
+    ///
+    /// A co-occurrence edge is weak evidence of a real relationship: the two
+    /// entities were merely co-mentioned. A typed predicate (causal, employment,
+    /// structural) encodes an actual relation. Spreading activation should flow
+    /// preferentially along meaning rather than adjacency, otherwise traversal over
+    /// a co-occurrence graph just rediscovers lexical co-occurrence (which BM25
+    /// already has). Weights are centred near 1.0 so the flag RE-WEIGHTS the graph
+    /// instead of globally scaling it; the load-bearing contrast is the 2.6× gap
+    /// between `CoOccurs` (0.5) and the causal relations (1.3).
+    pub fn spreading_weight(&self) -> f32 {
+        use RelationType::*;
+        match self {
+            // Causal relations — the lineage / multi-hop backbone.
+            Causes | ResultsIn | Triggers | SupersededBy => 1.3,
+            // Strong typed relations between distinct entities.
+            WorksAt | EmployedBy | Manages | AssignedTo | Approves | OwnedBy | CreatedBy
+            | DevelopedBy | Teaches => 1.1,
+            // Structural / functional relations.
+            PartOf | Contains | LocatedIn | LocatedAt | DependsOn | Requires | Uses
+            | Implements | Configures | DeploysTo | Monitors | Documents | WorksWith | Knows
+            | Learned | Prefers | Recommends => 1.0,
+            AlternativeTo => 0.9,
+            // Generic associations — progressively weaker evidence of meaning.
+            AssociatedWith | CoRetrieved => 0.7,
+            RelatedTo => 0.6,
+            CoOccurs => 0.5,
+            Custom(_) => 1.0,
+        }
+    }
+
+    /// Whether this relation encodes forward causation (cause `from` → effect
+    /// `to`). Used by backward causal-origin tracing: to find the origin of an
+    /// effect, walk these edges from the effect (`to`) toward the cause (`from`).
+    pub fn is_causal(&self) -> bool {
+        matches!(
+            self,
+            RelationType::Causes | RelationType::Triggers | RelationType::ResultsIn
+        )
+    }
+}
+
+/// SHODH_PERSON_PERSON_KNOWS=1 — type Person↔Person co-mentions as `Knows`
+/// instead of `CoOccurs`. Cached: read once per process (eval sets env before
+/// start; production restarts to change it).
+fn person_person_knows() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| {
+        std::env::var("SHODH_PERSON_PERSON_KNOWS")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    })
+}
+
+/// Match relational cue phrases in ALREADY-LOWERCASED text → a typed predicate.
+/// Shared by the whole-text and span-scoped extractors below.
+fn predicate_from_cues(t: &str) -> Option<(RelationType, &'static str)> {
+    use RelationType::*;
+    // Return the FIRST cue needle present in `t` (needle order = signal strength),
+    // so the caller learns both the predicate and the exact lexeme that fired.
+    let first = |needles: &[&'static str]| needles.iter().copied().find(|n| t.contains(n));
+
+    // Ordered by signal strength; first match wins. Cue fragments are chosen to
+    // survive an entity splitting the verb phrase ("X set Y in motion") — real text
+    // rarely keeps a relational verb contiguous, so matching only "set in motion"
+    // would miss the relation it is meant to capture.
+    if let Some(n) = first(&[
+        "in motion",
+        "brought about",
+        "gave rise",
+        "triggered",
+        "led directly to",
+        "led to",
+        "resulted in",
+        "caused",
+        "because of",
+        "due to",
+    ]) {
+        return Some((Triggers, n));
+    }
+    if let Some(n) = first(&[
+        "superseded",
+        "replaced by",
+        "deprecated",
+        "obsoleted",
+        "rolled back",
+    ]) {
+        return Some((SupersededBy, n));
+    }
+    if let Some(n) = first(&[
+        "manages",
+        "manager of",
+        "oversees",
+        "supervises",
+        "in charge of",
+    ]) {
+        return Some((Manages, n));
+    }
+    if let Some(n) = first(&[
+        "works at",
+        "works for",
+        "employed by",
+        "employee of",
+        "joined",
+    ]) {
+        return Some((WorksAt, n));
+    }
+    if let Some(n) = first(&[
+        "created",
+        "developed",
+        "built",
+        "founded",
+        "designed",
+        "authored",
+    ]) {
+        return Some((CreatedBy, n));
+    }
+    if let Some(n) = first(&["depends on", "relies on", "requires", "needs"]) {
+        return Some((DependsOn, n));
+    }
+    if let Some(n) = first(&["located in", "based in", "headquartered", "situated in"]) {
+        return Some((LocatedIn, n));
+    }
+    if let Some(n) = first(&["part of", "belongs to", "member of", "division of"]) {
+        return Some((PartOf, n));
+    }
+    if let Some(n) = first(&["uses", "using", "powered by", "built on"]) {
+        return Some((Uses, n));
+    }
+    None
+}
+
+/// Whole-text predicate recovery (lever-1, gated at the call site by
+/// `SHODH_GRAPH_EXTRACTED_PREDICATES`). Undirected and clause-blind — kept for the
+/// simple single-relation path and unit tests. Prefer `extract_directed_predicate`
+/// at edge-creation time.
+pub fn extract_predicate_from_text(text: &str) -> Option<RelationType> {
+    predicate_from_cues(&text.to_ascii_lowercase()).map(|(rt, _)| rt)
+}
+
+/// Span-scoped, DIRECTION-aware predicate recovery. Locates both entity mentions,
+/// scans only the sentence containing BOTH for a cue, and decides direction by
+/// surface order (the earlier mention is the subject/cause → `from_entity`),
+/// FLIPPED for effect-first constructions (see below).
+/// Returns `(relation, a_is_source)`; `None` when the mentions don't co-occur in
+/// one sentence or no cue is present, so the caller keeps the label-pair inference.
+///
+/// This fixes the two bugs that left lineage at P@1=0: a multi-relation sentence no
+/// longer types every pair the same (sentence-scoped), and the causal arrow now
+/// points cause→effect by surface order instead of trusting NER's entity ordering
+/// (the likely cause of the failed first measurement — a reversed arrow makes the
+/// backward origin-walk dead-end).
+///
+/// DIRECTION FIX (substrate audit 2026-06-10): surface order is only correct for
+/// cause-first constructions ("B triggered A"). Effect-first constructions invert
+/// it — "A happened BECAUSE OF B" / "A DUE TO B" / passive "A WAS CAUSED BY B" all
+/// put the EFFECT first, so the earlier mention is NOT the cause. Three of the ten
+/// causal cues systematically wrote reversed arrows, dead-ending the backward
+/// origin-walk for exactly those sentences. When an effect-first cue is present in
+/// the sentence, the arrow flips.
+pub fn extract_directed_predicate(
+    text: &str,
+    name_a: &str,
+    name_b: &str,
+) -> Option<(RelationType, bool)> {
+    let lc = text.to_ascii_lowercase();
+    let a = name_a.to_ascii_lowercase();
+    let b = name_b.to_ascii_lowercase();
+    if a.is_empty() || b.is_empty() {
+        return None;
+    }
+    let pa = lc.find(&a)?;
+    let pb = lc.find(&b)?;
+    if pa == pb {
+        return None;
+    }
+    // Window spanning both mentions, then clamp to the enclosing sentence so a cue
+    // from a neighbouring clause cannot leak in.
+    let (lo, hi) = if pa < pb {
+        (pa, pb + b.len())
+    } else {
+        (pb, pa + a.len())
+    };
+    let sent_start = lc[..lo]
+        .rfind(['.', '!', '?', ';', '\n'])
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    let sent_end = lc[hi..]
+        .find(['.', '!', '?', ';', '\n'])
+        .map(|i| hi + i)
+        .unwrap_or(lc.len());
+    let sentence = &lc[sent_start..sent_end];
+    let (rt, cue) = predicate_from_cues(sentence)?;
+
+    // PREDICATE-FRAGMENT GATE. A model-free fallback NER (no GLiNER assets) mints
+    // the cue's OWN words as entities — "motion" from "in motion", "brought" from
+    // "brought about". Such a mention sits INSIDE the predicate span, so it is the
+    // relation lexeme, not a causal argument. Left unchecked it becomes a shared
+    // causal endpoint across every sentence that uses the same cue, welding
+    // unrelated chains into cross-document causal bridges (the fallback-path
+    // lineage flood; the GLiNER typer never emits these predicate spans, so this
+    // gate is a no-op on the model path). An endpoint whose mention overlaps the
+    // fired cue's span is disqualified.
+    if let Some(cue_off) = sentence.find(cue) {
+        let cue_lo = sent_start + cue_off;
+        let cue_hi = cue_lo + cue.len();
+        let overlaps_cue = |lo: usize, len: usize| lo < cue_hi && cue_lo < lo + len;
+        if overlaps_cue(pa, a.len()) || overlaps_cue(pb, b.len()) {
+            return None;
+        }
+    }
+
+    // Effect-first constructions: the earlier mention is the EFFECT, not the cause.
+    const EFFECT_FIRST_CUES: [&str; 4] = ["because of", "due to", "caused by", "triggered by"];
+    let effect_first = EFFECT_FIRST_CUES.iter().any(|c| sentence.contains(c));
+    let a_first = pa < pb;
+    Some((rt, if effect_first { !a_first } else { a_first }))
+}
+
+/// Infer a typed relation between two entities based on their labels.
+///
+/// Uses ontological rules to assign semantically meaningful edge types
+/// instead of the default `RelatedTo`. Falls back to `CoOccurs` for
+/// co-mentioned entity pairs with no specific ontological relationship.
+///
+/// `add_relationship()` deduplicates by (from, to, relation_type) — same
+/// typed pair strengthens the existing edge rather than creating a duplicate.
+pub fn infer_relation_type_for_pair(from: &EntityLabel, to: &EntityLabel) -> RelationType {
+    use EntityLabel::*;
+    use RelationType::*;
+
+    match (from, to) {
+        // Person↔Person — the dominant pair in conversational/personal memory —
+        // previously had NO rule and fell through to CoOccurs (the mechanical
+        // cause of the >80%-untyped graph on conversational corpora, substrate
+        // audit 2026-06-10). Typed as Knows behind SHODH_PERSON_PERSON_KNOWS
+        // because the change is NOT free: non-generic types become eligible for
+        // ontological relation penalties and predicate weighting, so it must be
+        // A/B'd, not assumed.
+        (Person, Person) if person_person_knows() => Knows,
+
+        // Person relationships
+        (Person, Organization) | (Person, Team) => WorksAt,
+        (Person, Technology) | (Person, Service) | (Person, Database) => Uses,
+        (Person, Skill) => Learned,
+
+        // Task relationships
+        (Task, Person) | (Task, Team) => AssignedTo,
+        (Task, Technology) | (Task, Service) => Requires,
+
+        // Service/Module dependencies
+        (Service, Database) => Uses,
+        (Module, Module) | (Service, Service) | (Module, Service) | (Service, Module) => DependsOn,
+
+        // Pipeline / deployment
+        (Pipeline, Service) | (Pipeline, Environment) => DeploysTo,
+
+        // Monitoring
+        (Metric, Service) | (Metric, Pipeline) => Monitors,
+
+        // Configuration
+        (Configuration, Service) | (Configuration, Environment) => Configures,
+
+        // Documentation
+        (Document, Service) | (Document, Module) | (Document, Pipeline) | (Document, Project) => {
+            Documents
+        }
+
+        // Part-of / containment
+        (Task, Project)
+        | (Document, Repository)
+        | (Repository, Project)
+        | (Module, Project)
+        | (Service, Project) => PartOf,
+
+        // Two technologies co-mentioned were previously typed AlternativeTo —
+        // fabricated semantics from labels alone (co-mention says nothing about
+        // substitutability), and as a "confident" type it suppressed the cue
+        // extractor, starving the causal walk (the lineage-zero root cause,
+        // 2026-06-10). Co-mention is co-occurrence; real relations come from
+        // sentence evidence (semantic typer / cues).
+        (Technology, Technology) => CoOccurs,
+
+        // Location relationships (either direction)
+        (_, Location) | (Location, _) => LocatedIn,
+
+        // Default: co-occurrence (neutral bridge weight in spreading activation)
+        _ => CoOccurs,
     }
 }
 
@@ -958,6 +2113,38 @@ pub enum EpisodeSource {
     Observation,
 }
 
+/// Minimum dormancy (days since last activation) for an edge re-attestation
+/// to count as a [`TemporalAnomalyKind::DormantReactivation`] event.
+const DORMANT_REACTIVATION_MIN_DAYS: f32 = 7.0;
+
+/// Backstop cap on the pending temporal-anomaly queue (drained by the ingest
+/// path; the cap only matters if nothing drains it).
+const TEMPORAL_EVENT_QUEUE_CAP: usize = 1024;
+
+/// What kind of temporal anomaly the LTP/strengthen machinery surfaced.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub enum TemporalAnomalyKind {
+    /// An edge dormant for at least [`DORMANT_REACTIVATION_MIN_DAYS`] was
+    /// re-attested — a stale pattern suddenly became live again.
+    DormantReactivation,
+}
+
+/// A temporal anomaly detected at edge-strengthen time — SURFACED from the
+/// dynamics the Hebbian/decay machinery already runs, not re-detected.
+/// Queued on the graph (mirroring `pending_prune`) and drained by the ingest
+/// path, which resolves entity names and emits the event on SSE.
+#[derive(Debug, Clone, Serialize)]
+pub struct TemporalAnomalyEvent {
+    pub kind: TemporalAnomalyKind,
+    pub edge_uuid: Uuid,
+    pub from_entity: Uuid,
+    pub to_entity: Uuid,
+    pub relation_type: RelationType,
+    /// Days the edge sat dormant before this reactivation.
+    pub gap_days: f32,
+    pub detected_at: DateTime<Utc>,
+}
+
 /// Graph memory storage and operations
 ///
 /// Uses a single RocksDB instance with 9 column families for all graph data.
@@ -977,6 +2164,11 @@ pub struct GraphMemory {
     /// Key: Porter-stemmed lowercase name, Value: Entity UUID
     entity_stemmed_index: Arc<parking_lot::RwLock<HashMap<String, Uuid>>>,
 
+    /// In-memory alias index (loaded from the alias CF): a surface form
+    /// (lowercased) -> the canonical entity UUID it resolves to. Curated by the
+    /// entity resolver; the highest-priority tier in `find_entity_by_name`.
+    entity_alias_index: Arc<parking_lot::RwLock<HashMap<String, Uuid>>>,
+
     // === Atomic counters for O(1) stats (P1 fix) ===
     /// Entity count - initialized from entity_name_index.len(), updated on add
     entity_count: Arc<AtomicUsize>,
@@ -995,15 +2187,32 @@ pub struct GraphMemory {
     /// Maps entity UUID → embedding vector. Loaded on startup, updated on add.
     /// Used when string-based dedup (exact/case/stemmed) fails — catches synonyms
     /// like "authentication" ↔ "auth" via cosine similarity.
+    #[allow(clippy::type_complexity)]
     entity_embedding_cache: Arc<parking_lot::RwLock<Vec<(Uuid, Vec<f32>)>>>,
 
     /// Edges found below prune threshold during lazy-decay reads.
     /// Flushed as batch deletes on each maintenance cycle (no full scan needed).
     pending_prune: parking_lot::Mutex<Vec<Uuid>>,
 
+    /// Temporal anomalies surfaced at strengthen time (dormant reactivation),
+    /// drained by the ingest path and emitted on SSE. Capped backstop.
+    pending_temporal_anomalies: parking_lot::Mutex<Vec<TemporalAnomalyEvent>>,
+
     /// Entities that may have become orphaned from pruned edges.
     /// Checked during flush_pending_maintenance().
     pending_orphan_checks: parking_lot::Mutex<Vec<Uuid>>,
+
+    /// Topology-aware decay (W1-B): smoothed per-node structural protection in
+    /// `[0, 1]`, carried across heavy cycles for hysteresis. Recomputed (not
+    /// persisted) each heavy cycle from the current edge set when
+    /// `SHODH_TOPOLOGY_AWARE_DECAY` is on — persisting it would go stale the
+    /// instant any edge is added or pruned, and would cost a full entities-CF
+    /// rewrite per cycle (like the curvature pass) for a value consumed only
+    /// within the same cycle's prune decision. In-memory means a process restart
+    /// re-derives protection from current structure (conservative: it never
+    /// over-protects, it just loses the "was recently a bridge" tail). Empty and
+    /// untouched when the flag is off.
+    topology_protection: parking_lot::RwLock<HashMap<Uuid, f32>>,
 }
 
 impl GraphMemory {
@@ -1057,6 +2266,9 @@ impl GraphMemory {
         self.db
             .cf_handle(CF_STEMMED_INDEX)
             .expect("stemmed_index CF must exist")
+    }
+    fn alias_cf(&self) -> &ColumnFamily {
+        self.db.cf_handle(CF_ALIAS).expect("alias CF must exist")
     }
 
     /// Create a new graph memory system.
@@ -1120,18 +2332,28 @@ impl GraphMemory {
         // Load/migrate stemmed index for O(1) linguistic lookup
         let entity_stemmed_index = Self::load_or_migrate_stemmed_index(&db, &entity_name_index)?;
 
+        // Load the alias index (surface -> canonical UUID). New CF: empty for
+        // pre-existing DBs, no migration — it is populated only by the resolver.
+        let entity_alias_index = Self::load_alias_index(&db)?;
+
         let entity_count = entity_name_index.len();
 
         // Count relationships and episodes during startup (one-time cost)
         // This is O(n) at startup, but get_stats() will be O(1) at runtime
-        let relationships_cf = db.cf_handle(CF_RELATIONSHIPS).unwrap();
-        let episodes_cf = db.cf_handle(CF_EPISODES).unwrap();
-        let relationship_count = Self::count_cf_entries(&db, relationships_cf);
+        let relationships_cf = db
+            .cf_handle(CF_RELATIONSHIPS)
+            .ok_or_else(|| anyhow::anyhow!("CF '{}' not found after DB open", CF_RELATIONSHIPS))?;
+        let episodes_cf = db
+            .cf_handle(CF_EPISODES)
+            .ok_or_else(|| anyhow::anyhow!("CF '{}' not found after DB open", CF_EPISODES))?;
+        let relationship_count = Self::count_relationship_edges(&db, relationships_cf);
         let episode_count = Self::count_cf_entries(&db, episodes_cf);
 
         // Load entity embedding cache for concept merging
         // Only entities with pre-computed name_embeddings are cached
-        let entities_cf = db.cf_handle(CF_ENTITIES).unwrap();
+        let entities_cf = db
+            .cf_handle(CF_ENTITIES)
+            .ok_or_else(|| anyhow::anyhow!("CF '{}' not found after DB open", CF_ENTITIES))?;
         let entity_embedding_cache =
             Self::load_entity_embedding_cache(&db, entities_cf, &entity_name_index);
         let embedding_cache_size = entity_embedding_cache.len();
@@ -1141,13 +2363,16 @@ impl GraphMemory {
             entity_name_index: Arc::new(parking_lot::RwLock::new(entity_name_index)),
             entity_lowercase_index: Arc::new(parking_lot::RwLock::new(entity_lowercase_index)),
             entity_stemmed_index: Arc::new(parking_lot::RwLock::new(entity_stemmed_index)),
+            entity_alias_index: Arc::new(parking_lot::RwLock::new(entity_alias_index)),
             entity_count: Arc::new(AtomicUsize::new(entity_count)),
             relationship_count: Arc::new(AtomicUsize::new(relationship_count)),
             episode_count: Arc::new(AtomicUsize::new(episode_count)),
             synapse_update_lock: Arc::new(parking_lot::Mutex::new(())),
             entity_embedding_cache: Arc::new(parking_lot::RwLock::new(entity_embedding_cache)),
             pending_prune: parking_lot::Mutex::new(Vec::new()),
+            pending_temporal_anomalies: parking_lot::Mutex::new(Vec::new()),
             pending_orphan_checks: parking_lot::Mutex::new(Vec::new()),
+            topology_protection: parking_lot::RwLock::new(HashMap::new()),
         };
 
         if entity_count > 0 || relationship_count > 0 || episode_count > 0 {
@@ -1188,7 +2413,9 @@ impl GraphMemory {
                 continue;
             }
 
-            let cf = db.cf_handle(cf_name).unwrap();
+            let cf = db
+                .cf_handle(cf_name)
+                .ok_or_else(|| anyhow::anyhow!("CF '{}' not found during migration", cf_name))?;
 
             // Only migrate if the CF is empty (avoid double migration)
             if db
@@ -1217,7 +2444,7 @@ impl GraphMemory {
                                 batch.put_cf(cf, &key, &value);
                                 count += 1;
                                 // Flush in chunks to limit memory usage
-                                if count % 10_000 == 0 {
+                                if count.is_multiple_of(10_000) {
                                     db.write(std::mem::take(&mut batch))?;
                                     batch = WriteBatch::default();
                                 }
@@ -1266,8 +2493,12 @@ impl GraphMemory {
 
     /// Load entity name->UUID index from name_index CF, or migrate from entities CF if empty
     fn load_or_migrate_name_index(db: &DB) -> Result<HashMap<String, Uuid>> {
-        let name_index_cf = db.cf_handle(CF_NAME_INDEX).unwrap();
-        let entities_cf = db.cf_handle(CF_ENTITIES).unwrap();
+        let name_index_cf = db
+            .cf_handle(CF_NAME_INDEX)
+            .ok_or_else(|| anyhow::anyhow!("CF '{}' not found", CF_NAME_INDEX))?;
+        let entities_cf = db
+            .cf_handle(CF_ENTITIES)
+            .ok_or_else(|| anyhow::anyhow!("CF '{}' not found", CF_ENTITIES))?;
         let mut index = HashMap::new();
 
         // Try to load from name_index CF first
@@ -1286,12 +2517,7 @@ impl GraphMemory {
             let entity_iter = db.iterator_cf(entities_cf, rocksdb::IteratorMode::Start);
             let mut migrated_count = 0;
             for (_, value) in entity_iter.flatten() {
-                if let Ok(entity) = bincode::serde::decode_from_slice::<EntityNode, _>(
-                    &value,
-                    bincode::config::standard(),
-                )
-                .map(|(v, _)| v)
-                {
+                if let Ok((entity, _)) = decode_entity_node(&value) {
                     // Store in name_index CF: name -> UUID bytes
                     db.put_cf(
                         name_index_cf,
@@ -1310,6 +2536,548 @@ impl GraphMemory {
         Ok(index)
     }
 
+    /// Load the alias index (surface -> canonical UUID) from the alias CF. Unlike
+    /// the name indexes there is no migration: the CF is empty until the resolver
+    /// seeds it, and a surface with no alias simply falls through to name lookup.
+    fn load_alias_index(db: &DB) -> Result<HashMap<String, Uuid>> {
+        let alias_cf = db
+            .cf_handle(CF_ALIAS)
+            .ok_or_else(|| anyhow::anyhow!("CF '{}' not found", CF_ALIAS))?;
+        let mut index = HashMap::new();
+        let iter = db.iterator_cf(alias_cf, rocksdb::IteratorMode::Start);
+        for (key, value) in iter.flatten() {
+            if let (Ok(surface), Ok(uuid_bytes)) = (
+                std::str::from_utf8(&key),
+                <[u8; 16]>::try_from(value.as_ref()),
+            ) {
+                index.insert(surface.to_string(), Uuid::from_bytes(uuid_bytes));
+            }
+        }
+        Ok(index)
+    }
+
+    /// Register that `surface` is an alias of the canonical entity `canonical`.
+    /// Idempotent; the surface is trimmed and lowercased so resolution is
+    /// case-insensitive. Persists to the alias CF and the in-memory index.
+    pub fn put_alias(&self, surface: &str, canonical: Uuid) -> Result<()> {
+        let key = surface.trim().to_lowercase();
+        if key.is_empty() {
+            return Ok(());
+        }
+        self.db
+            .put_cf(self.alias_cf(), key.as_bytes(), canonical.as_bytes())?;
+        self.entity_alias_index.write().insert(key, canonical);
+        Ok(())
+    }
+
+    /// Resolve a surface form to its canonical entity UUID, if an alias is
+    /// registered. O(1) in-memory lookup.
+    pub fn resolve_alias(&self, surface: &str) -> Option<Uuid> {
+        let key = surface.trim().to_lowercase();
+        self.entity_alias_index.read().get(&key).copied()
+    }
+
+    /// Number of registered aliases.
+    pub fn alias_count(&self) -> usize {
+        self.entity_alias_index.read().len()
+    }
+
+    /// Seed the alias table from a batch of `(surface, canonical_uuid)` pairs —
+    /// the output of an entity-resolution pass. Written atomically; the in-memory
+    /// index is updated to match. Returns the number of aliases written.
+    pub fn seed_aliases<I>(&self, pairs: I) -> Result<usize>
+    where
+        I: IntoIterator<Item = (String, Uuid)>,
+    {
+        let mut batch = rocksdb::WriteBatch::default();
+        let mut staged: Vec<(String, Uuid)> = Vec::new();
+        for (surface, canonical) in pairs {
+            let key = surface.trim().to_lowercase();
+            if key.is_empty() {
+                continue;
+            }
+            batch.put_cf(self.alias_cf(), key.as_bytes(), canonical.as_bytes());
+            staged.push((key, canonical));
+        }
+        self.db.write(batch)?;
+        let written = staged.len();
+        let mut index = self.entity_alias_index.write();
+        index.extend(staged);
+        Ok(written)
+    }
+
+    /// Extract appositive / definite-description aliases from the episode text and
+    /// seed them (ER Plan Task 3.1 — the LLM-free "free-label engine"). "Apple, the
+    /// iPhone maker" → alias `iphone maker` → Apple's canonical node, so a later
+    /// bare "iPhone maker" mention resolves to Apple (Tier-0 `resolve_alias`)
+    /// instead of forming a duplicate. Model-free (spaCy-rusty appositive parse);
+    /// no-ops without the parser. Returns the number of aliases seeded.
+    pub fn mint_appositive_aliases(&self, content: &str) -> usize {
+        let Some(pairs) = crate::appositive::extract_from_text(content) else {
+            return 0;
+        };
+        if pairs.is_empty() {
+            return 0;
+        }
+        let mut to_seed: Vec<(String, Uuid)> = Vec::new();
+        for p in pairs {
+            // Idempotent: skip if this surface already resolves. The anchor must be
+            // a real entity in this graph — the appositive phrase becomes its alias.
+            if self.resolve_alias(&p.alias).is_some() {
+                continue;
+            }
+            if let Ok(Some(anchor)) = self.find_entity_by_name(&p.canonical) {
+                to_seed.push((p.alias, anchor.uuid));
+            }
+        }
+        if to_seed.is_empty() {
+            return 0;
+        }
+        self.seed_aliases(to_seed).unwrap_or(0)
+    }
+
+    /// Retrieval-based KB linking (ER Task 3.2) — GATED. For each freshly-extracted
+    /// entity, link its surface to the domain KB (`SHODH_KB_PATH`): exact alias hit,
+    /// else type-blocked embedding nearest-neighbour ≥ `SHODH_KB_LINK_MIN`. When the
+    /// KB's canonical entity already exists as a node in this graph, seed a
+    /// surface→canonical alias so corpus mentions collapse onto the world-knowledge
+    /// entity (`Google` → `Alphabet Inc.`) — a merge no in-corpus matcher reaches.
+    /// No-ops without `SHODH_KB_LINKING=1` or a loaded KB (`SHODH_KB_PATH`). Returns
+    /// aliases seeded.
+    pub fn kb_link_entities(&self, entity_uuids: &[(String, Uuid, EntityLabel)]) -> usize {
+        let on = std::env::var("SHODH_KB_LINKING")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        if !on {
+            return 0;
+        }
+        let Some(kb) = crate::kb::global() else {
+            return 0;
+        };
+        let min = std::env::var("SHODH_KB_LINK_MIN")
+            .ok()
+            .and_then(|s| s.parse::<f32>().ok())
+            .unwrap_or(0.75);
+        let mut seeded = 0usize;
+        for (name, uuid, label) in entity_uuids {
+            if self.resolve_alias(name).is_some() {
+                continue;
+            }
+            let ty = label.as_str().to_lowercase();
+            let kb_hit = kb.link_by_alias(name).or_else(|| {
+                self.get_entity(uuid)
+                    .ok()
+                    .flatten()
+                    .and_then(|e| e.name_embedding)
+                    .and_then(|emb| kb.link_by_embedding(&emb, &ty, min).map(|(e, _)| e))
+            });
+            if let Some(kbe) = kb_hit {
+                if name.eq_ignore_ascii_case(&kbe.label) {
+                    continue;
+                }
+                if let Ok(Some(canon)) = self.find_entity_by_name(&kbe.label) {
+                    if canon.uuid != *uuid
+                        && self.seed_aliases([(name.clone(), canon.uuid)]).is_ok()
+                    {
+                        seeded += 1;
+                    }
+                }
+            }
+        }
+        seeded
+    }
+
+    /// Map a causal-spine canonical relation label to a `RelationType`, preferring
+    /// the named variants where they exist and falling back to `Custom`.
+    fn relation_type_from_label(label: &str) -> RelationType {
+        match label {
+            "Causes" => RelationType::Causes,
+            "Triggers" => RelationType::Triggers,
+            "ResultsIn" => RelationType::ResultsIn,
+            "RelatedTo" => RelationType::RelatedTo,
+            other => RelationType::Custom(other.to_string()),
+        }
+    }
+
+    /// Find or create an EVENT node for a CATENA event lemma. Exact-match reuse so
+    /// repeated events (collapse, blackout) are one node; new events are added
+    /// with `EntityLabel::Event`.
+    fn get_or_create_event(&self, lemma: &str, now: DateTime<Utc>) -> Option<Uuid> {
+        let name = lemma.trim();
+        if name.len() < 3 {
+            return None;
+        }
+        if let Ok(Some(existing)) = self.find_entity_by_name_strict(name) {
+            return Some(existing.uuid);
+        }
+        let node = EntityNode {
+            uuid: Uuid::new_v4(),
+            name: name.to_string(),
+            labels: vec![EntityLabel::Event],
+            created_at: now,
+            last_seen_at: now,
+            mention_count: 1,
+            summary: String::new(),
+            attributes: HashMap::new(),
+            name_embedding: None,
+            salience: EntityExtractor::calculate_base_salience(&EntityLabel::Event, false),
+            is_proper_noun: false,
+            selectivity: None,
+            fine_type: None,
+        };
+        self.add_entity(node).ok()
+    }
+
+    /// Build a causal-spine `RelationshipEdge` with provenance from the given
+    /// typing method. Born strong (typed edges are the spine, not co-occurrence).
+    #[allow(clippy::too_many_arguments)]
+    fn build_spine_edge(
+        &self,
+        from_entity: Uuid,
+        to_entity: Uuid,
+        relation_type: RelationType,
+        source_episode: Uuid,
+        context: &str,
+        now: DateTime<Utc>,
+        typed_by: TypingMethod,
+    ) -> RelationshipEdge {
+        let ctx: String = context.chars().take(150).collect();
+        let span_len = ctx.chars().count() as u32;
+        RelationshipEdge {
+            uuid: Uuid::new_v4(),
+            from_entity,
+            to_entity,
+            relation_type,
+            strength: 0.7,
+            created_at: now,
+            valid_at: now,
+            invalidated_at: None,
+            source_episode_id: Some(source_episode),
+            context: ctx,
+            last_activated: now,
+            activation_count: 1,
+            ltp_status: LtpStatus::None,
+            tier: EdgeTier::L1Working,
+            activation_timestamps: None,
+            entity_confidence: None,
+            forman_curvature: None,
+            endpoint_selectivity: None,
+            provenance: vec![ProvenanceRecord {
+                source_episode_id: source_episode,
+                mention_count: 1,
+                first_observed: now,
+                last_observed: now,
+                confidence: None,
+                evidence_span: Some((0, span_len)),
+                typed_by: Some(typed_by),
+            }],
+        }
+    }
+
+    /// Mint the causal-spine edges for an ingested passage: OpenIE clause-level
+    /// entity→entity causal edges + CATENA event→event edges (the sparse narrative
+    /// spine). Parser-based clause/event extraction reaches causation the
+    /// entity-pair cue typer structurally cannot. Runs only when the dependency
+    /// parser is available (`SHODH_SPACY_MODEL_PATH`) and not disabled via
+    /// `SHODH_CAUSAL_SPINE=0`. Precision-gated: causal families only, abstract-
+    /// social predicates (`supported`/`affected`) skipped. Returns edges minted.
+    pub fn mint_causal_spine_edges(
+        &self,
+        content: &str,
+        entity_uuids: &[(String, Uuid, EntityLabel)],
+        source_episode: Uuid,
+        now: DateTime<Utc>,
+    ) -> usize {
+        if !crate::dep_parser::is_available() {
+            return 0;
+        }
+        if std::env::var("SHODH_CAUSAL_SPINE")
+            .map(|v| v == "0" || v.eq_ignore_ascii_case("false"))
+            .unwrap_or(false)
+        {
+            return 0;
+        }
+        let mut minted = 0usize;
+
+        // Entity name → UUID, longest name first so `container ship` beats `ship`.
+        let mut names: Vec<(String, Uuid)> = entity_uuids
+            .iter()
+            .filter(|(n, _, _)| n.trim().len() >= 3)
+            .map(|(n, u, _)| (n.to_lowercase(), *u))
+            .collect();
+        names.sort_by_key(|(n, _)| std::cmp::Reverse(n.len()));
+        // Word-boundary match (space-padded) so `port` matches "the Port of
+        // Baltimore" but NOT "support"; longest entity name wins (sort above).
+        let match_entity = |span: &str| -> Option<Uuid> {
+            let s = format!(" {} ", span.to_lowercase());
+            names
+                .iter()
+                .find(|(n, _)| s.contains(&format!(" {} ", n)))
+                .map(|(_, u)| *u)
+        };
+
+        // OpenIE — entity→entity typed causal edges (grammar supplies the predicate).
+        if let Some(triples) = crate::openie::extract_triples(content) {
+            for tr in triples {
+                if !tr.causal || tr.low_precision {
+                    continue;
+                }
+                let (Some(from), Some(to)) = (match_entity(&tr.subject), match_entity(&tr.object))
+                else {
+                    continue;
+                };
+                if from == to {
+                    continue;
+                }
+                let rt = Self::relation_type_from_label(tr.relation);
+                let edge = self.build_spine_edge(
+                    from,
+                    to,
+                    rt,
+                    source_episode,
+                    content,
+                    now,
+                    TypingMethod::OpenIe,
+                );
+                if self.add_relationship(edge).is_ok() {
+                    minted += 1;
+                }
+            }
+        }
+
+        // CATENA — event→event edges (the inchoative pivots no entity arm sees):
+        // causal signals mint `Causes`, temporal signals mint `Precedes` — sequence
+        // is never reported as causation.
+        if let Some(links) = crate::catena::extract_event_links(content) {
+            for link in links {
+                let (Some(from), Some(to)) = (
+                    self.get_or_create_event(&link.source, now),
+                    self.get_or_create_event(&link.target, now),
+                ) else {
+                    continue;
+                };
+                if from == to {
+                    continue;
+                }
+                let rt = match link.relation {
+                    crate::causal_vocab::LinkRelation::Causes => RelationType::Causes,
+                    crate::causal_vocab::LinkRelation::Precedes => {
+                        RelationType::Custom("Precedes".to_string())
+                    }
+                };
+                let edge = self.build_spine_edge(
+                    from,
+                    to,
+                    rt,
+                    source_episode,
+                    content,
+                    now,
+                    TypingMethod::Catena,
+                );
+                if self.add_relationship(edge).is_ok() {
+                    minted += 1;
+                }
+            }
+        }
+
+        if minted > 0 {
+            tracing::info!(edges = minted, "causal spine: minted OpenIE + CATENA edges");
+        }
+        minted
+    }
+
+    /// Canonicalize the entity graph: run the resolver over the live mentions and
+    /// MERGE each cluster's duplicate mention nodes into its canonical entity —
+    /// re-pointing every edge onto the canonical (add_relationship dedups by type,
+    /// so duplicate edges collapse) and deleting the duplicate node. This is what
+    /// folds `Dali` / `the Dali` / `container ship` into one node and prunes the
+    /// mention-duplication that makes the graph read as a hairball. The resolver
+    /// uses the dependency parser for head detection; no-op returning `(0, 0)` when
+    /// the parser is unavailable. Returns `(nodes_merged, edges_repointed)`.
+    pub fn canonicalize_entities(&self) -> Result<(usize, usize)> {
+        use crate::entity_resolution::parse_mention_tokens;
+        use crate::fs_matcher::{cluster, MatchRecord};
+
+        if !crate::dep_parser::is_available() {
+            return Ok((0, 0));
+        }
+        let entities = self.get_all_entities()?;
+        if entities.len() < 2 {
+            return Ok((0, 0));
+        }
+
+        // Parse each mention (spaCy-rusty) for its syntactic head, drop verb-
+        // fragment junk (`is_entity`), and build a Fellegi-Sunter record with the
+        // full comparison evidence the matcher scores over. This is the
+        // Galárraga (CIKM'14) + CESI (WWW'18) feature union realized as FS
+        // comparisons: name (Jaro-Winkler + IDF), head, type, ATTRIBUTE OVERLAP
+        // (the typed relations the entity participates in — Galárraga's key
+        // signal), and NAME EMBEDDING (CESI's learned-embedding signal). Name
+        // + head + type alone only catch exact duplicates; the relation and
+        // embedding evidence let it merge abbreviations / paraphrases
+        // ("Key Bridge" ≡ "Francis Scott Key Bridge") that surface strings miss.
+        let mut records: Vec<MatchRecord> = Vec::new();
+        let mut meta: Vec<(Uuid, bool, usize, String)> = Vec::new(); // (uuid, is_proper, mentions, name)
+        for e in &entities {
+            let Some(parsed) =
+                crate::dep_parser::parse(&e.name).and_then(|t| parse_mention_tokens(&t))
+            else {
+                continue;
+            };
+            if !parsed.is_entity() {
+                continue;
+            }
+            let primary_type = e
+                .labels
+                .first()
+                .map(|l| l.as_str().to_string())
+                .unwrap_or_default();
+            // Attribute overlap: the TYPED relations this entity participates in.
+            // Generic co-occurrence (CoOccurs/RelatedTo/CoRetrieved) is excluded —
+            // it is undiscriminative (everything co-occurs) and would wash out the
+            // signal. Two mentions of one real entity share these typed relations.
+            let agent_roles: HashSet<String> = self
+                .get_entity_relationships(&e.uuid)
+                .unwrap_or_default()
+                .iter()
+                .filter(|edge| {
+                    !matches!(
+                        edge.relation_type,
+                        RelationType::CoOccurs
+                            | RelationType::RelatedTo
+                            | RelationType::CoRetrieved
+                    )
+                })
+                .map(|edge| edge.relation_type.as_str().to_string())
+                .collect();
+            records.push(MatchRecord {
+                name: parsed.clean.to_lowercase(),
+                head: parsed.head.clone(),
+                entity_type: primary_type,
+                agent_roles,
+                name_embedding: e.name_embedding.clone(),
+                ..Default::default()
+            });
+            meta.push((e.uuid, e.is_proper_noun, e.mention_count, e.name.clone()));
+        }
+        if records.len() < 2 {
+            return Ok((0, 0));
+        }
+
+        // Splink: fit + type-blocked clustering at a precision-first threshold.
+        let mut clusters = cluster(&records, 0.9, 20);
+
+        // Contrastive projection adapter (ER Task 4.2, Sudowoodo-lite) — GATED.
+        // Self-supervise a tiny projection over the frozen name embeddings from the
+        // confident base merges (within-cluster pairs = positives; cross-type pairs =
+        // negatives, which prevent collapse), then re-cluster in the learned space to
+        // catch coreferent surfaces the frozen embedding missed. Opt in with
+        // SHODH_CONTRASTIVE_ADAPTER=1 so it can be measured before earning the default.
+        let adapter_on = std::env::var("SHODH_CONTRASTIVE_ADAPTER")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        if adapter_on {
+            if let Some(dim) = records
+                .iter()
+                .find_map(|r| r.name_embedding.as_ref().map(|e| e.len()))
+            {
+                let mut adapter = crate::contrastive::ContrastiveAdapter::identity(dim);
+                for c in clusters.iter().filter(|c| c.len() >= 2) {
+                    for a in 0..c.len() {
+                        for b in (a + 1)..c.len() {
+                            let (ri, rj) = (&records[c[a]], &records[c[b]]);
+                            if let (Some(ea), Some(eb)) = (&ri.name_embedding, &rj.name_embedding) {
+                                // A negative: the nearest-indexed record of a DIFFERENT
+                                // entity type (never coreferent), guarding over-merge.
+                                let neg = records
+                                    .iter()
+                                    .find(|r| {
+                                        r.entity_type != ri.entity_type
+                                            && r.name_embedding.is_some()
+                                    })
+                                    .and_then(|r| r.name_embedding.clone());
+                                adapter.learn(ea, eb, neg.as_deref());
+                                adapter.learn(eb, ea, neg.as_deref());
+                            }
+                        }
+                    }
+                }
+                for r in records.iter_mut() {
+                    if let Some(e) = r.name_embedding.take() {
+                        r.name_embedding = Some(adapter.project(&e));
+                    }
+                }
+                clusters = cluster(&records, 0.9, 20);
+            }
+        }
+
+        let mut merged_nodes = 0usize;
+        let mut repointed = 0usize;
+        // Alias pairs to seed after merging: every merged surface → its canonical
+        // UUID. `resolve_alias` is checked at ingest (Tier 0), so once seeded, a
+        // future mention of that surface redirects to the canonical node instead of
+        // re-creating the duplicate — this closes the ingest loop (canonicalize →
+        // aliases → cleaner ingest → less to canonicalize).
+        let mut alias_pairs: Vec<(String, Uuid)> = Vec::new();
+        for cluster_idxs in clusters {
+            if cluster_idxs.len() < 2 {
+                continue;
+            }
+            // Canonical = the most-proper / most-mentioned member.
+            let canon_idx = *cluster_idxs
+                .iter()
+                .max_by_key(|&&i| (meta[i].1, meta[i].2))
+                .unwrap();
+            let canonical = meta[canon_idx].0;
+            for &i in &cluster_idxs {
+                if i == canon_idx {
+                    continue;
+                }
+                let member = meta[i].0;
+                // Remember this surface → canonical mapping (raw name + parsed clean
+                // form) so future ingests of the merged surface resolve directly.
+                alias_pairs.push((meta[i].3.clone(), canonical));
+                if records[i].name != meta[i].3.trim().to_lowercase() {
+                    alias_pairs.push((records[i].name.clone(), canonical));
+                }
+                // Re-point every edge touching the member onto the canonical node.
+                let member_edges = self.get_entity_relationships(&member)?;
+                for edge in member_edges {
+                    let mut ne = edge.clone();
+                    ne.uuid = Uuid::new_v4();
+                    if ne.from_entity == member {
+                        ne.from_entity = canonical;
+                    }
+                    if ne.to_entity == member {
+                        ne.to_entity = canonical;
+                    }
+                    let _ = self.delete_relationship(&edge.uuid);
+                    // Drop self-loops; add_relationship dedups by (from,to,type) so
+                    // duplicate edges between the same entities merge, not multiply.
+                    if ne.from_entity != ne.to_entity && self.add_relationship(ne).is_ok() {
+                        repointed += 1;
+                    }
+                }
+                let _ = self.delete_entity(&member);
+                merged_nodes += 1;
+            }
+        }
+        // Close the ingest loop: seed the merged surfaces as aliases of their
+        // canonical node so re-ingesting them never re-creates the duplicate.
+        let aliases_seeded = if alias_pairs.is_empty() {
+            0
+        } else {
+            self.seed_aliases(alias_pairs).unwrap_or(0)
+        };
+        tracing::info!(
+            merged = merged_nodes,
+            repointed,
+            aliases_seeded,
+            "canonicalize (Splink): merged duplicate mention nodes into canonical entities"
+        );
+        Ok((merged_nodes, repointed))
+    }
+
     /// Load lowercase name->UUID index, or migrate from name_index if empty
     ///
     /// This enables O(1) case-insensitive entity lookup instead of O(n) linear search.
@@ -1317,7 +3085,9 @@ impl GraphMemory {
         db: &DB,
         name_index: &HashMap<String, Uuid>,
     ) -> Result<HashMap<String, Uuid>> {
-        let lowercase_cf = db.cf_handle(CF_LOWERCASE_INDEX).unwrap();
+        let lowercase_cf = db
+            .cf_handle(CF_LOWERCASE_INDEX)
+            .ok_or_else(|| anyhow::anyhow!("CF '{}' not found", CF_LOWERCASE_INDEX))?;
         let mut index = HashMap::new();
 
         // Try to load from lowercase_index CF
@@ -1355,7 +3125,9 @@ impl GraphMemory {
         db: &DB,
         name_index: &HashMap<String, Uuid>,
     ) -> Result<HashMap<String, Uuid>> {
-        let stemmed_cf = db.cf_handle(CF_STEMMED_INDEX).unwrap();
+        let stemmed_cf = db
+            .cf_handle(CF_STEMMED_INDEX)
+            .ok_or_else(|| anyhow::anyhow!("CF '{}' not found", CF_STEMMED_INDEX))?;
         let mut index = HashMap::new();
 
         // Try to load from stemmed_index CF
@@ -1399,6 +3171,22 @@ impl GraphMemory {
         db.iterator_cf(cf, rocksdb::IteratorMode::Start).count()
     }
 
+    /// Count only true relationship-edge records in the relationships CF.
+    ///
+    /// The relationships CF holds two kinds of keys: real edge records (16-byte
+    /// UUID key → encoded `RelationshipEdge`) and `mem_edge:<a>:<b>`
+    /// forward/reverse index keys (ASCII key → 16-byte edge UUID). The generic
+    /// `count_cf_entries` counts both, which over-states the edge count (~3x for
+    /// memory-pair edges). The startup seed for `relationship_count` must count
+    /// only the 16-byte-keyed edge records so it stays consistent with the
+    /// increments/decrements applied at runtime.
+    fn count_relationship_edges(db: &DB, cf: &ColumnFamily) -> usize {
+        db.iterator_cf(cf, rocksdb::IteratorMode::Start)
+            .filter_map(|r| r.ok())
+            .filter(|(key, _)| key.len() == 16)
+            .count()
+    }
+
     /// Load entity embedding cache from persisted entities.
     ///
     /// Scans entities referenced by the name index and collects those with
@@ -1414,10 +3202,7 @@ impl GraphMemory {
         for uuid in name_index.values() {
             let key = uuid.as_bytes();
             if let Ok(Some(value)) = db.get_cf(entities_cf, key) {
-                if let Ok((entity, _)) = bincode::serde::decode_from_slice::<EntityNode, _>(
-                    &value,
-                    bincode::config::standard(),
-                ) {
+                if let Ok((entity, _)) = decode_entity_node(&value) {
                     if let Some(emb) = entity.name_embedding {
                         cache.push((*uuid, emb));
                         if cache.len() >= ENTITY_EMBEDDING_CACHE_MAX {
@@ -1470,10 +3255,10 @@ impl GraphMemory {
                 let mut best_match: Option<(Uuid, f32)> = None;
                 for (uuid, existing_emb) in cache.iter() {
                     let sim = crate::similarity::cosine_similarity(new_emb, existing_emb);
-                    if sim >= ENTITY_CONCEPT_MERGE_THRESHOLD {
-                        if best_match.map_or(true, |(_, best_sim)| sim > best_sim) {
-                            best_match = Some((*uuid, sim));
-                        }
+                    if sim >= ENTITY_CONCEPT_MERGE_THRESHOLD
+                        && best_match.is_none_or(|(_, best_sim)| sim > best_sim)
+                    {
+                        best_match = Some((*uuid, sim));
                     }
                 }
                 if let Some((matched_uuid, sim)) = best_match {
@@ -1512,6 +3297,26 @@ impl GraphMemory {
                 // Preserve existing embedding if the incoming one is None
                 if entity.name_embedding.is_none() {
                     entity.name_embedding = existing.name_embedding;
+                }
+
+                // Preserve an existing fine type when the re-mention carries none.
+                // Re-mentions are the common case (pre-extracted names, tags, fallback
+                // entities), and they must not wipe a fine type GLiNER already set.
+                if entity.fine_type.is_none() {
+                    entity.fine_type = existing.fine_type.clone();
+                }
+
+                // Merge summary: first non-empty wins, preserve existing
+                if !existing.summary.is_empty() {
+                    entity.summary = existing.summary.clone();
+                }
+
+                // Merge attributes: add new keys without overwriting existing
+                for (k, v) in &existing.attributes {
+                    entity
+                        .attributes
+                        .entry(k.clone())
+                        .or_insert_with(|| v.clone());
                 }
 
                 // Update salience with frequency boost
@@ -1562,23 +3367,27 @@ impl GraphMemory {
             stemmed_index.insert(stemmed_name.clone(), entity.uuid);
         }
 
-        // Update entity embedding cache for future concept merges
+        // Update entity embedding cache for future concept merges.
+        // Recency-of-mention ordering: the front is the least-recently-mentioned
+        // entry (the eviction victim), the back is the most recent. A re-mention
+        // counts as an access and moves the entry to the back, so the drain below
+        // removes genuinely cold entities rather than merely the earliest-added
+        // (which may still be hot). Only matters once the graph exceeds
+        // ENTITY_EMBEDDING_CACHE_MAX (10k) distinct embedded entities.
         if let Some(ref emb) = entity.name_embedding {
             let mut cache = self.entity_embedding_cache.write();
             if is_new_entity {
                 cache.push((entity.uuid, emb.clone()));
-                // Evict oldest entries when cache exceeds the configured maximum.
-                // Oldest entries (index 0) are typically the least recently mentioned
-                // since they were loaded at startup or added earliest.
                 if cache.len() > ENTITY_EMBEDDING_CACHE_MAX {
                     let excess = cache.len() - ENTITY_EMBEDDING_CACHE_MAX;
                     cache.drain(..excess);
                 }
-            } else {
-                // Update existing entry in cache (embedding may have changed)
-                if let Some(entry) = cache.iter_mut().find(|(uuid, _)| *uuid == entity.uuid) {
-                    entry.1 = emb.clone();
-                }
+            } else if let Some(pos) = cache.iter().position(|(uuid, _)| *uuid == entity.uuid) {
+                // Re-mention: refresh the (possibly changed) embedding and promote
+                // to the back as the most-recently-accessed entry.
+                let mut entry = cache.remove(pos);
+                entry.1 = emb.clone();
+                cache.push(entry);
             }
         }
 
@@ -1603,7 +3412,7 @@ impl GraphMemory {
 
         // Store entity in database
         let key = entity.uuid.as_bytes();
-        let value = bincode::serde::encode_to_vec(&entity, bincode::config::standard())?;
+        let value = crate::serialization::encode(&entity)?;
         self.db.put_cf(self.entities_cf(), key, value)?;
 
         // Increment counter only for truly new entities
@@ -1619,8 +3428,7 @@ impl GraphMemory {
         let key = uuid.as_bytes();
         match self.db.get_cf(self.entities_cf(), key)? {
             Some(value) => {
-                let (entity, _): (EntityNode, _) =
-                    bincode::serde::decode_from_slice(&value, bincode::config::standard())?;
+                let (entity, _) = decode_entity_node(&value)?;
                 Ok(Some(entity))
             }
             None => Ok(None),
@@ -1719,11 +3527,112 @@ impl GraphMemory {
             self.db.delete_cf(self.entity_pair_index_cf(), key)?;
         }
 
+        // 6b. Remove entity_episodes inverted-index entries (entity_uuid:episode_uuid).
+        // These are otherwise only cleaned per-episode (delete_episode), so deleting
+        // an entity while episodes still reference it in entity_refs leaves stale
+        // entries that accumulate over orphan-cleanup churn. (entity_edges entries
+        // need no handling here: delete_relationship already removes both endpoints
+        // when each edge dies, and this entity is edgeless by the time it is deleted.)
+        let ep_prefix = format!("{}:", uuid);
+        let mut episode_keys_to_delete = Vec::new();
+        let iter = self
+            .db
+            .prefix_iterator_cf(self.entity_episodes_cf(), ep_prefix.as_bytes());
+        for item in iter {
+            match item {
+                Ok((key, _)) => {
+                    if key.starts_with(ep_prefix.as_bytes()) {
+                        episode_keys_to_delete.push(key.to_vec());
+                    } else {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        for key in &episode_keys_to_delete {
+            if let Err(e) = self.db.delete_cf(self.entity_episodes_cf(), key) {
+                tracing::warn!(entity = %uuid, error = %e, "Failed to delete from entity_episodes index");
+            }
+        }
+
         // 7. Decrement counter
         self.entity_count.fetch_sub(1, Ordering::Relaxed);
 
         tracing::debug!("Deleted orphaned entity '{}' (uuid={})", entity.name, uuid);
         Ok(true)
+    }
+
+    /// PHRASE-LEVEL precision resolution: entities whose FULL (lowercased) name
+    /// occurs verbatim inside `text_lower`. The inverse of fuzzy lookup — instead
+    /// of asking "which entity does this fragment match?" (where "incident"
+    /// binds to an arbitrary hub), it asks "which entity names does the query
+    /// actually CONTAIN?" ("the selvic incident" ⊂ query ✓; "the selvic1
+    /// incident" ⊄ query ✗). Built for causal-walk seeding, where a wrong seed
+    /// injects a wrong chain's origins into the candidate pool. Names shorter
+    /// than `min_len` are skipped (stop-word-like entity names would match
+    /// everything); capped at `max` results, longest names first (most specific).
+    pub fn find_entities_contained_in_text(
+        &self,
+        text_lower: &str,
+        min_len: usize,
+        max: usize,
+    ) -> Result<Vec<EntityNode>> {
+        let mut hits: Vec<(usize, Uuid)> = {
+            let lowercase_index = self.entity_lowercase_index.read();
+            lowercase_index
+                .iter()
+                .filter(|(name, _)| name.len() >= min_len && text_lower.contains(name.as_str()))
+                .map(|(name, uuid)| (name.len(), *uuid))
+                .collect()
+        };
+        // Longest (most specific) first; deterministic tie-break by uuid.
+        hits.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+        let mut out = Vec::new();
+        for (_, uuid) in hits.into_iter().take(max) {
+            if let Some(ent) = self.get_entity(&uuid)? {
+                out.push(ent);
+            }
+        }
+        Ok(out)
+    }
+
+    /// STRICT entity resolution: tiers 1-3 only (exact / case-insensitive /
+    /// stemmed) — no substring or word-level fuzzing.
+    ///
+    /// Use this when the caller needs PRECISION over recall — e.g. seeds for
+    /// the causal-origin walk. The lineage diagnosis (2026-06-10) showed the
+    /// fuzzy tiers binding a fragmented query token ("incident") to an
+    /// arbitrary hub node, making the backward walk inject OTHER chains' roots
+    /// into the candidate pool and crowding the true root out of the top-10
+    /// (harness root-cause P@1 pinned at 0.0). Spreading-activation seeding
+    /// keeps the recall-oriented fuzzy resolver; precision consumers use this.
+    pub fn find_entity_by_name_strict(&self, name: &str) -> Result<Option<EntityNode>> {
+        let uuid = {
+            let index = self.entity_name_index.read();
+            index.get(name).copied()
+        };
+        if let Some(uuid) = uuid {
+            return self.get_entity(&uuid);
+        }
+        let name_lower = name.to_lowercase();
+        let uuid = {
+            let lowercase_index = self.entity_lowercase_index.read();
+            lowercase_index.get(&name_lower).copied()
+        };
+        if let Some(uuid) = uuid {
+            return self.get_entity(&uuid);
+        }
+        let stemmer = Stemmer::create(Algorithm::English);
+        let stemmed_name = Self::stem_entity_name(&stemmer, name);
+        let uuid = {
+            let stemmed_index = self.entity_stemmed_index.read();
+            stemmed_index.get(&stemmed_name).copied()
+        };
+        if let Some(uuid) = uuid {
+            return self.get_entity(&uuid);
+        }
+        Ok(None)
     }
 
     /// Find entity by name (case-insensitive, O(1) lookup)
@@ -1735,6 +3644,16 @@ impl GraphMemory {
     /// 4. Substring match - "York" matches "New York City"
     /// 5. Word-level match - "York" matches "New York"
     pub fn find_entity_by_name(&self, name: &str) -> Result<Option<EntityNode>> {
+        // Tier 0: Alias resolution (curated canonical mapping — highest priority).
+        // A surface the resolver merged (e.g. "cargo ship" -> the Dali) resolves
+        // straight to its canonical node rather than matching its own stale
+        // mention. If the canonical UUID is dangling, fall through to name lookup.
+        if let Some(canonical) = self.resolve_alias(name) {
+            if let Some(entity) = self.get_entity(&canonical)? {
+                return Ok(Some(entity));
+            }
+        }
+
         // Tier 1: Exact match (O(1))
         let uuid = {
             let index = self.entity_name_index.read();
@@ -1824,65 +3743,30 @@ impl GraphMemory {
         Ok(None)
     }
 
-    /// Find all entities matching a name with fuzzy matching
-    ///
-    /// Returns multiple matches ranked by match quality.
-    /// Useful for spreading activation across related entities.
-    pub fn find_entities_fuzzy(&self, name: &str, max_results: usize) -> Result<Vec<EntityNode>> {
-        let mut results = Vec::new();
-        let name_lower = name.to_lowercase();
+    /// Total number of episodes stored in the graph (the `N` in PMI / IDF statistics).
+    /// O(1) — read from the maintained atomic counter.
+    pub fn total_episode_count(&self) -> usize {
+        self.episode_count.load(Ordering::Relaxed)
+    }
 
-        // Skip very short queries
-        if name.len() < 2 {
-            return Ok(results);
-        }
+    /// Lightweight quality metrics for an existing entity in the graph.
+    /// Used by NER filtering to suppress known stop-word entities.
+    pub fn get_entity_reputation(&self, name: &str) -> Option<EntityReputation> {
+        // O(1) lookup via lowercase index
+        let uuid = {
+            let index = self.entity_lowercase_index.read();
+            index.get(&name.to_lowercase()).copied()
+        }?;
 
-        let lowercase_index = self.entity_lowercase_index.read();
+        let entity = self.get_entity(&uuid).ok()??;
+        let degree = self.entity_edge_count(&uuid).unwrap_or(0);
 
-        // Score and collect matches
-        let mut scored: Vec<(Uuid, f32)> = Vec::new();
-
-        for (entity_name, uuid) in lowercase_index.iter() {
-            let score = if entity_name == &name_lower {
-                1.0 // Exact match
-            } else if entity_name.starts_with(&name_lower) {
-                0.9 // Prefix match
-            } else if entity_name.contains(&name_lower) {
-                0.7 // Substring match
-            } else {
-                // Word-level match
-                let entity_words: Vec<&str> = entity_name.split_whitespace().collect();
-                let query_words: Vec<&str> = name_lower.split_whitespace().collect();
-
-                let mut word_score: f32 = 0.0;
-                for qw in &query_words {
-                    for ew in &entity_words {
-                        if ew == qw {
-                            word_score += 0.5;
-                        } else if ew.starts_with(qw) {
-                            word_score += 0.3;
-                        }
-                    }
-                }
-                word_score.min(0.6) // Cap word-level score
-            };
-
-            if score > 0.0 {
-                scored.push((*uuid, score));
-            }
-        }
-
-        // Sort by score descending
-        scored.sort_by(|a, b| b.1.total_cmp(&a.1));
-
-        // Take top results
-        for (uuid, _score) in scored.into_iter().take(max_results) {
-            if let Some(entity) = self.get_entity(&uuid)? {
-                results.push(entity);
-            }
-        }
-
-        Ok(results)
+        Some(EntityReputation {
+            selectivity: entity.selectivity.unwrap_or(1.0), // Conservative default
+            mention_count: entity.mention_count,
+            degree,
+            salience: entity.salience,
+        })
     }
 
     /// Canonical pair key for the entity-pair index.
@@ -1895,9 +3779,24 @@ impl GraphMemory {
         }
     }
 
-    /// Index an entity pair → edge UUID for O(1) dedup lookups
-    fn index_entity_pair(&self, entity_a: &Uuid, entity_b: &Uuid, edge_uuid: &Uuid) -> Result<()> {
-        let key = Self::pair_key(entity_a, entity_b);
+    /// Typed pair key: includes relation type to support multiple edges per pair
+    fn typed_pair_key(entity_a: &Uuid, entity_b: &Uuid, relation_type: &RelationType) -> String {
+        format!(
+            "{}:{}",
+            Self::pair_key(entity_a, entity_b),
+            relation_type.as_str()
+        )
+    }
+
+    /// Index an entity pair + relation type → edge UUID for O(1) dedup lookups
+    fn index_entity_pair(
+        &self,
+        entity_a: &Uuid,
+        entity_b: &Uuid,
+        edge_uuid: &Uuid,
+        relation_type: &RelationType,
+    ) -> Result<()> {
+        let key = Self::typed_pair_key(entity_a, entity_b, relation_type);
         self.db.put_cf(
             self.entity_pair_index_cf(),
             key.as_bytes(),
@@ -1906,25 +3805,32 @@ impl GraphMemory {
         Ok(())
     }
 
-    /// Remove entity pair from the pair index
-    fn remove_entity_pair_index(&self, entity_a: &Uuid, entity_b: &Uuid) -> Result<()> {
-        let key = Self::pair_key(entity_a, entity_b);
+    /// Remove entity pair + relation type from the pair index
+    fn remove_entity_pair_index(
+        &self,
+        entity_a: &Uuid,
+        entity_b: &Uuid,
+        relation_type: &RelationType,
+    ) -> Result<()> {
+        let key = Self::typed_pair_key(entity_a, entity_b, relation_type);
         self.db
             .delete_cf(self.entity_pair_index_cf(), key.as_bytes())?;
         Ok(())
     }
 
-    /// Find existing relationship between two entities (either direction)
+    /// Find existing relationship between two entities with a specific relation type.
     ///
-    /// O(1) lookup via entity-pair index, with fallback to linear scan
-    /// for edges created before the pair index existed (migration path).
-    pub fn find_relationship_between(
+    /// O(1) lookup via typed pair index, with fallback to linear scan for pre-index edges.
+    /// Matches only edges with the same `RelationType`, allowing multiple semantically
+    /// distinct edges (e.g. WorksWith + PartOf) between the same entity pair.
+    pub fn find_relationship_between_typed(
         &self,
         entity_a: &Uuid,
         entity_b: &Uuid,
+        relation_type: &RelationType,
     ) -> Result<Option<RelationshipEdge>> {
-        // Fast path: O(1) pair index lookup
-        let key = Self::pair_key(entity_a, entity_b);
+        // Fast path: direct typed key lookup
+        let key = Self::typed_pair_key(entity_a, entity_b, relation_type);
         if let Some(edge_uuid_bytes) = self
             .db
             .get_cf(self.entity_pair_index_cf(), key.as_bytes())?
@@ -1934,48 +3840,22 @@ impl GraphMemory {
                 if let Some(edge) = self.get_relationship(&edge_uuid)? {
                     return Ok(Some(edge));
                 }
-                // Edge was deleted but pair index is stale — clean up and fall through
+                // Stale index entry — clean up
                 let _ = self
                     .db
                     .delete_cf(self.entity_pair_index_cf(), key.as_bytes());
             }
         }
 
-        // Slow path: linear scan for pre-index edges (backward compatibility)
-        // This path is only hit for edges created before the pair index existed.
-        // Once all old edges are either strengthened (which updates the index) or
-        // pruned, this path becomes dead code.
-        let edges_a = self.get_entity_relationships(entity_a)?;
-        for edge in edges_a {
-            if (edge.from_entity == *entity_a && edge.to_entity == *entity_b)
-                || (edge.from_entity == *entity_b && edge.to_entity == *entity_a)
-            {
-                // Backfill pair index for this legacy edge
-                let _ = self.index_entity_pair(entity_a, entity_b, &edge.uuid);
-                return Ok(Some(edge));
-            }
-        }
-        Ok(None)
-    }
-
-    /// Find existing relationship between two entities with a specific relation type.
-    ///
-    /// Unlike `find_relationship_between` which returns any edge between the pair,
-    /// this method only matches edges with the same `RelationType`. This allows
-    /// multiple semantically distinct edges (e.g. WorksWith + PartOf) between
-    /// the same entity pair.
-    pub fn find_relationship_between_typed(
-        &self,
-        entity_a: &Uuid,
-        entity_b: &Uuid,
-        relation_type: &RelationType,
-    ) -> Result<Option<RelationshipEdge>> {
+        // Slow path: linear scan for pre-index edges
         let edges = self.get_entity_relationships(entity_a)?;
         for edge in edges {
             if edge.relation_type == *relation_type
                 && ((edge.from_entity == *entity_a && edge.to_entity == *entity_b)
                     || (edge.from_entity == *entity_b && edge.to_entity == *entity_a))
             {
+                // Backfill typed pair index
+                let _ = self.index_entity_pair(entity_a, entity_b, &edge.uuid, relation_type);
                 return Ok(Some(edge));
             }
         }
@@ -1996,18 +3876,94 @@ impl GraphMemory {
             &edge.to_entity,
             &edge.relation_type,
         )? {
+            // #8 DIAGNOSTIC (default-safe, log-only): the typed pair key is
+            // order-independent (pair_key sorts min/max UUID), so an incoming
+            // CAUSAL attestation whose direction is the REVERSE of the stored
+            // edge collapses into it silently — the stored cause→effect arrow
+            // is never flipped. Count how often that actually happens for causal
+            // relations: if it's frequent, the order-independent key is losing
+            // real direction and a direction-sensitive key + reindex is justified;
+            // if near-zero (expected, given the effect-first extractor already
+            // fixes most mis-direction), the migration isn't worth its cost.
+            // grep eval logs for "directed reverse-collapse".
+            if edge.relation_type.is_causal()
+                && existing.from_entity == edge.to_entity
+                && existing.to_entity == edge.from_entity
+            {
+                DIRECTED_REVERSE_COLLAPSE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                tracing::info!(
+                    target: "shodh::provenance",
+                    relation = ?edge.relation_type,
+                    "directed reverse-collapse: incoming {}->{} merged into stored {}->{}",
+                    edge.from_entity,
+                    edge.to_entity,
+                    existing.from_entity,
+                    existing.to_entity
+                );
+            }
+            // Temporal anomaly (B4): a long-dormant edge being re-attested is a
+            // pattern reactivation. Measured BEFORE strengthen()/last_activated
+            // overwrite the gap; queued for the ingest path to drain + emit.
+            let now = Utc::now();
+            let gap_days = now
+                .signed_duration_since(existing.last_activated)
+                .num_seconds() as f32
+                / 86_400.0;
+            if gap_days >= DORMANT_REACTIVATION_MIN_DAYS {
+                let mut queue = self.pending_temporal_anomalies.lock();
+                if queue.len() < TEMPORAL_EVENT_QUEUE_CAP {
+                    queue.push(TemporalAnomalyEvent {
+                        kind: TemporalAnomalyKind::DormantReactivation,
+                        edge_uuid: existing.uuid,
+                        from_entity: existing.from_entity,
+                        to_entity: existing.to_entity,
+                        relation_type: existing.relation_type.clone(),
+                        gap_days,
+                        detected_at: now,
+                    });
+                }
+            }
+
             // Strengthen existing edge instead of creating duplicate
             let _ = existing.strengthen();
-            existing.last_activated = Utc::now();
+            existing.last_activated = now;
 
             // Update context if new context is more informative
             if edge.context.len() > existing.context.len() {
                 existing.context = edge.context;
             }
 
+            // Provenance capture (Increment 1, bug fix): the prior implementation
+            // strengthened the synapse but DISCARDED the new attestation's source
+            // episode. Merge the incoming attestation into the trail so every
+            // source episode that wires this edge is recorded — not just the last.
+            if edge.provenance.is_empty() {
+                // Synthesize one attestation from the incoming edge's source
+                // episode. With no source episode there is nothing to attest, so
+                // we skip rather than record a nil-UUID record.
+                if let Some(source_episode_id) = edge.source_episode_id {
+                    merge_provenance(
+                        &mut existing.provenance,
+                        ProvenanceRecord {
+                            source_episode_id,
+                            mention_count: 1,
+                            first_observed: now,
+                            last_observed: now,
+                            confidence: edge.entity_confidence,
+                            evidence_span: None,
+                            typed_by: None,
+                        },
+                    );
+                }
+            } else {
+                for record in edge.provenance.drain(..) {
+                    merge_provenance(&mut existing.provenance, record);
+                }
+            }
+
             // Persist the strengthened edge
             let key = existing.uuid.as_bytes();
-            let value = bincode::serde::encode_to_vec(&existing, bincode::config::standard())?;
+            let value = crate::serialization::encode(&existing)?;
             self.db.put_cf(self.relationships_cf(), key, value)?;
 
             return Ok(existing.uuid);
@@ -2017,9 +3973,38 @@ impl GraphMemory {
         edge.uuid = Uuid::new_v4();
         edge.created_at = Utc::now();
 
+        // Provenance capture (Increment 1): seed the trail from this edge's
+        // source episode if the caller did not already provide a richer seed.
+        // Enforce the cap regardless so a caller-seeded trail can't exceed it.
+        if edge.provenance.is_empty() {
+            if let Some(source_episode_id) = edge.source_episode_id {
+                let now = edge.created_at;
+                merge_provenance(
+                    &mut edge.provenance,
+                    ProvenanceRecord {
+                        source_episode_id,
+                        mention_count: 1,
+                        first_observed: now,
+                        last_observed: now,
+                        confidence: edge.entity_confidence,
+                        evidence_span: None,
+                        typed_by: None,
+                    },
+                );
+            }
+        } else if edge.provenance.len() > provenance_max_sources() {
+            let cap = provenance_max_sources();
+            edge.provenance.sort_by(|a, b| {
+                b.mention_count
+                    .cmp(&a.mention_count)
+                    .then_with(|| b.last_observed.cmp(&a.last_observed))
+            });
+            edge.provenance.truncate(cap);
+        }
+
         // Store relationship
         let key = edge.uuid.as_bytes();
-        let value = bincode::serde::encode_to_vec(&edge, bincode::config::standard())?;
+        let value = crate::serialization::encode(&edge)?;
         self.db.put_cf(self.relationships_cf(), key, value)?;
 
         // Increment relationship counter
@@ -2029,8 +4014,13 @@ impl GraphMemory {
         self.index_entity_edge(&edge.from_entity, &edge.uuid)?;
         self.index_entity_edge(&edge.to_entity, &edge.uuid)?;
 
-        // Update entity-pair index for O(1) dedup lookups
-        self.index_entity_pair(&edge.from_entity, &edge.to_entity, &edge.uuid)?;
+        // Update entity-pair index for O(1) dedup lookups (typed key supports multi-edge)
+        self.index_entity_pair(
+            &edge.from_entity,
+            &edge.to_entity,
+            &edge.uuid,
+            &edge.relation_type,
+        )?;
 
         // Insert-time degree pruning: cap edges per entity to prevent O(n²) explosion.
         // If either entity exceeds MAX_ENTITY_DEGREE, prune the weakest edges.
@@ -2039,6 +4029,39 @@ impl GraphMemory {
         self.prune_entity_if_over_degree(&edge.to_entity)?;
 
         Ok(edge.uuid)
+    }
+
+    /// Drain the temporal anomalies queued by the strengthen path (dormant
+    /// reactivations). Called by the ingest path after each graph write; the
+    /// caller resolves entity names and emits SSE events.
+    pub fn drain_temporal_anomalies(&self) -> Vec<TemporalAnomalyEvent> {
+        std::mem::take(&mut *self.pending_temporal_anomalies.lock())
+    }
+
+    /// RocksDB in-process memory for this graph DB: (memtable bytes,
+    /// table-reader bytes), summed over all graph column families. The shared
+    /// block cache is deliberately excluded — it is one pool shared by every
+    /// DB instance and is reported once at the manager level.
+    pub fn rocksdb_memory_breakdown(&self) -> (u64, u64) {
+        let mut memtables = 0u64;
+        let mut readers = 0u64;
+        for cf_name in GRAPH_CF_NAMES {
+            if let Some(cf) = self.db.cf_handle(cf_name) {
+                if let Ok(Some(v)) = self
+                    .db
+                    .property_int_value_cf(cf, "rocksdb.cur-size-all-mem-tables")
+                {
+                    memtables += v;
+                }
+                if let Ok(Some(v)) = self
+                    .db
+                    .property_int_value_cf(cf, "rocksdb.estimate-table-readers-mem")
+                {
+                    readers += v;
+                }
+            }
+        }
+        (memtables, readers)
     }
 
     /// Index an edge for an entity
@@ -2125,7 +4148,7 @@ impl GraphMemory {
         }
 
         if !to_prune.is_empty() {
-            tracing::info!(
+            tracing::debug!(
                 entity = %entity_uuid,
                 pruned = to_prune.len(),
                 remaining = MAX_ENTITY_DEGREE,
@@ -2193,10 +4216,7 @@ impl GraphMemory {
 
         let mut edges = Vec::with_capacity(edge_uuids.len());
         for value in results.into_iter().flatten().flatten() {
-            if let Ok((edge, _)) = bincode::serde::decode_from_slice::<RelationshipEdge, _>(
-                &value,
-                bincode::config::standard(),
-            ) {
+            if let Ok((edge, _)) = decode_relationship_edge(&value) {
                 edges.push(edge);
             }
         }
@@ -2220,8 +4240,7 @@ impl GraphMemory {
         // This replaces the eager full-scan apply_decay() with lazy on-read pruning.
         let mut has_prunable = false;
         for edge in &edges {
-            if edge.effective_strength() < edge.tier.prune_threshold()
-                && !edge.ltp_status.is_potentiated()
+            if edge.effective_strength() < edge.tier.prune_threshold() && !edge.is_prune_protected()
             {
                 has_prunable = true;
                 break;
@@ -2244,7 +4263,7 @@ impl GraphMemory {
             }
             edges.retain(|edge| {
                 if edge.effective_strength() < edge.tier.prune_threshold()
-                    && !edge.ltp_status.is_potentiated()
+                    && !edge.is_prune_protected()
                 {
                     prune_queue.push(edge.uuid);
                     orphan_queue.push(edge.from_entity);
@@ -2262,6 +4281,332 @@ impl GraphMemory {
         }
 
         Ok(edges)
+    }
+
+    /// Trace the causal origin(s) of a set of effect entities — the "root cause".
+    ///
+    /// Spreading activation cannot answer "what was the origin of C?": it favours
+    /// the PROXIMAL cause (1 hop) over the distal root (2+ hops), and its per-edge
+    /// step hardcodes the `to_entity` as the target so it only flows forward
+    /// (cause → effect), never backward. This walks the OTHER way: from each effect
+    /// it follows incoming causal edges (where the current node is the `to_entity`
+    /// of a `Causes`/`Triggers`/`ResultsIn` edge) toward the `from_entity` cause,
+    /// repeatedly, and returns the terminal sources — the nodes with no further
+    /// causal antecedent. Those are the roots whose episodes answer the query.
+    ///
+    /// Requires causally-typed edges (see `extract_predicate_from_text` /
+    /// `SHODH_GRAPH_EXTRACTED_PREDICATES`); on a pure co-occurrence graph there are
+    /// no causal edges to walk and this correctly returns nothing.
+    ///
+    /// Returns origins SCORED by backward-path strength — the max over paths of the
+    /// product of edge `effective_strength` with per-hop decay — sorted strongest
+    /// first. The unscored version of this walk returned EVERY terminal source in
+    /// the backward cone; on a graph with cross-chain causal bleed that was 21–57
+    /// origins per query when exactly 1 was correct (the measured lineage flood),
+    /// and the downstream injection amplified all of them. Scores let the caller
+    /// take a bounded top-k — the reach_inject lesson (bounded ranked set, never
+    /// everything reachable), causal edition. Relaxation re-expands improved nodes
+    /// (exact best-path); products of factors < 1 cannot improve around a cycle, so
+    /// it terminates.
+    pub fn trace_causal_origins(
+        &self,
+        seeds: &[Uuid],
+        max_depth: usize,
+    ) -> Result<Vec<(Uuid, f32)>> {
+        use std::collections::HashSet;
+        const HOP_DECAY: f32 = 0.7;
+        const MAX_NODES: usize = 4000;
+
+        let seed_set: HashSet<Uuid> = seeds.iter().copied().collect();
+        // Best backward-path strength per node (max-product relaxation).
+        let mut best: HashMap<Uuid, f32> = seeds.iter().map(|s| (*s, 1.0_f32)).collect();
+        let mut origins: HashMap<Uuid, f32> = HashMap::new();
+        let mut frontier: Vec<Uuid> = seeds.to_vec();
+
+        for _ in 0..max_depth.max(1) {
+            if frontier.is_empty() || best.len() >= MAX_NODES {
+                break;
+            }
+            let mut next: Vec<Uuid> = Vec::new();
+            for node in std::mem::take(&mut frontier) {
+                let node_score = best.get(&node).copied().unwrap_or(0.0);
+                if node_score <= 0.0 {
+                    continue;
+                }
+                let edges = self.get_entity_relationships_limited(&node, Some(64))?;
+                // Incoming causal edges: this node is the EFFECT (to_entity); the
+                // cause is the from_entity. Self-loops are skipped.
+                let parents: Vec<(Uuid, f32)> = edges
+                    .iter()
+                    .filter(|e| {
+                        e.to_entity == node && e.from_entity != node && e.relation_type.is_causal()
+                    })
+                    .map(|e| (e.from_entity, e.effective_strength().clamp(0.0, 1.0)))
+                    .collect();
+                if parents.is_empty() {
+                    // No causal antecedent → this is a source. A seed with no causal
+                    // parent is the query subject itself, not an origin, so skip it.
+                    if !seed_set.contains(&node) {
+                        let entry = origins.entry(node).or_insert(0.0);
+                        if node_score > *entry {
+                            *entry = node_score;
+                        }
+                    }
+                } else {
+                    for (parent, strength) in parents {
+                        let candidate = node_score * strength * HOP_DECAY;
+                        let entry = best.entry(parent).or_insert(0.0);
+                        if candidate > *entry {
+                            *entry = candidate;
+                            next.push(parent);
+                        }
+                    }
+                }
+            }
+            frontier = next;
+        }
+
+        let mut out: Vec<(Uuid, f32)> = origins.into_iter().collect();
+        // Strongest first; uuid tiebreak for determinism.
+        out.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        Ok(out)
+    }
+
+    fn relation_stats_cf(&self) -> &ColumnFamily {
+        self.db
+            .cf_handle(CF_RELATION_STATS)
+            .expect("relation_stats CF must exist")
+    }
+
+    /// Record one piece of high-precision relation evidence — the cue extractor
+    /// acting as distant supervisor (Angeli 2015 §5, adapted): every explicit
+    /// lexical cue hit teaches the per-user (label-pair → relation, direction)
+    /// statistics that `lookup_learned_pair_relation` later applies to cue-less
+    /// pairs. `src_label`/`dst_label` are the labels of the relation's source
+    /// and target entities respectively.
+    pub fn record_relation_evidence(
+        &self,
+        src_label: &EntityLabel,
+        dst_label: &EntityLabel,
+        relation: &RelationType,
+    ) -> Result<()> {
+        // Generic labels never participate (see label_is_generic) — refusing
+        // at RECORD time keeps the stats CF small and the signal honest.
+        if label_is_generic(src_label) || label_is_generic(dst_label) {
+            return Ok(());
+        }
+        let (la, lb, src_is_a) = canonical_label_pair(src_label, dst_label);
+        let key = format!("lp:{la}:{lb}:{}", relation.as_str());
+        let mut stat: PairRelationStat = match self.db.get_cf(self.relation_stats_cf(), &key)? {
+            Some(bytes) => crate::serialization::try_decode(&bytes)
+                .map(|(s, _)| s)
+                .unwrap_or_else(|_| PairRelationStat::new(relation.clone())),
+            None => PairRelationStat::new(relation.clone()),
+        };
+        stat.count += 1;
+        if src_is_a {
+            stat.src_is_a += 1;
+        }
+        self.db.put_cf(
+            self.relation_stats_cf(),
+            &key,
+            crate::serialization::encode(&stat)?,
+        )?;
+        self.bump_stat_counter(&format!("lp_total:{la}:{lb}"))?;
+        self.bump_stat_counter(&format!("rel_total:{}", relation.as_str()))?;
+        self.bump_stat_counter("lp_grand_total")?;
+        Ok(())
+    }
+
+    fn bump_stat_counter(&self, key: &str) -> Result<()> {
+        let n: u64 = match self.db.get_cf(self.relation_stats_cf(), key)? {
+            Some(bytes) => crate::serialization::try_decode(&bytes)
+                .map(|(v, _)| v)
+                .unwrap_or(0),
+            None => 0,
+        };
+        self.db.put_cf(
+            self.relation_stats_cf(),
+            key,
+            crate::serialization::encode(&(n + 1))?,
+        )?;
+        Ok(())
+    }
+
+    fn read_stat_counter(&self, key: &str) -> Result<u64> {
+        Ok(match self.db.get_cf(self.relation_stats_cf(), key)? {
+            Some(bytes) => crate::serialization::try_decode(&bytes)
+                .map(|(v, _)| v)
+                .unwrap_or(0),
+            None => 0,
+        })
+    }
+
+    /// Learned label-pair relation for a cue-less pair: the typed default this
+    /// user's own cue evidence has EARNED, replacing the hardcoded label-pair
+    /// table. Returns (relation, label_a_entity_is_source, support) for the
+    /// caller's (label_a, label_b) mention order, or None.
+    ///
+    /// Gates (each against a measured failure mode; tightened after the first
+    /// measurement, batched guard run 27348362950, rejected v1 for
+    /// per-application over-generalization):
+    /// - NO generic labels (Concept/Keyword/Other) on either endpoint —
+    ///   catch-all labels made every co-mention one "pair" (CreatedBy 3→344);
+    /// - support ≥ 10 (was 3) — a mapping must be earned by real evidence mass;
+    /// - purity ≥ 0.6 — a near-tie between relations stays generic (the
+    ///   embedding-argmax platform-divergence lesson: never let a coin flip
+    ///   pick semantics);
+    /// - PMI² > 0 — the pair must co-occur with the relation MORE than chance
+    ///   (Angeli 2015 §5);
+    /// - NEVER causal — causal edges demand explicit sentence-level evidence;
+    ///   a statistically-defaulted causal edge is lineage poison (the fragment
+    ///   bridge class);
+    /// - direction by ≥ 0.7 majority for cross-label pairs, mention order
+    ///   otherwise.
+    /// The caller adds the per-APPLICATION cap (max learned edges per memory).
+    pub fn lookup_learned_pair_relation(
+        &self,
+        label_a: &EntityLabel,
+        label_b: &EntityLabel,
+    ) -> Result<Option<(RelationType, bool, u64)>> {
+        if label_is_generic(label_a) || label_is_generic(label_b) {
+            return Ok(None);
+        }
+        let (la, lb, a_is_canonical_a) = canonical_label_pair(label_a, label_b);
+        let pair_total = self.read_stat_counter(&format!("lp_total:{la}:{lb}"))?;
+        if pair_total < 10 {
+            return Ok(None);
+        }
+        let prefix = format!("lp:{la}:{lb}:");
+        let iter = self
+            .db
+            .prefix_iterator_cf(self.relation_stats_cf(), prefix.as_bytes());
+        let mut best: Option<PairRelationStat> = None;
+        for (key, value) in iter.flatten() {
+            let Ok(key_str) = std::str::from_utf8(&key) else {
+                break;
+            };
+            if !key_str.starts_with(&prefix) {
+                break;
+            }
+            if let Ok((stat, _)) = crate::serialization::try_decode::<PairRelationStat>(&value) {
+                if best.as_ref().map(|b| stat.count > b.count).unwrap_or(true) {
+                    best = Some(stat);
+                }
+            }
+        }
+        let Some(best) = best else {
+            return Ok(None);
+        };
+        if best.relation.is_causal() {
+            return Ok(None);
+        }
+        let purity = best.count as f64 / pair_total as f64;
+        if purity < 0.6 {
+            return Ok(None);
+        }
+        let grand = self.read_stat_counter("lp_grand_total")?.max(1);
+        let rel_total = self
+            .read_stat_counter(&format!("rel_total:{}", best.relation.as_str()))?
+            .max(1);
+        // PMI² = log2( c(pair,rel)² · N / (c(pair) · c(rel)) ).
+        let pmi2 = ((best.count as f64).powi(2) * grand as f64
+            / (pair_total as f64 * rel_total as f64))
+            .log2();
+        if pmi2 <= 0.0 {
+            return Ok(None);
+        }
+        // Direction: majority vote across the evidence, expressed for the
+        // canonical pair, then mapped back to the caller's mention order.
+        let a_is_source = if la == lb {
+            true // same-label pairs carry no label-level direction signal
+        } else {
+            let ratio = best.src_is_a as f64 / best.count as f64;
+            if ratio >= 0.7 {
+                a_is_canonical_a
+            } else if ratio <= 0.3 {
+                !a_is_canonical_a
+            } else {
+                return Ok(None); // direction unsettled → stay generic
+            }
+        };
+        Ok(Some((best.relation.clone(), a_is_source, best.count)))
+    }
+
+    /// Typed-relation neighbor lookup — the lineage walk's machinery as a
+    /// general retrieval primitive (typed-walk retrieval, #67). For each seed,
+    /// collect the entities connected by an edge whose relation type is in
+    /// `relations`, respecting direction: `incoming=false` follows
+    /// seed --R--> neighbor (e.g. Caroline --LocatedIn--> Denver for "where
+    /// does Caroline live"); `incoming=true` follows neighbor --R--> seed
+    /// (e.g. creator --CreatedBy--> artifact for "who made X"). Scored by
+    /// edge `effective_strength`, deduped by max, strongest first — the same
+    /// bounded-ranked-set discipline as the causal walk.
+    pub fn typed_neighbors(
+        &self,
+        seeds: &[Uuid],
+        relations: &[RelationType],
+        incoming: bool,
+        max_edges_per_seed: usize,
+    ) -> Result<Vec<(Uuid, f32)>> {
+        let mut best: HashMap<Uuid, f32> = HashMap::new();
+        for seed in seeds {
+            let edges = self.get_entity_relationships_limited(seed, Some(max_edges_per_seed))?;
+            for edge in &edges {
+                if !relations.contains(&edge.relation_type) {
+                    continue;
+                }
+                let neighbor = if incoming {
+                    if edge.to_entity != *seed || edge.from_entity == *seed {
+                        continue;
+                    }
+                    edge.from_entity
+                } else {
+                    if edge.from_entity != *seed || edge.to_entity == *seed {
+                        continue;
+                    }
+                    edge.to_entity
+                };
+                let score = edge.effective_strength().clamp(0.0, 1.0);
+                let entry = best.entry(neighbor).or_insert(0.0);
+                if score > *entry {
+                    *entry = score;
+                }
+            }
+        }
+        let mut out: Vec<(Uuid, f32)> = best.into_iter().collect();
+        out.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        Ok(out)
+    }
+
+    /// Count edges by relation type — the substrate's typed-fraction scoreboard
+    /// (audit 2026-06-10: >80% of the graph was CoOccurs; the typed fraction is
+    /// the progress metric for the relation substrate). Full scan; intended for
+    /// post-ingest diagnostics, not the query path. Index entries in the CF fail
+    /// the format-tag decode and are skipped.
+    pub fn relation_type_distribution(&self) -> Result<Vec<(String, usize)>> {
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        let iter = self
+            .db
+            .iterator_cf(self.relationships_cf(), rocksdb::IteratorMode::Start);
+        for (_, value) in iter.flatten() {
+            if let Ok((edge, _)) = decode_relationship_edge(&value) {
+                *counts
+                    .entry(edge.relation_type.as_str().to_string())
+                    .or_default() += 1;
+            }
+        }
+        let mut out: Vec<(String, usize)> = counts.into_iter().collect();
+        out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        Ok(out)
     }
 
     /// Calculate edge density for a specific entity (SHO-D5)
@@ -2311,62 +4656,12 @@ impl GraphMemory {
         Ok(Some(total_edges as f32 / entity_uuids.len() as f32))
     }
 
-    /// Calculate edge density per tier for a specific entity (SHO-D5)
-    ///
-    /// Returns counts of edges by tier: (L1_count, L2_count, L3_count, LTP_count)
-    /// Useful for understanding if an entity's graph is consolidated (mostly L3/LTP)
-    /// or still noisy (mostly L1).
-    pub fn entity_density_by_tier(
-        &self,
-        entity_uuid: &Uuid,
-    ) -> Result<(usize, usize, usize, usize)> {
-        let edges = self.get_entity_relationships(entity_uuid)?;
-
-        let mut l1_count = 0;
-        let mut l2_count = 0;
-        let mut l3_count = 0;
-        let mut ltp_count = 0;
-
-        for edge in edges {
-            if edge.is_potentiated() {
-                ltp_count += 1;
-            } else {
-                match edge.tier {
-                    EdgeTier::L1Working => l1_count += 1,
-                    EdgeTier::L2Episodic => l2_count += 1,
-                    EdgeTier::L3Semantic => l3_count += 1,
-                }
-            }
-        }
-
-        Ok((l1_count, l2_count, l3_count, ltp_count))
-    }
-
-    /// Calculate consolidated ratio for an entity (SHO-D5)
-    ///
-    /// Returns the ratio of consolidated edges (L2 + L3 + LTP) to total edges.
-    /// High ratio (>0.7) = trust graph search, Low ratio (<0.3) = trust vector search.
-    ///
-    /// Returns None if entity has no edges.
-    pub fn entity_consolidation_ratio(&self, entity_uuid: &Uuid) -> Result<Option<f32>> {
-        let (l1, l2, l3, ltp) = self.entity_density_by_tier(entity_uuid)?;
-        let total = l1 + l2 + l3 + ltp;
-
-        if total == 0 {
-            return Ok(None);
-        }
-
-        let consolidated = l2 + l3 + ltp;
-        Ok(Some(consolidated as f32 / total as f32))
-    }
-
     /// Get relationship by UUID (raw, without decay applied)
     pub fn get_relationship(&self, uuid: &Uuid) -> Result<Option<RelationshipEdge>> {
         let key = uuid.as_bytes();
         match self.db.get_cf(self.relationships_cf(), key)? {
             Some(value) => {
-                let (edge, _): (RelationshipEdge, _) =
-                    bincode::serde::decode_from_slice(&value, bincode::config::standard())?;
+                let (edge, _) = decode_relationship_edge(&value)?;
                 Ok(Some(edge))
             }
             None => Ok(None),
@@ -2385,8 +4680,7 @@ impl GraphMemory {
         let key = uuid.as_bytes();
         match self.db.get_cf(self.relationships_cf(), key)? {
             Some(value) => {
-                let (mut edge, _): (RelationshipEdge, _) =
-                    bincode::serde::decode_from_slice(&value, bincode::config::standard())?;
+                let (mut edge, _) = decode_relationship_edge(&value)?;
                 // Apply effective strength calculation (doesn't persist)
                 edge.strength = edge.effective_strength();
                 Ok(Some(edge))
@@ -2410,7 +4704,15 @@ impl GraphMemory {
 
         // Delete from main storage
         self.db.delete_cf(self.relationships_cf(), key)?;
-        self.relationship_count.fetch_sub(1, Ordering::Relaxed);
+        // Saturating decrement: never wrap below 0. relationship_count is an
+        // accounting estimate that can legitimately drift (some creation paths
+        // historically omitted the increment), and a plain fetch_sub would wrap
+        // usize to ~1.8e19 once it hits 0.
+        let _ = self
+            .relationship_count
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |c| {
+                Some(c.saturating_sub(1))
+            });
 
         // Remove from entity_edges index for BOTH entities
         // (add_relationship indexes both from_entity and to_entity)
@@ -2426,8 +4728,10 @@ impl GraphMemory {
             tracing::warn!(edge = %uuid, key = %to_key, error = %e, "Failed to delete from entity_edges index");
         }
 
-        // Remove from entity-pair index
-        if let Err(e) = self.remove_entity_pair_index(&edge.from_entity, &edge.to_entity) {
+        // Remove from entity-pair index (typed key)
+        if let Err(e) =
+            self.remove_entity_pair_index(&edge.from_entity, &edge.to_entity, &edge.relation_type)
+        {
             tracing::warn!(edge = %uuid, "Failed to delete from entity_pair index: {}", e);
         }
 
@@ -2461,20 +4765,65 @@ impl GraphMemory {
             }
         }
 
-        // Delete edges sourced from this episode
-        // Scan all relationships for matching source_episode_id
+        // Scrub this episode from every edge's attestation trail (multi-source aware).
+        //
+        // An edge survives iff at least one attesting episode remains after scrubbing.
+        // The deleted episode is removed from the provenance trail; if it was the
+        // edge's primary `source_episode_id` but other sources still attest the edge,
+        // primacy is promoted to a surviving source. Only edges left with NO remaining
+        // attestation are deleted. This avoids both over-deletion (nuking a
+        // well-corroborated edge because its first source was removed) and dangling
+        // trails (provenance still pointing at a now-deleted episode).
+        //
+        // Edges never sourced from this episode (source_episode_id is a different
+        // episode or None, and the episode is absent from the trail) are untouched —
+        // including memory↔memory co-retrieval edges, which carry no episode
+        // attestation by design.
         let iter = self
             .db
             .iterator_cf(self.relationships_cf(), rocksdb::IteratorMode::Start);
         let mut edges_to_delete = Vec::new();
+        let mut edges_to_update: Vec<RelationshipEdge> = Vec::new();
         for (_, value) in iter.flatten() {
-            if let Ok((edge, _)) = bincode::serde::decode_from_slice::<RelationshipEdge, _>(
-                &value,
-                bincode::config::standard(),
-            ) {
-                if edge.source_episode_id == Some(*episode_uuid) {
-                    edges_to_delete.push(edge.uuid);
+            let mut edge = match decode_relationship_edge(&value) {
+                Ok((edge, _)) => edge,
+                Err(_) => continue,
+            };
+            let was_primary_source = edge.source_episode_id == Some(*episode_uuid);
+            let in_trail = edge
+                .provenance
+                .iter()
+                .any(|p| p.source_episode_id == *episode_uuid);
+            if !was_primary_source && !in_trail {
+                continue;
+            }
+            edge.provenance
+                .retain(|p| p.source_episode_id != *episode_uuid);
+            if was_primary_source {
+                // Promote a surviving attesting episode to primary source, if any.
+                edge.source_episode_id = edge.provenance.first().map(|p| p.source_episode_id);
+            }
+            let still_attested = edge.source_episode_id.is_some() || !edge.provenance.is_empty();
+            if still_attested {
+                edges_to_update.push(edge);
+            } else {
+                edges_to_delete.push(edge.uuid);
+            }
+        }
+
+        // Persist scrubbed survivors. Endpoints and relation_type are unchanged, so
+        // no edge index (pair-key / entity-edge) needs updating — only the payload.
+        for edge in &edges_to_update {
+            match crate::serialization::encode(edge) {
+                Ok(encoded) => {
+                    if let Err(e) =
+                        self.db
+                            .put_cf(self.relationships_cf(), edge.uuid.as_bytes(), encoded)
+                    {
+                        tracing::debug!("Failed to persist scrubbed edge {}: {}", edge.uuid, e);
+                    }
                 }
+                Err(e) => tracing::debug!("Failed to encode scrubbed edge {}: {}", edge.uuid, e),
             }
         }
 
@@ -2485,9 +4834,10 @@ impl GraphMemory {
         }
 
         tracing::debug!(
-            "Deleted episode {} with {} entity_refs and {} sourced edges",
+            "Deleted episode {} with {} entity_refs; {} edges scrubbed, {} orphan edges removed",
             &episode_uuid.to_string()[..8],
             episode.entity_refs.len(),
+            edges_to_update.len(),
             edges_to_delete.len()
         );
 
@@ -2506,7 +4856,10 @@ impl GraphMemory {
 
         // Clear each column family by iterating and batch-deleting
         for cf_name in GRAPH_CF_NAMES {
-            let cf = self.db.cf_handle(cf_name).unwrap();
+            let cf = self
+                .db
+                .cf_handle(cf_name)
+                .ok_or_else(|| anyhow::anyhow!("CF '{}' not found during clear_all", cf_name))?;
             let mut batch = rocksdb::WriteBatch::default();
             let iter = self.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
             for (key, _) in iter.flatten() {
@@ -2519,6 +4872,7 @@ impl GraphMemory {
         self.entity_name_index.write().clear();
         self.entity_lowercase_index.write().clear();
         self.entity_stemmed_index.write().clear();
+        self.entity_alias_index.write().clear();
 
         // Reset counters
         self.entity_count.store(0, Ordering::Relaxed);
@@ -2528,6 +4882,7 @@ impl GraphMemory {
         // Drain pending maintenance queues — they reference now-deleted entities/edges
         let _ = std::mem::take(&mut *self.pending_prune.lock());
         let _ = std::mem::take(&mut *self.pending_orphan_checks.lock());
+        let _ = std::mem::take(&mut *self.pending_temporal_anomalies.lock());
 
         tracing::info!(
             "Graph data cleared (GDPR erasure): {} entities, {} relationships, {} episodes",
@@ -2548,12 +4903,15 @@ impl GraphMemory {
             entity_count
         );
 
-        let value = bincode::serde::encode_to_vec(&episode, bincode::config::standard())?;
+        let value = crate::serialization::encode(&episode)?;
+        let already_existed = self.db.get_cf(self.episodes_cf(), key)?.is_some();
         self.db.put_cf(self.episodes_cf(), key, value)?;
 
-        // Increment episode counter
-        let prev = self.episode_count.fetch_add(1, Ordering::Relaxed);
-        tracing::debug!("add_episode: count {} -> {}", prev, prev + 1);
+        // Only increment counter for genuinely new episodes (not overwrites from retries)
+        if !already_existed {
+            let prev = self.episode_count.fetch_add(1, Ordering::Relaxed);
+            tracing::debug!("add_episode: count {} -> {}", prev, prev + 1);
+        }
 
         // Update inverted index: entity_uuid -> episode_uuid
         for entity_uuid in &episode.entity_refs {
@@ -2576,8 +4934,7 @@ impl GraphMemory {
         let key = uuid.as_bytes();
         match self.db.get_cf(self.episodes_cf(), key)? {
             Some(value) => {
-                let (episode, _): (EpisodicNode, _) =
-                    bincode::serde::decode_from_slice(&value, bincode::config::standard())?;
+                let (episode, _) = crate::serialization::try_decode::<EpisodicNode>(&value)?;
                 Ok(Some(episode))
             }
             None => Ok(None),
@@ -2625,10 +4982,7 @@ impl GraphMemory {
 
         let mut episodes = Vec::with_capacity(episode_uuids.len());
         for value in results.into_iter().flatten().flatten() {
-            if let Ok((episode, _)) = bincode::serde::decode_from_slice::<EpisodicNode, _>(
-                &value,
-                bincode::config::standard(),
-            ) {
+            if let Ok((episode, _)) = crate::serialization::try_decode::<EpisodicNode>(&value) {
                 episodes.push(episode);
             }
         }
@@ -2788,404 +5142,6 @@ impl GraphMemory {
         })
     }
 
-    /// Weighted graph traversal with filtering (Dijkstra-style best-first)
-    ///
-    /// Unlike BFS traverse_from_entity, this uses edge weights to prioritize
-    /// stronger connections. Enables Cypher-like pattern matching:
-    /// - Filter by relationship types
-    /// - Filter by minimum edge strength
-    /// - Score paths by cumulative weight
-    ///
-    /// Returns entities sorted by path score (strongest connections first).
-    ///
-    /// Performance: Uses batch edge reading and early termination to handle
-    /// large graphs (10000+ edges) efficiently.
-    pub fn traverse_weighted(
-        &self,
-        start_uuid: &Uuid,
-        max_depth: usize,
-        relation_types: Option<&[RelationType]>,
-        min_strength: f32,
-    ) -> Result<GraphTraversal> {
-        // Performance limits - prevents exponential blowup on dense graphs
-        const MAX_ENTITIES: usize = 200; // Stop after finding this many entities
-        const MAX_EDGES_PER_NODE: usize = 100; // Limit edges loaded per node
-        const MAX_ITERATIONS: usize = 500; // Prevent infinite loops
-
-        // Priority queue entry: (negative score for max-heap, uuid, depth, path_score)
-        #[derive(Clone)]
-        struct PQEntry {
-            score: f32,
-            uuid: Uuid,
-            depth: usize,
-        }
-        impl PartialEq for PQEntry {
-            fn eq(&self, other: &Self) -> bool {
-                self.score == other.score
-            }
-        }
-        impl Eq for PQEntry {}
-        impl PartialOrd for PQEntry {
-            fn partial_cmp(&self, other: &Self) -> Option<CmpOrdering> {
-                Some(self.cmp(other))
-            }
-        }
-        impl Ord for PQEntry {
-            fn cmp(&self, other: &Self) -> CmpOrdering {
-                // BinaryHeap is a max-heap: higher score = popped first = explored first
-                self.score.total_cmp(&other.score)
-            }
-        }
-
-        let mut visited: HashMap<Uuid, f32> = HashMap::new(); // uuid -> best path score
-        let mut heap: BinaryHeap<PQEntry> = BinaryHeap::new();
-        let mut all_entities: Vec<TraversedEntity> = Vec::new();
-        let mut all_edges: Vec<RelationshipEdge> = Vec::new();
-        let mut edges_to_strengthen: Vec<Uuid> = Vec::new();
-        let mut iterations = 0;
-
-        // Start node
-        heap.push(PQEntry {
-            score: 1.0,
-            uuid: *start_uuid,
-            depth: 0,
-        });
-        visited.insert(*start_uuid, 1.0);
-
-        if let Some(entity) = self.get_entity(start_uuid)? {
-            all_entities.push(TraversedEntity {
-                entity,
-                hop_distance: 0,
-                decay_factor: 1.0,
-            });
-        }
-
-        while let Some(PQEntry { score, uuid, depth }) = heap.pop() {
-            iterations += 1;
-
-            // Early termination: entity/iteration limits reached, stop draining heap
-            if all_entities.len() >= MAX_ENTITIES || iterations >= MAX_ITERATIONS {
-                break;
-            }
-
-            // Depth limit: skip this node's children but keep processing others
-            if depth >= max_depth {
-                continue;
-            }
-
-            // Skip if we've found a better path to this node
-            if let Some(&best) = visited.get(&uuid) {
-                if score < best * 0.99 {
-                    continue;
-                }
-            }
-
-            // Use limited edge reading to avoid loading 10000+ edges
-            let edges = self.get_entity_relationships_limited(&uuid, Some(MAX_EDGES_PER_NODE))?;
-
-            for edge in edges {
-                // Skip invalidated edges
-                if edge.invalidated_at.is_some() {
-                    continue;
-                }
-
-                // Filter by relationship type if specified
-                if let Some(types) = relation_types {
-                    if !types.contains(&edge.relation_type) {
-                        continue;
-                    }
-                }
-
-                // Filter by minimum strength
-                let effective = edge.effective_strength();
-                if effective < min_strength {
-                    continue;
-                }
-
-                let connected_uuid = if edge.from_entity == uuid {
-                    edge.to_entity
-                } else {
-                    edge.from_entity
-                };
-
-                // Path score = parent_score * edge_strength (multiplicative decay)
-                let new_score = score * effective;
-
-                // Only visit if this is a better path
-                let dominated = visited
-                    .get(&connected_uuid)
-                    .is_some_and(|&best| new_score <= best);
-                if dominated {
-                    continue;
-                }
-
-                // Track edge for Hebbian strengthening AFTER domination check
-                // so only edges on optimal paths are strengthened
-                edges_to_strengthen.push(edge.uuid);
-
-                let is_new_entity = !visited.contains_key(&connected_uuid);
-                visited.insert(connected_uuid, new_score);
-
-                // Add edge to results
-                let mut edge_with_strength = edge.clone();
-                edge_with_strength.strength = effective;
-                all_edges.push(edge_with_strength);
-
-                // Only add entity once (first discovery); better-path rediscovery
-                // updates visited score but doesn't duplicate the entity in results
-                if is_new_entity {
-                    if let Some(entity) = self.get_entity(&connected_uuid)? {
-                        all_entities.push(TraversedEntity {
-                            entity,
-                            hop_distance: depth + 1,
-                            decay_factor: new_score,
-                        });
-                    }
-                }
-
-                heap.push(PQEntry {
-                    score: new_score,
-                    uuid: connected_uuid,
-                    depth: depth + 1,
-                });
-            }
-        }
-
-        // Sort entities by path score (decay_factor) descending
-        all_entities.sort_by(|a, b| b.decay_factor.total_cmp(&a.decay_factor));
-
-        // Hebbian strengthening
-        if !edges_to_strengthen.is_empty() {
-            if let Err(e) = self.batch_strengthen_synapses(&edges_to_strengthen) {
-                tracing::debug!("Failed to strengthen synapses: {}", e);
-            }
-        }
-
-        tracing::debug!(
-            "traverse_weighted: {} entities, {} edges (min_strength={:.2})",
-            all_entities.len(),
-            all_edges.len(),
-            min_strength
-        );
-
-        Ok(GraphTraversal {
-            entities: all_entities,
-            relationships: all_edges,
-        })
-    }
-
-    /// Bidirectional search between two entities (meet-in-middle)
-    ///
-    /// Complexity: O(b^(d/2)) instead of O(b^d) for unidirectional search.
-    /// Finds the shortest weighted path between start and goal.
-    /// Returns entities along the path with their path scores.
-    ///
-    /// Performance: Uses batch edge reading with limits.
-    pub fn traverse_bidirectional(
-        &self,
-        start_uuid: &Uuid,
-        goal_uuid: &Uuid,
-        max_depth: usize,
-        min_strength: f32,
-    ) -> Result<GraphTraversal> {
-        const MAX_EDGES_PER_NODE: usize = 100;
-
-        // Track forward search from start
-        let mut forward_visited: HashMap<Uuid, (f32, usize)> = HashMap::new(); // uuid -> (score, depth)
-        let mut forward_parents: HashMap<Uuid, (Uuid, Uuid)> = HashMap::new(); // child -> (parent, edge_uuid)
-        let mut forward_frontier: Vec<(Uuid, f32, usize)> = vec![(*start_uuid, 1.0, 0)];
-        forward_visited.insert(*start_uuid, (1.0, 0));
-
-        // Track backward search from goal
-        let mut backward_visited: HashMap<Uuid, (f32, usize)> = HashMap::new();
-        let mut backward_parents: HashMap<Uuid, (Uuid, Uuid)> = HashMap::new();
-        let mut backward_frontier: Vec<(Uuid, f32, usize)> = vec![(*goal_uuid, 1.0, 0)];
-        backward_visited.insert(*goal_uuid, (1.0, 0));
-
-        let mut meeting_node: Option<Uuid> = None;
-        let mut best_path_score: f32 = 0.0;
-        let half_depth = max_depth / 2 + 1;
-
-        // Alternate forward and backward expansion
-        for _round in 0..half_depth {
-            // Expand forward frontier
-            let mut new_forward: Vec<(Uuid, f32, usize)> = Vec::new();
-            for (uuid, score, depth) in forward_frontier.drain(..) {
-                if depth >= half_depth {
-                    continue;
-                }
-
-                let edges =
-                    self.get_entity_relationships_limited(&uuid, Some(MAX_EDGES_PER_NODE))?;
-                for edge in edges {
-                    if edge.invalidated_at.is_some() {
-                        continue;
-                    }
-                    let effective = edge.effective_strength();
-                    if effective < min_strength {
-                        continue;
-                    }
-
-                    let connected = if edge.from_entity == uuid {
-                        edge.to_entity
-                    } else {
-                        edge.from_entity
-                    };
-                    let new_score = score * effective;
-
-                    // Check if we meet backward search
-                    if let Some(&(back_score, _)) = backward_visited.get(&connected) {
-                        let combined = new_score * back_score;
-                        if combined > best_path_score {
-                            best_path_score = combined;
-                            meeting_node = Some(connected);
-                        }
-                    }
-
-                    // Update forward frontier
-                    let dominated = forward_visited
-                        .get(&connected)
-                        .is_some_and(|&(best, _)| new_score <= best);
-                    if !dominated {
-                        forward_visited.insert(connected, (new_score, depth + 1));
-                        forward_parents.insert(connected, (uuid, edge.uuid));
-                        new_forward.push((connected, new_score, depth + 1));
-                    }
-                }
-            }
-            forward_frontier = new_forward;
-
-            // Expand backward frontier
-            let mut new_backward: Vec<(Uuid, f32, usize)> = Vec::new();
-            for (uuid, score, depth) in backward_frontier.drain(..) {
-                if depth >= half_depth {
-                    continue;
-                }
-
-                let edges =
-                    self.get_entity_relationships_limited(&uuid, Some(MAX_EDGES_PER_NODE))?;
-                for edge in edges {
-                    if edge.invalidated_at.is_some() {
-                        continue;
-                    }
-                    let effective = edge.effective_strength();
-                    if effective < min_strength {
-                        continue;
-                    }
-
-                    let connected = if edge.from_entity == uuid {
-                        edge.to_entity
-                    } else {
-                        edge.from_entity
-                    };
-                    let new_score = score * effective;
-
-                    // Check if we meet forward search
-                    if let Some(&(fwd_score, _)) = forward_visited.get(&connected) {
-                        let combined = fwd_score * new_score;
-                        if combined > best_path_score {
-                            best_path_score = combined;
-                            meeting_node = Some(connected);
-                        }
-                    }
-
-                    // Update backward frontier
-                    let dominated = backward_visited
-                        .get(&connected)
-                        .is_some_and(|&(best, _)| new_score <= best);
-                    if !dominated {
-                        backward_visited.insert(connected, (new_score, depth + 1));
-                        backward_parents.insert(connected, (uuid, edge.uuid));
-                        new_backward.push((connected, new_score, depth + 1));
-                    }
-                }
-            }
-            backward_frontier = new_backward;
-
-            // Early termination if we found a meeting point
-            if meeting_node.is_some() {
-                break;
-            }
-        }
-
-        // Reconstruct path from meeting node
-        let mut all_entities: Vec<TraversedEntity> = Vec::new();
-        let mut all_edges: Vec<RelationshipEdge> = Vec::new();
-        let mut edges_to_strengthen: Vec<Uuid> = Vec::new();
-
-        if let Some(meeting) = meeting_node {
-            // Forward path: start -> meeting
-            let mut path_forward: Vec<Uuid> = vec![meeting];
-            let mut current = meeting;
-            while let Some(&(parent, edge_uuid)) = forward_parents.get(&current) {
-                path_forward.push(parent);
-                edges_to_strengthen.push(edge_uuid);
-                if let Some(edge) = self.get_relationship(&edge_uuid)? {
-                    all_edges.push(edge);
-                }
-                current = parent;
-            }
-            path_forward.reverse();
-
-            // Backward path: meeting -> goal
-            let mut path_backward: Vec<Uuid> = Vec::new();
-            current = meeting;
-            while let Some(&(parent, edge_uuid)) = backward_parents.get(&current) {
-                path_backward.push(parent);
-                edges_to_strengthen.push(edge_uuid);
-                if let Some(edge) = self.get_relationship(&edge_uuid)? {
-                    all_edges.push(edge);
-                }
-                current = parent;
-            }
-
-            // Combine paths
-            let full_path: Vec<Uuid> = path_forward.into_iter().chain(path_backward).collect();
-
-            // Build entities with scores
-            for (i, uuid) in full_path.iter().enumerate() {
-                if let Some(entity) = self.get_entity(uuid)? {
-                    let score = forward_visited
-                        .get(uuid)
-                        .map(|&(s, _)| s)
-                        .or_else(|| backward_visited.get(uuid).map(|&(s, _)| s))
-                        .unwrap_or(0.5);
-                    all_entities.push(TraversedEntity {
-                        entity,
-                        hop_distance: i,
-                        decay_factor: score,
-                    });
-                }
-            }
-        } else {
-            // No path found - return empty traversal
-            tracing::debug!(
-                "traverse_bidirectional: no path between {:?} and {:?}",
-                start_uuid,
-                goal_uuid
-            );
-        }
-
-        // Hebbian strengthening for traversed edges
-        if !edges_to_strengthen.is_empty() {
-            if let Err(e) = self.batch_strengthen_synapses(&edges_to_strengthen) {
-                tracing::debug!("Failed to strengthen synapses: {}", e);
-            }
-        }
-
-        tracing::debug!(
-            "traverse_bidirectional: {} entities, {} edges, path_score={:.4}",
-            all_entities.len(),
-            all_edges.len(),
-            best_path_score
-        );
-
-        Ok(GraphTraversal {
-            entities: all_entities,
-            relationships: all_edges,
-        })
-    }
-
     /// Subgraph pattern matching (Cypher-like MATCH patterns)
     ///
     /// Pattern format: Vec of (relation_type, direction) tuples
@@ -3195,6 +5151,7 @@ impl GraphMemory {
     /// Pattern: vec![(WorksAt, true), (LocatedIn, true)]
     ///
     /// Returns all entities that match the pattern starting from start_uuid.
+    #[cfg(test)]
     pub fn match_pattern(
         &self,
         start_uuid: &Uuid,
@@ -3235,6 +5192,7 @@ impl GraphMemory {
         Ok(matches)
     }
 
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     fn match_pattern_recursive(
         &self,
@@ -3332,6 +5290,7 @@ impl GraphMemory {
     ///
     /// Pattern: Vec of (relation_type, is_outgoing) tuples
     /// Returns: All complete pattern matches with their paths.
+    #[cfg(test)]
     pub fn find_pattern_matches(
         &self,
         pattern: &[(RelationType, bool)],
@@ -3350,8 +5309,7 @@ impl GraphMemory {
             }
 
             let (_, value) = result?;
-            let (entity, _): (EntityNode, _) =
-                bincode::serde::decode_from_slice(&value, bincode::config::standard())?;
+            let (entity, _) = decode_entity_node(&value)?;
 
             let entity_matches = self.match_pattern(&entity.uuid, pattern, min_strength)?;
             for m in entity_matches {
@@ -3386,7 +5344,7 @@ impl GraphMemory {
             edge.invalidated_at = Some(Utc::now());
 
             let key = edge.uuid.as_bytes();
-            let value = bincode::serde::encode_to_vec(&edge, bincode::config::standard())?;
+            let value = crate::serialization::encode(&edge)?;
             self.db.put_cf(self.relationships_cf(), key, value)?;
         }
 
@@ -3410,7 +5368,7 @@ impl GraphMemory {
             let _ = edge.strengthen();
 
             let key = edge.uuid.as_bytes();
-            let value = bincode::serde::encode_to_vec(&edge, bincode::config::standard())?;
+            let value = crate::serialization::encode(&edge)?;
             self.db.put_cf(self.relationships_cf(), key, value)?;
         }
 
@@ -3448,14 +5406,11 @@ impl GraphMemory {
 
         for (i, result) in results.into_iter().enumerate() {
             if let Ok(Some(value)) = result {
-                if let Ok((mut edge, _)) = bincode::serde::decode_from_slice::<RelationshipEdge, _>(
-                    &value,
-                    bincode::config::standard(),
-                ) {
+                if let Ok((mut edge, _)) = decode_relationship_edge(&value) {
                     let _ = edge.strengthen();
-                    match bincode::serde::encode_to_vec(&edge, bincode::config::standard()) {
+                    match crate::serialization::encode(&edge) {
                         Ok(encoded) => {
-                            batch.put_cf(self.relationships_cf(), &keys[i], encoded);
+                            batch.put_cf(self.relationships_cf(), keys[i], encoded);
                             strengthened += 1;
                         }
                         Err(e) => {
@@ -3474,6 +5429,187 @@ impl GraphMemory {
         Ok(strengthened)
     }
 
+    /// Importance-gated batch strengthening.
+    ///
+    /// Same as `batch_strengthen_synapses` but calls `strengthen_with_importance(importance)`
+    /// instead of `strengthen()`. The importance value scales the Hebbian boost
+    /// from [`STRENGTHEN_IMPORTANCE_FLOOR`, 1.0].
+    pub fn batch_strengthen_synapses_with_importance(
+        &self,
+        edge_uuids: &[Uuid],
+        importance: f32,
+    ) -> Result<usize> {
+        if edge_uuids.is_empty() {
+            return Ok(0);
+        }
+
+        let _guard = self
+            .synapse_update_lock
+            .try_lock_for(std::time::Duration::from_secs(5))
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "synapse_update_lock timeout in batch_strengthen_synapses_with_importance"
+                )
+            })?;
+
+        let keys: Vec<[u8; 16]> = edge_uuids.iter().map(|u| *u.as_bytes()).collect();
+        let key_refs: Vec<&[u8]> = keys.iter().map(|k| k.as_slice()).collect();
+        let results = self
+            .db
+            .batched_multi_get_cf(self.relationships_cf(), &key_refs, false);
+
+        let mut batch = WriteBatch::default();
+        let mut strengthened = 0;
+
+        for (i, result) in results.into_iter().enumerate() {
+            if let Ok(Some(value)) = result {
+                if let Ok((mut edge, _)) = decode_relationship_edge(&value) {
+                    let _ = edge.strengthen_with_importance(importance);
+                    match crate::serialization::encode(&edge) {
+                        Ok(encoded) => {
+                            batch.put_cf(self.relationships_cf(), keys[i], encoded);
+                            strengthened += 1;
+                        }
+                        Err(e) => {
+                            tracing::debug!("Failed to serialize edge {}: {}", edge_uuids[i], e);
+                        }
+                    }
+                }
+            }
+        }
+
+        if strengthened > 0 {
+            self.db.write(batch)?;
+        }
+
+        Ok(strengthened)
+    }
+
+    /// Weaken edges in batch (anti-Hebbian: misleading retrieval feedback).
+    ///
+    /// Applies multiplicative decay (`1 - decay_factor`) to each edge's strength.
+    /// Edges below their tier's prune threshold are queued for lazy removal.
+    /// Uses a single RocksDB `WriteBatch` and one lock acquisition.
+    ///
+    /// Returns the number of edges successfully weakened.
+    pub fn batch_weaken_synapses(&self, edge_uuids: &[Uuid], decay_factor: f32) -> Result<usize> {
+        if edge_uuids.is_empty() {
+            return Ok(0);
+        }
+
+        let _guard = self
+            .synapse_update_lock
+            .try_lock_for(std::time::Duration::from_secs(5))
+            .ok_or_else(|| {
+                anyhow::anyhow!("synapse_update_lock timeout in batch_weaken_synapses")
+            })?;
+
+        let keys: Vec<[u8; 16]> = edge_uuids.iter().map(|u| *u.as_bytes()).collect();
+        let key_refs: Vec<&[u8]> = keys.iter().map(|k| k.as_slice()).collect();
+        let results = self
+            .db
+            .batched_multi_get_cf(self.relationships_cf(), &key_refs, false);
+
+        let mut batch = WriteBatch::default();
+        let mut weakened = 0;
+        let clamped_decay = decay_factor.clamp(0.0, 1.0);
+
+        for (i, result) in results.into_iter().enumerate() {
+            if let Ok(Some(value)) = result {
+                if let Ok((mut edge, _)) = decode_relationship_edge(&value) {
+                    // Fully potentiated edges are protected from batch weakening
+                    if matches!(edge.ltp_status, LtpStatus::Full) {
+                        continue;
+                    }
+                    edge.strength *= 1.0 - clamped_decay;
+                    edge.strength = edge.strength.max(crate::constants::LTP_MIN_STRENGTH);
+                    // Queue for pruning if below tier threshold. When enabled,
+                    // multi-source corroboration shields the edge from this
+                    // strength-only decay path (LTP::Full was already skipped above).
+                    if edge.strength < edge.tier.prune_threshold()
+                        && !edge.corroboration_protected()
+                    {
+                        self.pending_prune.lock().push(edge.uuid);
+                    }
+                    match crate::serialization::encode(&edge) {
+                        Ok(encoded) => {
+                            batch.put_cf(self.relationships_cf(), keys[i], encoded);
+                            weakened += 1;
+                        }
+                        Err(e) => {
+                            tracing::debug!("Failed to serialize edge {}: {}", edge_uuids[i], e);
+                        }
+                    }
+                }
+            }
+        }
+
+        if weakened > 0 {
+            self.db.write(batch)?;
+        }
+
+        Ok(weakened)
+    }
+
+    /// Collect edge UUIDs for a set of memory UUIDs via their episodic entity refs.
+    ///
+    /// For each memory, looks up its EpisodicNode to find entity_refs, then collects
+    /// all edges incident to those entities (capped at `max_edges`).
+    /// Used by feedback-driven Hebbian reinforcement.
+    pub fn collect_entity_edges_for_memories(
+        &self,
+        memory_uuids: &[Uuid],
+        max_edges: usize,
+    ) -> Result<Vec<Uuid>> {
+        use std::collections::HashSet;
+
+        let mut entity_set: HashSet<Uuid> = HashSet::new();
+
+        // Phase 1: gather all entities referenced by these memories' episodes
+        for mem_uuid in memory_uuids.iter().take(20) {
+            if let Some(episode) = self.get_episode(mem_uuid)? {
+                for entity_ref in &episode.entity_refs {
+                    entity_set.insert(*entity_ref);
+                }
+            }
+        }
+
+        if entity_set.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Phase 2: collect edge UUIDs from entity_edges index (deduplicated)
+        let mut edge_set: HashSet<Uuid> = HashSet::new();
+        for entity_uuid in &entity_set {
+            let prefix = format!("{entity_uuid}:");
+            let iter = self
+                .db
+                .prefix_iterator_cf(self.entity_edges_cf(), prefix.as_bytes());
+
+            for (key, _) in iter.flatten() {
+                if edge_set.len() >= max_edges {
+                    break;
+                }
+                if let Ok(key_str) = std::str::from_utf8(&key) {
+                    if !key_str.starts_with(&prefix) {
+                        break;
+                    }
+                    if let Some(edge_uuid_str) = key_str.split(':').nth(1) {
+                        if let Ok(edge_uuid) = Uuid::parse_str(edge_uuid_str) {
+                            edge_set.insert(edge_uuid);
+                        }
+                    }
+                }
+            }
+
+            if edge_set.len() >= max_edges {
+                break;
+            }
+        }
+
+        Ok(edge_set.into_iter().collect())
+    }
+
     /// Record co-retrieval of memories (Hebbian learning between memories)
     ///
     /// When memories are retrieved together, they form associations.
@@ -3482,6 +5618,28 @@ impl GraphMemory {
     /// Note: Limits to top N memories to avoid O(n²) explosion on large retrievals.
     /// Returns the number of edges created/strengthened.
     pub fn record_memory_coactivation(&self, memory_ids: &[Uuid]) -> Result<usize> {
+        // STRENGTHEN-ONLY gate. Read here (not in the hot loop) so the impl is
+        // env-free and unit-testable by parameter. Default ON: co-retrieval
+        // reinforces existing edges and never mints all-pairs `CoRetrieved` (which
+        // was ~80% of the graph and the OOM driver). Disable with
+        // SHODH_COACT_STRENGTHEN_ONLY=0 to restore the legacy flood.
+        let strengthen_only = std::env::var("SHODH_COACT_STRENGTHEN_ONLY")
+            .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
+            .unwrap_or(true);
+        self.record_memory_coactivation_impl(memory_ids, strengthen_only)
+    }
+
+    /// Co-retrieval Hebbian update. `strengthen_only = true`: reinforce edges that
+    /// ALREADY exist between co-active memories; do NOT mint a new CoRetrieved edge
+    /// for every co-retrieved pair. Un-gated all-pairs creation is the recall-time
+    /// flood (measured ~80% of graph edges, bypassing the ingest gates, unbounded
+    /// with query volume — the OOM driver). Mirrors schema-gated consolidation:
+    /// usage strengthens existing structure, it does not wire every co-activation.
+    fn record_memory_coactivation_impl(
+        &self,
+        memory_ids: &[Uuid],
+        strengthen_only: bool,
+    ) -> Result<usize> {
         const MAX_COACTIVATION_SIZE: usize = 20;
 
         // Limit to top N to bound worst-case complexity
@@ -3518,13 +5676,11 @@ impl GraphMemory {
                     // Strengthen existing edge
                     let _ = edge.strengthen();
                     let key = edge.uuid.as_bytes();
-                    if let Ok(value) =
-                        bincode::serde::encode_to_vec(&edge, bincode::config::standard())
-                    {
+                    if let Ok(value) = crate::serialization::encode(&edge) {
                         batch.put_cf(self.relationships_cf(), key, value);
                         edges_updated += 1;
                     }
-                } else {
+                } else if !strengthen_only {
                     // Create new CoRetrieved edge (bidirectional represented as single edge)
                     // Starts in L1 (working memory) with tier-specific initial weight
                     let edge = RelationshipEdge {
@@ -3545,15 +5701,16 @@ impl GraphMemory {
                         tier: EdgeTier::L1Working,
                         // PIPE-5: Memory-to-memory edges use default confidence
                         entity_confidence: None,
+                        forman_curvature: None,
+                        endpoint_selectivity: None,
+                        provenance: Vec::new(),
                     };
 
                     let key = edge.uuid.as_bytes();
-                    if let Ok(value) =
-                        bincode::serde::encode_to_vec(&edge, bincode::config::standard())
-                    {
+                    if let Ok(value) = crate::serialization::encode(&edge) {
                         batch.put_cf(self.relationships_cf(), key, value);
 
-                        // Also index in the reverse direction for lookup
+                        // Index in mem_edge: for fast pair lookup
                         let idx_key_fwd = format!("mem_edge:{mem_a}:{mem_b}");
                         let idx_key_rev = format!("mem_edge:{mem_b}:{mem_a}");
                         batch.put_cf(
@@ -3566,6 +5723,12 @@ impl GraphMemory {
                             idx_key_rev.as_bytes(),
                             edge.uuid.as_bytes(),
                         );
+
+                        // Index in entity_edges_cf for graph traversal visibility
+                        let ee_key_a = format!("{mem_a}:{}", edge.uuid);
+                        let ee_key_b = format!("{mem_b}:{}", edge.uuid);
+                        batch.put_cf(self.entity_edges_cf(), ee_key_a.as_bytes(), b"1");
+                        batch.put_cf(self.entity_edges_cf(), ee_key_b.as_bytes(), b"1");
 
                         edges_updated += 1;
                         new_edges += 1;
@@ -3670,8 +5833,7 @@ impl GraphMemory {
                 // Strengthen existing edge — capture tier promotion if it occurs
                 let promotion = edge.strengthen();
                 let key = edge.uuid.as_bytes();
-                if let Ok(value) = bincode::serde::encode_to_vec(&edge, bincode::config::standard())
-                {
+                if let Ok(value) = crate::serialization::encode(&edge) {
                     batch.put_cf(self.relationships_cf(), key, value);
                     strengthened += 1;
 
@@ -3704,51 +5866,11 @@ impl GraphMemory {
                         });
                     }
                 }
-            } else {
-                // Create new ReplayStrengthened edge
-                // Replay edges start in L2 (episodic) since they represent consolidated associations
-                let edge = RelationshipEdge {
-                    uuid: Uuid::new_v4(),
-                    from_entity: from_uuid,
-                    to_entity: to_uuid,
-                    relation_type: RelationType::CoRetrieved,
-                    strength: EdgeTier::L2Episodic.initial_weight(),
-                    created_at: Utc::now(),
-                    valid_at: Utc::now(),
-                    invalidated_at: None,
-                    source_episode_id: None,
-                    context: "replay_strengthened".to_string(),
-                    last_activated: Utc::now(),
-                    activation_count: 1,
-                    ltp_status: LtpStatus::None,
-                    activation_timestamps: None,
-                    tier: EdgeTier::L2Episodic,
-                    // PIPE-5: Replay edges use default confidence
-                    entity_confidence: None,
-                };
-
-                let key = edge.uuid.as_bytes();
-                if let Ok(value) = bincode::serde::encode_to_vec(&edge, bincode::config::standard())
-                {
-                    batch.put_cf(self.relationships_cf(), key, value);
-
-                    // Index both directions
-                    let idx_key_fwd = format!("mem_edge:{from_uuid}:{to_uuid}");
-                    let idx_key_rev = format!("mem_edge:{to_uuid}:{from_uuid}");
-                    batch.put_cf(
-                        self.relationships_cf(),
-                        idx_key_fwd.as_bytes(),
-                        edge.uuid.as_bytes(),
-                    );
-                    batch.put_cf(
-                        self.relationships_cf(),
-                        idx_key_rev.as_bytes(),
-                        edge.uuid.as_bytes(),
-                    );
-
-                    strengthened += 1;
-                }
             }
+            // No `else`: the replay path reinforces EXISTING edges only. It used to
+            // mint a new `CoRetrieved` edge for every boosted memory pair without an
+            // edge — the second all-pairs flood site — REMOVED entirely. Co-retrieval
+            // strengthens structure; it does not create it.
         }
 
         if strengthened > 0 {
@@ -3795,6 +5917,162 @@ impl GraphMemory {
         }
 
         Ok((strengthened, promotion_boosts))
+    }
+
+    /// Strengthen graph edges between two causally-linked memories.
+    ///
+    /// Resolves memory UUIDs to their entity_refs via EpisodicNodes, then strengthens
+    /// the cross-product of entity pairs. This couples the lineage system (explicit
+    /// causal chains) with the knowledge graph (spreading activation), so causally-linked
+    /// memories naturally co-activate during retrieval.
+    ///
+    /// Returns the number of entity-pair edges strengthened.
+    pub fn strengthen_lineage_connection(
+        &self,
+        from_memory_uuid: &Uuid,
+        to_memory_uuid: &Uuid,
+        boost: f32,
+    ) -> Result<usize> {
+        // Resolve entity_refs for both memories
+        let from_episode = self.get_episode(from_memory_uuid)?;
+        let to_episode = self.get_episode(to_memory_uuid)?;
+
+        let (from_entities, to_entities) = match (from_episode, to_episode) {
+            (Some(fe), Some(te)) if !fe.entity_refs.is_empty() && !te.entity_refs.is_empty() => {
+                (fe.entity_refs, te.entity_refs)
+            }
+            _ => return Ok(0),
+        };
+
+        // Cap entity lists to prevent O(N^2) explosion on heavily-tagged memories.
+        // 8 × 8 = 64 pairs max, which is reasonable for a single lineage edge.
+        const MAX_ENTITIES_PER_SIDE: usize = 8;
+        let from_capped = &from_entities[..from_entities.len().min(MAX_ENTITIES_PER_SIDE)];
+        let to_capped = &to_entities[..to_entities.len().min(MAX_ENTITIES_PER_SIDE)];
+
+        // Build cross-product of entity pairs with lineage boost
+        let mut edge_boosts: Vec<(String, String, f32)> =
+            Vec::with_capacity(from_capped.len() * to_capped.len());
+        for from_entity in from_capped {
+            for to_entity in to_capped {
+                if from_entity != to_entity {
+                    edge_boosts.push((from_entity.to_string(), to_entity.to_string(), boost));
+                }
+            }
+        }
+
+        if edge_boosts.is_empty() {
+            return Ok(0);
+        }
+
+        let (strengthened, _promotions) = self.strengthen_memory_edges(&edge_boosts)?;
+
+        tracing::debug!(
+            from_memory = %&from_memory_uuid.to_string()[..8],
+            to_memory = %&to_memory_uuid.to_string()[..8],
+            entity_pairs = edge_boosts.len(),
+            strengthened,
+            boost,
+            "Lineage→graph edge strengthening"
+        );
+
+        Ok(strengthened)
+    }
+
+    /// Create typed graph edges between entity pairs of two causally-linked episodes.
+    ///
+    /// This bridges the lineage namespace into the knowledge graph: lineage edges
+    /// (stored in plain RocksDB keys) become typed RelationshipEdge entries visible
+    /// to spreading activation. The `CausalRelation::to_graph_relation_type()`
+    /// mapping provides the edge type (Causes, Triggers, SupersededBy, etc.).
+    ///
+    /// `add_relationship()` deduplicates by (from, to, type) — repeat calls
+    /// strengthen existing edges rather than creating duplicates.
+    pub fn create_lineage_graph_edges(
+        &self,
+        from_memory_uuid: &Uuid,
+        to_memory_uuid: &Uuid,
+        relation_type: RelationType,
+        confidence: f32,
+    ) -> Result<usize> {
+        if confidence < crate::constants::LINEAGE_GRAPH_BRIDGE_MIN_CONFIDENCE {
+            return Ok(0);
+        }
+
+        let from_episode = self.get_episode(from_memory_uuid)?;
+        let to_episode = self.get_episode(to_memory_uuid)?;
+
+        let (from_entities, to_entities) = match (from_episode, to_episode) {
+            (Some(fe), Some(te)) if !fe.entity_refs.is_empty() && !te.entity_refs.is_empty() => {
+                (fe.entity_refs, te.entity_refs)
+            }
+            _ => return Ok(0),
+        };
+
+        const MAX_PER_SIDE: usize = 8;
+        let from_capped = &from_entities[..from_entities.len().min(MAX_PER_SIDE)];
+        let to_capped = &to_entities[..to_entities.len().min(MAX_PER_SIDE)];
+
+        let now = chrono::Utc::now();
+        let base_strength = EdgeTier::L2Episodic.initial_weight()
+            * confidence
+            * crate::constants::LINEAGE_GRAPH_BRIDGE_BOOST;
+        let mut created = 0usize;
+
+        for &from_entity in from_capped {
+            for &to_entity in to_capped {
+                if from_entity == to_entity {
+                    continue;
+                }
+                let edge = RelationshipEdge {
+                    uuid: Uuid::new_v4(),
+                    from_entity,
+                    to_entity,
+                    relation_type: relation_type.clone(),
+                    strength: base_strength,
+                    created_at: now,
+                    valid_at: now,
+                    invalidated_at: None,
+                    source_episode_id: Some(*from_memory_uuid),
+                    context: String::new(),
+                    last_activated: now,
+                    activation_count: 1,
+                    ltp_status: LtpStatus::None,
+                    tier: EdgeTier::L2Episodic,
+                    activation_timestamps: None,
+                    entity_confidence: Some(confidence),
+                    forman_curvature: None,
+                    endpoint_selectivity: None,
+                    // Lineage bridge edge: the source episode is known and the
+                    // bridge confidence is meaningful, so seed the attestation
+                    // trail here (typed_by left None — no dedicated lineage method).
+                    provenance: vec![ProvenanceRecord {
+                        source_episode_id: *from_memory_uuid,
+                        mention_count: 1,
+                        first_observed: now,
+                        last_observed: now,
+                        confidence: Some(confidence),
+                        evidence_span: None,
+                        typed_by: None,
+                    }],
+                };
+                if self.add_relationship(edge).is_ok() {
+                    created += 1;
+                }
+            }
+        }
+
+        if created > 0 {
+            tracing::debug!(
+                from_memory = %&from_memory_uuid.to_string()[..8],
+                to_memory = %&to_memory_uuid.to_string()[..8],
+                relation = ?relation_type,
+                created,
+                "Lineage→graph typed edge creation"
+            );
+        }
+
+        Ok(created)
     }
 
     /// Find memories associated with a given memory through co-retrieval
@@ -3890,21 +6168,28 @@ impl GraphMemory {
                 let entity_a = &refs[i];
                 let entity_b = &refs[j];
 
-                // Find existing edge between this entity pair
-                if let Ok(Some(mut edge)) = self.find_edge_between_entities(entity_a, entity_b) {
-                    if edge.invalidated_at.is_some() {
-                        continue;
-                    }
-                    let _ = edge.strengthen();
-                    let key = edge.uuid.as_bytes();
-                    if let Ok(value) =
-                        bincode::serde::encode_to_vec(&edge, bincode::config::standard())
+                // Find existing entity-entity edge via entity_edges_cf index
+                // (find_edge_between_entities uses mem_edge: prefix which is memory-to-memory only)
+                let edges = match self.get_entity_relationships(entity_a) {
+                    Ok(e) => e,
+                    Err(_) => continue,
+                };
+                for mut edge in edges {
+                    if (edge.from_entity == *entity_a && edge.to_entity == *entity_b)
+                        || (edge.from_entity == *entity_b && edge.to_entity == *entity_a)
                     {
-                        batch.put_cf(self.relationships_cf(), key, value);
-                        strengthened += 1;
+                        if edge.invalidated_at.is_some() {
+                            continue;
+                        }
+                        let _ = edge.strengthen();
+                        let key = edge.uuid.as_bytes();
+                        if let Ok(value) = crate::serialization::encode(&edge) {
+                            batch.put_cf(self.relationships_cf(), key, value);
+                            strengthened += 1;
+                        }
+                        break; // Only strengthen one edge per pair
                     }
                 }
-                // Don't create new edges — only strengthen existing ones from NER
             }
         }
 
@@ -4006,7 +6291,7 @@ impl GraphMemory {
             let should_prune = edge.decay();
 
             let key = edge.uuid.as_bytes();
-            let value = bincode::serde::encode_to_vec(&edge, bincode::config::standard())?;
+            let value = crate::serialization::encode(&edge)?;
             self.db.put_cf(self.relationships_cf(), key, value)?;
 
             return Ok(should_prune);
@@ -4015,56 +6300,22 @@ impl GraphMemory {
         Ok(false)
     }
 
-    /// Batch decay multiple synapses atomically
-    ///
-    /// Returns a vector of edge UUIDs that should be pruned.
-    pub fn batch_decay_synapses(&self, edge_uuids: &[Uuid]) -> Result<Vec<Uuid>> {
-        if edge_uuids.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        // Single lock acquisition for entire batch, with timeout
-        let _guard = self
-            .synapse_update_lock
-            .try_lock_for(std::time::Duration::from_secs(5))
-            .ok_or_else(|| {
-                anyhow::anyhow!("synapse_update_lock timeout in batch_decay_synapses")
-            })?;
-
-        let mut batch = WriteBatch::default();
-        let mut to_prune = Vec::new();
-
-        for edge_uuid in edge_uuids {
-            if let Some(mut edge) = self.get_relationship(edge_uuid)? {
-                let should_prune = edge.decay();
-
-                let key = edge.uuid.as_bytes();
-                match bincode::serde::encode_to_vec(&edge, bincode::config::standard()) {
-                    Ok(value) => {
-                        batch.put_cf(self.relationships_cf(), key, value);
-                        if should_prune {
-                            to_prune.push(*edge_uuid);
-                        }
-                    }
-                    Err(e) => {
-                        tracing::debug!("Failed to serialize edge {}: {}", edge_uuid, e);
-                    }
-                }
-            }
-        }
-
-        // Atomic write of all updates
-        self.db.write(batch)?;
-
-        Ok(to_prune)
-    }
-
-    /// Apply decay to already-loaded edges in-place, avoiding double deserialization.
+    /// Apply decay to already-loaded edges in-place as of an explicit `now`,
+    /// avoiding double deserialization.
     ///
     /// Mutates edges directly, serializes results into a WriteBatch, and returns
-    /// the UUIDs of edges that should be pruned. Used by `apply_decay()` which
-    /// already has the full edge list from `get_all_relationships()`.
-    fn batch_decay_edges_in_place(&self, edges: &mut [RelationshipEdge]) -> Result<Vec<Uuid>> {
+    /// the UUIDs of edges that should be pruned. Used by
+    /// [`apply_decay_at`](Self::apply_decay_at) (which already has the full edge
+    /// list from `get_all_relationships()`); production reaches it via
+    /// [`apply_decay`](Self::apply_decay) with `now = Utc::now()`. The injectable
+    /// clock lets the decay-evaluation harness age a real graph at the
+    /// production cadence without waiting wall-clock time.
+    fn batch_decay_edges_in_place_at(
+        &self,
+        edges: &mut [RelationshipEdge],
+        now: DateTime<Utc>,
+        protection: Option<&crate::decay::TopologyProtection>,
+    ) -> Result<Vec<Uuid>> {
         if edges.is_empty() {
             return Ok(Vec::new());
         }
@@ -4073,25 +6324,34 @@ impl GraphMemory {
             .synapse_update_lock
             .try_lock_for(std::time::Duration::from_secs(5))
             .ok_or_else(|| {
-                anyhow::anyhow!("synapse_update_lock timeout in batch_decay_edges_in_place")
+                anyhow::anyhow!("synapse_update_lock timeout in batch_decay_edges_in_place_at")
             })?;
         let mut batch = WriteBatch::default();
-        let mut to_prune = Vec::new();
+        // Indices (into `edges`) the BASE (time+usage) gate flagged for pruning.
+        // Decisions are deferred so the topology rescue budget can be computed
+        // against the full candidate count for this cycle.
+        let mut flagged: Vec<usize> = Vec::new();
 
-        for edge in edges.iter_mut() {
+        for (i, edge) in edges.iter_mut().enumerate() {
             let strength_before = edge.strength;
-            let should_prune = edge.decay();
+            let should_prune = edge.decay_at(now);
 
             // Only write back edges whose strength actually changed (or need pruning).
             // With 300s maintenance intervals, most edges won't have meaningful decay,
             // so this reduces the WriteBatch from ~12MB (all 34k edges) to ~150KB.
+            // Rescued edges keep this decayed strength written; the rescue defends
+            // EXISTENCE, not strength — a bridge re-evaluated next cycle.
             if should_prune || (edge.strength - strength_before).abs() > f32::EPSILON {
                 let key = edge.uuid.as_bytes();
-                match bincode::serde::encode_to_vec(&*edge, bincode::config::standard()) {
+                match crate::serialization::encode(&*edge) {
                     Ok(value) => {
                         batch.put_cf(self.relationships_cf(), key, value);
+                        // Flag for prune only on a successful write-back, exactly
+                        // as the pre-W1-B code did — an edge that fails to
+                        // serialize is neither written nor pruned (byte-identical
+                        // to today when protection is None).
                         if should_prune {
-                            to_prune.push(edge.uuid);
+                            flagged.push(i);
                         }
                     }
                     Err(e) => {
@@ -4101,8 +6361,162 @@ impl GraphMemory {
             }
         }
 
+        // Base prune set = every flagged edge. Topology-aware decay (W1-B) rescues
+        // a BUDGETED top slice of the flagged edges whose loss would fragment the
+        // graph. With `protection == None` (flag off) this is byte-identical to
+        // the pre-W1-B behaviour: every flagged edge is pruned.
+        let to_prune = self.select_prune_set(edges, &flagged, protection);
+
         self.db.write(batch)?;
         Ok(to_prune)
+    }
+
+    /// Apply the topology-aware rescue budget to the base prune set.
+    ///
+    /// `flagged` are the indices the base (time+usage) gate wants to prune this
+    /// cycle. When protection is present, edges touching genuine structure
+    /// (`edge_protection > TOPOLOGY_RESCUE_MIN_PROTECTION`) are rescue-eligible;
+    /// they are ranked by the keep score `strength + α · protection` and the top
+    /// `ceil(BUDGET_FRAC · |flagged|)` (≥1 when any qualify) are spared. Everything
+    /// else is pruned. Ranking (not an absolute threshold) is the measured choice:
+    /// step-1 showed bridge scores are corpus-relative and compressed, so the
+    /// budget bounds forgetting-loss while rank picks the genuinely critical edges.
+    fn select_prune_set(
+        &self,
+        edges: &[RelationshipEdge],
+        flagged: &[usize],
+        protection: Option<&crate::decay::TopologyProtection>,
+    ) -> Vec<Uuid> {
+        let Some(prot) = protection else {
+            return flagged.iter().map(|&i| edges[i].uuid).collect();
+        };
+        if flagged.is_empty() {
+            return Vec::new();
+        }
+
+        // Rescue-eligible flagged edges, keyed by keep score (descending rank).
+        let mut eligible: Vec<(usize, f32)> = Vec::new();
+        for &i in flagged {
+            let e = &edges[i];
+            let p = prot.edge_protection(&e.from_entity, &e.to_entity);
+            if p > crate::constants::TOPOLOGY_RESCUE_MIN_PROTECTION {
+                let keep = crate::decay::topology_keep_score(
+                    e.strength,
+                    p,
+                    crate::constants::TOPOLOGY_RESCUE_ALPHA,
+                );
+                eligible.push((i, keep));
+            }
+        }
+
+        let budget = ((crate::constants::TOPOLOGY_RESCUE_BUDGET_FRAC * flagged.len() as f32).ceil()
+            as usize)
+            .max(1)
+            .min(eligible.len());
+
+        eligible.sort_by(|a, b| b.1.total_cmp(&a.1));
+        let rescued: std::collections::HashSet<usize> =
+            eligible.iter().take(budget).map(|(i, _)| *i).collect();
+
+        if !rescued.is_empty() {
+            tracing::debug!(
+                rescued = rescued.len(),
+                flagged = flagged.len(),
+                budget,
+                "Topology-aware decay: rescued bridge edges from prune"
+            );
+        }
+
+        flagged
+            .iter()
+            .filter(|&&i| !rescued.contains(&i))
+            .map(|&i| edges[i].uuid)
+            .collect()
+    }
+
+    /// Compute this cycle's raw topology protection over the active edge set and
+    /// smooth it against the stored (previous-cycle) map via hysteresis, updating
+    /// the stored map in place. Returns the protection (smoothed node scores +
+    /// this cycle's bridge-pair set) used by the prune gate.
+    fn compute_and_smooth_topology(
+        &self,
+        edges: &[RelationshipEdge],
+    ) -> crate::decay::TopologyProtection {
+        let pairs: Vec<(Uuid, Uuid)> = edges.iter().map(|e| (e.from_entity, e.to_entity)).collect();
+        let raw = crate::decay::compute_topology_protection(&pairs);
+
+        let mut guard = self.topology_protection.write();
+        let smoothed = crate::decay::smooth_protection(
+            &guard,
+            &raw.node_protection,
+            crate::constants::TOPOLOGY_HYSTERESIS_DECAY,
+        );
+        *guard = smoothed.clone();
+
+        crate::decay::TopologyProtection {
+            node_protection: smoothed,
+            bridge_pairs: raw.bridge_pairs,
+        }
+    }
+
+    /// Apply synaptic homeostasis: global downscaling of all edge strengths.
+    ///
+    /// After each maintenance cycle, scales ALL edge weights by `factor` (typically 0.95).
+    /// Edges with LtpStatus::Full are protected — fully consolidated synapses resist
+    /// homeostatic downscaling, matching biological systems consolidation.
+    ///
+    /// This prevents runaway strengthening and keeps total network energy bounded.
+    /// Strong edges survive; weak edges fall below prune thresholds and are cleared
+    /// in the next decay cycle.
+    ///
+    /// Reference: Tononi & Cirelli (2003) "Sleep and synaptic homeostasis: a hypothesis"
+    pub fn apply_synaptic_homeostasis(&self, factor: f32) -> Result<usize> {
+        let mut all_edges = self.get_all_relationships()?;
+        if all_edges.is_empty() {
+            return Ok(0);
+        }
+
+        let _guard = self
+            .synapse_update_lock
+            .try_lock_for(std::time::Duration::from_secs(5))
+            .ok_or_else(|| {
+                anyhow::anyhow!("synapse_update_lock timeout in apply_synaptic_homeostasis")
+            })?;
+
+        let mut batch = WriteBatch::default();
+        let mut scaled_count = 0;
+
+        for edge in all_edges.iter_mut() {
+            // Fully potentiated edges are protected from homeostatic downscaling
+            if matches!(edge.ltp_status, LtpStatus::Full) {
+                continue;
+            }
+
+            let old_strength = edge.strength;
+            edge.strength *= factor;
+            // Never scale below absolute floor
+            edge.strength = edge.strength.max(crate::constants::LTP_MIN_STRENGTH);
+
+            if (edge.strength - old_strength).abs() > f32::EPSILON {
+                let key = edge.uuid.as_bytes();
+                if let Ok(value) = crate::serialization::encode(&*edge) {
+                    batch.put_cf(self.relationships_cf(), key, value);
+                    scaled_count += 1;
+                }
+            }
+        }
+
+        if scaled_count > 0 {
+            self.db.write(batch)?;
+            tracing::debug!(
+                "Synaptic homeostasis: scaled {} of {} edges by factor {}",
+                scaled_count,
+                all_edges.len(),
+                factor
+            );
+        }
+
+        Ok(scaled_count)
     }
 
     /// Apply decay to all synapses and prune weak edges (AUD-2)
@@ -4111,10 +6525,24 @@ impl GraphMemory {
     /// 1. Apply time-based decay to all edge strengths
     /// 2. Remove edges that have decayed below threshold
     /// 3. Detect orphaned entities (entities that lost all their edges)
+    /// 4. Apply synaptic homeostasis (global edge downscaling)
     ///
     /// Returns a `GraphDecayResult` with pruned count and orphaned entity/memory IDs
     /// for Direction 2 coupling (edge pruning → orphan detection).
     pub fn apply_decay(&self) -> Result<crate::memory::types::GraphDecayResult> {
+        self.apply_decay_at(Utc::now())
+    }
+
+    /// As [`apply_decay`](Self::apply_decay), but ages edges as of an explicit
+    /// `now`. Production calls `apply_decay()` (wall clock). The decay-evaluation
+    /// harness calls this repeatedly at the ~6h production cadence to age a real
+    /// graph through simulated time — the only faithful way to reproduce the
+    /// periodic-decay dynamics, since a single large jump would land directly in
+    /// the power-law phase and hide the per-cycle behaviour.
+    pub fn apply_decay_at(
+        &self,
+        now: DateTime<Utc>,
+    ) -> Result<crate::memory::types::GraphDecayResult> {
         // Get all edges (need full data for orphan tracking)
         let mut all_edges = self.get_all_relationships()?;
 
@@ -4122,8 +6550,23 @@ impl GraphMemory {
             return Ok(crate::memory::types::GraphDecayResult::default());
         }
 
+        // W1-B topology-aware decay (default OFF). When on, compute per-node
+        // structural protection ONCE per heavy cycle over the active edge set —
+        // this is the "sleep" pass, colocated with the existing full decay, never
+        // per-write or at recall time. `None` ⇒ the prune gate is byte-identical
+        // to today's time+usage-only decision.
+        let topo_on = std::env::var("SHODH_TOPOLOGY_AWARE_DECAY")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        let protection = if topo_on {
+            Some(self.compute_and_smooth_topology(&all_edges))
+        } else {
+            None
+        };
+
         // Apply decay in-place on already-deserialized edges (avoids double deserialization)
-        let to_prune = self.batch_decay_edges_in_place(&mut all_edges)?;
+        let to_prune =
+            self.batch_decay_edges_in_place_at(&mut all_edges, now, protection.as_ref())?;
 
         if to_prune.is_empty() {
             return Ok(crate::memory::types::GraphDecayResult::default());
@@ -4170,11 +6613,219 @@ impl GraphMemory {
             );
         }
 
+        // 4. Apply synaptic homeostasis (global edge downscaling)
+        // Runs after pruning so that homeostatic pressure doesn't interfere with
+        // the prune decision (edges are pruned at their true decayed strength first).
+        if let Err(e) =
+            self.apply_synaptic_homeostasis(crate::constants::HOMEOSTASIS_SCALING_FACTOR)
+        {
+            tracing::warn!("Synaptic homeostasis failed (non-fatal): {}", e);
+        }
+
         Ok(crate::memory::types::GraphDecayResult {
             pruned_count,
             orphaned_entity_ids,
             orphaned_memory_ids: Vec::new(), // Populated by memory layer via entity→memory lookup
         })
+    }
+
+    /// Compute Forman-Ricci curvature for all active edges in the graph.
+    ///
+    /// For a directed edge e = (u → v) in the knowledge graph:
+    ///   F(→e→) = 2 - in_deg(u) - out_deg(v)    [flow-through curvature]
+    ///   F(←e←) = 2 - out_deg(u) - in_deg(v)    [flow-loss curvature]
+    ///   F(e)   = F(→e→) + F(←e←) = 4 - deg(u) - deg(v)
+    ///
+    /// The directed components reveal information flow structure:
+    /// - F(→e→) captures how much flow converges through this edge
+    /// - F(←e←) captures how much flow is lost/dispersed at this edge
+    ///
+    /// Stores computed curvature on each edge and writes back to RocksDB.
+    ///
+    /// Reference: Leal, Restrepo, Stadler, Jost (2018) arXiv:1811.07825
+    ///            "Forman-Ricci curvature for hypergraphs"
+    pub fn compute_forman_ricci_curvature(&self) -> Result<CurvatureStats> {
+        let all_edges = self.get_all_relationships()?;
+
+        if all_edges.is_empty() {
+            return Ok(CurvatureStats {
+                edges_computed: 0,
+                mean_curvature: 0.0,
+                min_curvature: 0.0,
+                max_curvature: 0.0,
+                positive_count: 0,
+                zero_count: 0,
+                negative_count: 0,
+            });
+        }
+
+        // Phase 1: Build degree maps (in-degree and out-degree per entity)
+        // Single pass over all edges — O(|E|)
+        let mut in_degree: HashMap<Uuid, i32> = HashMap::new();
+        let mut out_degree: HashMap<Uuid, i32> = HashMap::new();
+
+        for edge in &all_edges {
+            *out_degree.entry(edge.from_entity).or_insert(0) += 1;
+            *in_degree.entry(edge.to_entity).or_insert(0) += 1;
+        }
+
+        // Phase 2: Compute curvature for each edge, collect per-entity curvatures
+        let mut entity_curvatures: HashMap<Uuid, Vec<f32>> = HashMap::new();
+
+        let mut sum_curvature: f64 = 0.0;
+        let mut min_curvature = f32::MAX;
+        let mut max_curvature = f32::MIN;
+        let mut positive_count: usize = 0;
+        let mut zero_count: usize = 0;
+        let mut negative_count: usize = 0;
+
+        // First pass: compute curvature values and collect per-entity
+        let mut edge_curvatures: Vec<f32> = Vec::with_capacity(all_edges.len());
+        for edge in &all_edges {
+            let src_in = in_degree.get(&edge.from_entity).copied().unwrap_or(0);
+            let src_out = out_degree.get(&edge.from_entity).copied().unwrap_or(0);
+            let tgt_in = in_degree.get(&edge.to_entity).copied().unwrap_or(0);
+            let tgt_out = out_degree.get(&edge.to_entity).copied().unwrap_or(0);
+
+            // Directed Forman-Ricci (Equations 5 + 7 from the paper)
+            let flow_through = 2 - src_in - tgt_out; // F(→e→)
+            let flow_loss = 2 - src_out - tgt_in; // F(←e←)
+            let curvature = (flow_through + flow_loss) as f32; // F(e) = 4 - deg(u) - deg(v)
+
+            edge_curvatures.push(curvature);
+
+            // Collect per-entity curvature for selectivity computation
+            entity_curvatures
+                .entry(edge.from_entity)
+                .or_default()
+                .push(curvature);
+            entity_curvatures
+                .entry(edge.to_entity)
+                .or_default()
+                .push(curvature);
+
+            // Update stats
+            sum_curvature += curvature as f64;
+            if curvature < min_curvature {
+                min_curvature = curvature;
+            }
+            if curvature > max_curvature {
+                max_curvature = curvature;
+            }
+            #[allow(clippy::float_cmp)]
+            if curvature > 0.0 {
+                positive_count += 1;
+            } else if curvature == 0.0 {
+                zero_count += 1;
+            } else {
+                negative_count += 1;
+            }
+        }
+
+        // Phase 3: Compute selectivity per entity
+        // selectivity = stdev(incident curvatures) / degree
+        // High selectivity → concept (mixed community + bridge edges)
+        // Low selectivity → stop word (uniform curvature across all edges)
+        let mut entity_selectivity: HashMap<Uuid, f32> = HashMap::new();
+        for (entity_id, curvs) in &entity_curvatures {
+            let n = curvs.len() as f32;
+            if n < 2.0 {
+                // Single edge: can't compute variance, assign neutral selectivity
+                entity_selectivity.insert(*entity_id, 1.0);
+                continue;
+            }
+            let mean = curvs.iter().sum::<f32>() / n;
+            let variance = curvs.iter().map(|c| (c - mean).powi(2)).sum::<f32>() / (n - 1.0);
+            let stdev = variance.sqrt();
+            let selectivity = stdev / n; // Normalize by degree
+            entity_selectivity.insert(*entity_id, selectivity);
+        }
+
+        // Phase 4: Write entity selectivity back to RocksDB
+        let mut entity_batch = WriteBatch::default();
+        for (entity_id, selectivity) in &entity_selectivity {
+            let key = entity_id.as_bytes();
+            if let Ok(Some(value)) = self.db.get_cf(self.entities_cf(), key) {
+                if let Ok((mut entity, _)) = decode_entity_node(&value) {
+                    entity.selectivity = Some(*selectivity);
+                    if let Ok(encoded) = crate::serialization::encode(&entity) {
+                        entity_batch.put_cf(self.entities_cf(), key, encoded);
+                    }
+                }
+            }
+        }
+        self.db
+            .write(entity_batch)
+            .map_err(|e| anyhow::anyhow!("Failed to write entity selectivity batch: {}", e))?;
+
+        // Phase 5: Write edges with curvature + endpoint_selectivity
+        let mut edge_batch = WriteBatch::default();
+        for (mut edge, curvature) in all_edges.into_iter().zip(edge_curvatures.iter()) {
+            edge.forman_curvature = Some(*curvature);
+
+            // endpoint_selectivity = min of both endpoints
+            // The weakest link determines if this edge connects stop words
+            let src_sel = entity_selectivity
+                .get(&edge.from_entity)
+                .copied()
+                .unwrap_or(1.0);
+            let tgt_sel = entity_selectivity
+                .get(&edge.to_entity)
+                .copied()
+                .unwrap_or(1.0);
+            edge.endpoint_selectivity = Some(src_sel.min(tgt_sel));
+
+            let key = edge.uuid.as_bytes();
+            match crate::serialization::encode(&edge) {
+                Ok(value) => {
+                    edge_batch.put_cf(self.relationships_cf(), key, value);
+                }
+                Err(e) => {
+                    tracing::debug!("Failed to serialize edge {}: {}", edge.uuid, e);
+                }
+            }
+        }
+
+        let edges_computed = positive_count + zero_count + negative_count;
+
+        self.db
+            .write(edge_batch)
+            .map_err(|e| anyhow::anyhow!("Failed to write curvature batch: {}", e))?;
+
+        let stats = CurvatureStats {
+            edges_computed,
+            mean_curvature: if edges_computed > 0 {
+                (sum_curvature / edges_computed as f64) as f32
+            } else {
+                0.0
+            },
+            min_curvature: if edges_computed > 0 {
+                min_curvature
+            } else {
+                0.0
+            },
+            max_curvature: if edges_computed > 0 {
+                max_curvature
+            } else {
+                0.0
+            },
+            positive_count,
+            zero_count,
+            negative_count,
+        };
+
+        tracing::info!(
+            edges = stats.edges_computed,
+            mean = format!("{:.2}", stats.mean_curvature),
+            min = stats.min_curvature,
+            max = stats.max_curvature,
+            positive = stats.positive_count,
+            negative = stats.negative_count,
+            entities_with_selectivity = entity_selectivity.len(),
+            "Forman-Ricci curvature and selectivity computed"
+        );
+
+        Ok(stats)
     }
 
     /// Flush pending maintenance from opportunistic pruning queues.
@@ -4232,6 +6883,79 @@ impl GraphMemory {
         })
     }
 
+    /// Adjust entity salience for all entities connected to the given memories.
+    ///
+    /// Used by the reward loop to propagate recall feedback to entity reputation:
+    /// - Helpful recall → positive boost → entities become more trusted
+    /// - Misleading recall → negative penalty → entities lose reputation
+    /// - Habituation (ignored surfacings) → tiny penalty → noise entities decay
+    ///
+    /// Looks up each memory's EpisodicNode, reads `entity_refs`, deduplicates,
+    /// then batch-updates salience clamped to [0.05, 1.0].
+    ///
+    /// Returns the number of entities adjusted.
+    pub fn reinforce_entity_salience(&self, memory_uuids: &[Uuid], boost: f32) -> Result<usize> {
+        if memory_uuids.is_empty() || boost == 0.0 {
+            return Ok(0);
+        }
+
+        // Collect all unique entity UUIDs across all memories' episodes
+        let mut entity_uuids: std::collections::HashSet<Uuid> =
+            std::collections::HashSet::with_capacity(memory_uuids.len() * 4);
+
+        for mem_uuid in memory_uuids {
+            if let Some(episode) = self.get_episode(mem_uuid)? {
+                for entity_uuid in &episode.entity_refs {
+                    entity_uuids.insert(*entity_uuid);
+                }
+            }
+        }
+
+        if entity_uuids.is_empty() {
+            return Ok(0);
+        }
+
+        // Batch-read all entities
+        let keys: Vec<[u8; 16]> = entity_uuids.iter().map(|u| *u.as_bytes()).collect();
+        let key_refs: Vec<&[u8]> = keys.iter().map(|k| k.as_slice()).collect();
+        let results = self
+            .db
+            .batched_multi_get_cf(self.entities_cf(), &key_refs, false);
+
+        let mut batch = rocksdb::WriteBatch::default();
+        let mut adjusted = 0;
+
+        for (i, result) in results.into_iter().enumerate() {
+            if let Ok(Some(value)) = result {
+                if let Ok((mut entity, _)) = decode_entity_node(&value) {
+                    let old_salience = entity.salience;
+                    entity.salience = (entity.salience + boost).clamp(0.05, 1.0);
+
+                    // Skip write if salience didn't actually change (already at boundary)
+                    if (entity.salience - old_salience).abs() < f32::EPSILON {
+                        continue;
+                    }
+
+                    if let Ok(encoded) = crate::serialization::encode(&entity) {
+                        batch.put_cf(self.entities_cf(), keys[i], encoded);
+                        adjusted += 1;
+                    }
+                }
+            }
+        }
+
+        if adjusted > 0 {
+            self.db.write(batch)?;
+            tracing::debug!(
+                adjusted,
+                boost,
+                "Entity salience reinforcement batch committed"
+            );
+        }
+
+        Ok(adjusted)
+    }
+
     /// Get graph statistics - O(1) using atomic counters
     pub fn get_stats(&self) -> Result<GraphStats> {
         Ok(GraphStats {
@@ -4251,12 +6975,7 @@ impl GraphMemory {
             self.db
                 .iterator_cf_opt(self.entities_cf(), read_opts, rocksdb::IteratorMode::Start);
         for (_, value) in iter.flatten() {
-            if let Ok(entity) = bincode::serde::decode_from_slice::<EntityNode, _>(
-                &value,
-                bincode::config::standard(),
-            )
-            .map(|(v, _)| v)
-            {
+            if let Ok((entity, _)) = decode_entity_node(&value) {
                 entities.push(entity);
             }
         }
@@ -4282,12 +7001,7 @@ impl GraphMemory {
             rocksdb::IteratorMode::Start,
         );
         for (_, value) in iter.flatten() {
-            if let Ok(edge) = bincode::serde::decode_from_slice::<RelationshipEdge, _>(
-                &value,
-                bincode::config::standard(),
-            )
-            .map(|(v, _)| v)
-            {
+            if let Ok((edge, _)) = decode_relationship_edge(&value) {
                 // Only include non-invalidated relationships
                 if edge.invalidated_at.is_none() {
                     relationships.push(edge);
@@ -4299,6 +7013,30 @@ impl GraphMemory {
         relationships.sort_by(|a, b| b.strength.total_cmp(&a.strength));
 
         Ok(relationships)
+    }
+
+    /// Get all episodes in the graph
+    pub fn get_all_episodes(&self) -> Result<Vec<EpisodicNode>> {
+        let mut episodes = Vec::new();
+
+        // fill_cache(false) prevents this full scan from evicting hot data from
+        // the block cache. Decompressed blocks are used transiently and freed
+        // after the iterator advances, reducing peak C++ heap usage.
+        let mut read_opts = rocksdb::ReadOptions::default();
+        read_opts.fill_cache(false);
+        let iter =
+            self.db
+                .iterator_cf_opt(self.episodes_cf(), read_opts, rocksdb::IteratorMode::Start);
+        for (_, value) in iter.flatten() {
+            if let Ok((episode, _)) = crate::serialization::try_decode::<EpisodicNode>(&value) {
+                episodes.push(episode);
+            }
+        }
+
+        // Sort by created_at descending (newest first)
+        episodes.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+
+        Ok(episodes)
     }
 
     /// Get the Memory Universe visualization data
@@ -4441,8 +7179,33 @@ fn entity_type_color(label: Option<&EntityLabel>) -> String {
         Some(EntityLabel::Concept) => "#F7DC6F".to_string(), // Gold
         Some(EntityLabel::Date) => "#BB8FCE".to_string(),   // Light purple
         Some(EntityLabel::Keyword) => "#FF9F43".to_string(), // Orange for YAKE keywords
+        Some(EntityLabel::Project) => "#E74C3C".to_string(), // Red — project anchors
+        Some(EntityLabel::Task) => "#F39C12".to_string(),   // Amber — work items
+        Some(EntityLabel::Document) => "#1ABC9C".to_string(), // Turquoise — knowledge
+        Some(EntityLabel::Repository) => "#2ECC71".to_string(), // Emerald — code entities
+        Some(EntityLabel::Service) => "#3498DB".to_string(), // Blue — architectural
+        Some(EntityLabel::Database) => "#9B59B6".to_string(), // Purple — data stores
+        Some(EntityLabel::Metric) => "#E67E22".to_string(), // Dark orange — telemetry
+        Some(EntityLabel::Configuration) => "#95A5A6".to_string(), // Silver — config
+        Some(EntityLabel::Environment) => "#16A085".to_string(), // Dark teal — infra
+        Some(EntityLabel::Pipeline) => "#2980B9".to_string(), // Dark blue — CI/CD
+        Some(EntityLabel::Team) => "#27AE60".to_string(),   // Green — organizational
+        Some(EntityLabel::Role) => "#8E44AD".to_string(),   // Dark purple — roles
+        Some(EntityLabel::Module) => "#D35400".to_string(), // Pumpkin — code modules
+        Some(EntityLabel::Norp) => "#C0392B".to_string(),   // Brick red — groups/affiliations
+        Some(EntityLabel::Gpe) => "#5DADE2".to_string(),    // Lighter blue — political geography
+        Some(EntityLabel::Facility) => "#7F8C8D".to_string(), // Slate — built structures
+        Some(EntityLabel::Vehicle) => "#34495E".to_string(), // Dark slate — vehicles
+        Some(EntityLabel::Weapon) => "#922B21".to_string(), // Dark red — weapons
+        Some(EntityLabel::Work) => "#AF7AC5".to_string(),   // Orchid — creative works
+        Some(EntityLabel::Law) => "#6C3483".to_string(),    // Deep violet — legal instruments
+        Some(EntityLabel::Title) => "#CA6F1E".to_string(),  // Burnt orange — honorifics/positions
+        Some(EntityLabel::Cyber) => "#17202A".to_string(),  // Near-black — threats/malware
+        Some(EntityLabel::Money) => "#28B463".to_string(),  // Money green
+        Some(EntityLabel::Quantity) => "#F5B041".to_string(), // Amber — measurements
+        Some(EntityLabel::Time) => "#A569BD".to_string(), // Violet — distinct from Date's light purple
         Some(EntityLabel::Other(_)) => "#AEB6BF".to_string(), // Gray
-        None => "#AEB6BF".to_string(),                      // Gray default
+        None => "#AEB6BF".to_string(),                    // Gray default
     }
 }
 
@@ -4523,6 +7286,45 @@ pub struct GraphStats {
     pub episode_count: usize,
 }
 
+/// Summary statistics from Forman-Ricci curvature computation
+///
+/// Lightweight reputation signal for an entity, derived from graph topology.
+/// Used by NER quality gating to penalize/reject known stop-word entities.
+#[derive(Debug, Clone)]
+pub struct EntityReputation {
+    /// Curvature selectivity: high = concept, low = stop-word hub
+    pub selectivity: f32,
+    /// How many times this entity has been mentioned
+    pub mention_count: usize,
+    /// Number of edges incident to this entity
+    pub degree: usize,
+    /// Feedback-driven salience (reward loop output, 0.05–1.0)
+    pub salience: f32,
+}
+
+/// Captures the distribution of curvature across the knowledge graph.
+/// Positive curvature = tightly-connected community interior edges.
+/// Negative curvature = bridge/bottleneck edges between hubs.
+///
+/// Reference: Leal, Restrepo, Stadler, Jost (2018) arXiv:1811.07825
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CurvatureStats {
+    /// Number of edges with curvature computed
+    pub edges_computed: usize,
+    /// Mean curvature across all edges
+    pub mean_curvature: f32,
+    /// Minimum curvature (most negative = strongest bottleneck)
+    pub min_curvature: f32,
+    /// Maximum curvature (most positive = tightest community)
+    pub max_curvature: f32,
+    /// Number of edges with positive curvature (community-interior)
+    pub positive_count: usize,
+    /// Number of edges with zero curvature
+    pub zero_count: usize,
+    /// Number of edges with negative curvature (bridges/bottlenecks)
+    pub negative_count: usize,
+}
+
 /// Extracted entity with salience information
 #[derive(Debug, Clone)]
 pub struct ExtractedEntity {
@@ -4551,6 +7353,18 @@ pub struct EntityExtractor {
     /// Common words that should NOT be extracted as entities
     /// (stop words that start with capitals at sentence beginning)
     stop_words: HashSet<String>,
+
+    // Extended ontological keyword dictionaries (2026-03)
+    /// Service/infrastructure keywords (microservices, daemons, proxies)
+    service_keywords: HashSet<String>,
+    /// Database system keywords
+    database_keywords: HashSet<String>,
+    /// CI/CD and data pipeline keywords
+    pipeline_keywords: HashSet<String>,
+    /// Deployment environment keywords
+    environment_keywords: HashSet<String>,
+    /// Observability and metric keywords
+    metric_keywords: HashSet<String>,
 }
 
 impl EntityExtractor {
@@ -5331,6 +8145,143 @@ impl EntityExtractor {
         .map(String::from)
         .collect();
 
+        // Service/infrastructure keywords
+        let service_keywords: HashSet<String> = vec![
+            "microservice",
+            "daemon",
+            "worker",
+            "cron",
+            "lambda",
+            "serverless",
+            "gateway",
+            "proxy",
+            "nginx",
+            "envoy",
+            "istio",
+            "grpc",
+            "graphql",
+            "webhook",
+            "middleware",
+            "sidecar",
+            "ingress",
+            "loadbalancer",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+
+        // Database system keywords
+        let database_keywords: HashSet<String> = vec![
+            "postgresql",
+            "postgres",
+            "mysql",
+            "mariadb",
+            "sqlite",
+            "dynamodb",
+            "cassandra",
+            "elasticsearch",
+            "opensearch",
+            "clickhouse",
+            "timescaledb",
+            "cockroachdb",
+            "neo4j",
+            "arangodb",
+            "rocksdb",
+            "leveldb",
+            "badger",
+            "redb",
+            "sled",
+            "foundationdb",
+            "vitess",
+            "couchbase",
+            "couchdb",
+            "influxdb",
+            "questdb",
+            "duckdb",
+            "dragonfly",
+            "valkey",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+
+        // CI/CD and pipeline keywords
+        let pipeline_keywords: HashSet<String> = vec![
+            "jenkins",
+            "circleci",
+            "travis",
+            "argo",
+            "tekton",
+            "spinnaker",
+            "buildkite",
+            "drone",
+            "concourse",
+            "woodpecker",
+            "flux",
+            "argocd",
+            "terraform",
+            "pulumi",
+            "ansible",
+            "airflow",
+            "dagster",
+            "prefect",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+
+        // Deployment environment keywords
+        let environment_keywords: HashSet<String> = vec![
+            "staging",
+            "production",
+            "prod",
+            "dev",
+            "development",
+            "sandbox",
+            "canary",
+            "preview",
+            "qa",
+            "uat",
+            "integration",
+            "preprod",
+            "hotfix",
+            "nightly",
+            "edge",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+
+        // Observability and metric keywords
+        let metric_keywords: HashSet<String> = vec![
+            "latency",
+            "throughput",
+            "p99",
+            "p95",
+            "p50",
+            "slo",
+            "sla",
+            "sli",
+            "uptime",
+            "availability",
+            "mttr",
+            "mttf",
+            "error rate",
+            "saturation",
+            "prometheus",
+            "grafana",
+            "datadog",
+            "newrelic",
+            "jaeger",
+            "tempo",
+            "loki",
+            "opentelemetry",
+            "otel",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+
         Self {
             person_indicators,
             org_indicators,
@@ -5338,6 +8289,11 @@ impl EntityExtractor {
             location_keywords,
             tech_keywords,
             stop_words,
+            service_keywords,
+            database_keywords,
+            pipeline_keywords,
+            environment_keywords,
+            metric_keywords,
         }
     }
 
@@ -5354,17 +8310,42 @@ impl EntityExtractor {
     /// Proper nouns receive a 20% boost (capped at 1.0).
     pub fn calculate_base_salience(label: &EntityLabel, is_proper_noun: bool) -> f32 {
         let type_salience = match label {
-            EntityLabel::Person => 0.8,       // People are highly salient
-            EntityLabel::Organization => 0.7, // Organizations are important
-            EntityLabel::Location => 0.6,     // Locations matter for context
-            EntityLabel::Technology => 0.6,   // Tech keywords matter for dev context
-            EntityLabel::Product => 0.7,      // Products are specific entities
-            EntityLabel::Event => 0.6,        // Events are temporal anchors
-            EntityLabel::Skill => 0.5,        // Skills are somewhat important
-            EntityLabel::Keyword => 0.55,     // YAKE keywords - discriminative terms
-            EntityLabel::Concept => 0.4,      // Concepts are more generic
-            EntityLabel::Date => 0.3,         // Dates are structural, not salient
-            EntityLabel::Other(_) => 0.3,     // Unknown types get low salience
+            EntityLabel::Person => 0.8,         // People are highly salient
+            EntityLabel::Organization => 0.7,   // Organizations are important
+            EntityLabel::Location => 0.6,       // Locations matter for context
+            EntityLabel::Technology => 0.6,     // Tech keywords matter for dev context
+            EntityLabel::Product => 0.7,        // Products are specific entities
+            EntityLabel::Event => 0.6,          // Events are temporal anchors
+            EntityLabel::Skill => 0.5,          // Skills are somewhat important
+            EntityLabel::Keyword => 0.55,       // YAKE keywords - discriminative terms
+            EntityLabel::Concept => 0.4,        // Concepts are more generic
+            EntityLabel::Date => 0.3,           // Dates are structural, not salient
+            EntityLabel::Project => 0.7,        // Projects are specific, high-salience anchors
+            EntityLabel::Task => 0.55,          // Tasks are common but specific work items
+            EntityLabel::Document => 0.5,       // Documents provide contextual reference
+            EntityLabel::Repository => 0.65,    // Repos are identifiable code entities
+            EntityLabel::Service => 0.65,       // Services are architectural anchors
+            EntityLabel::Database => 0.6,       // Databases are infrastructure anchors
+            EntityLabel::Metric => 0.5,         // Metrics are precise but numerous
+            EntityLabel::Configuration => 0.45, // Config is low-salience, high-frequency
+            EntityLabel::Environment => 0.5,    // Environments are contextual
+            EntityLabel::Pipeline => 0.6,       // Pipelines are operational entities
+            EntityLabel::Team => 0.7,           // Teams are organizational anchors
+            EntityLabel::Role => 0.55,          // Roles are semi-generic
+            EntityLabel::Module => 0.55,        // Modules are code-level entities
+            EntityLabel::Norp => 0.55,          // Nationalities/groups are moderately salient
+            EntityLabel::Gpe => 0.6,            // Geopolitical entities, on par with Location
+            EntityLabel::Facility => 0.5,       // Facilities are concrete but generic
+            EntityLabel::Vehicle => 0.5,        // Vehicles are concrete but generic
+            EntityLabel::Weapon => 0.55,        // Weapons are specific, notable entities
+            EntityLabel::Work => 0.6,           // Named works are specific, on par with Product
+            EntityLabel::Law => 0.55,           // Named laws/regulations are specific anchors
+            EntityLabel::Title => 0.5,          // Titles are semi-generic, like Role
+            EntityLabel::Cyber => 0.55,         // Cyber entities (CVEs, malware) are specific
+            EntityLabel::Money => 0.4,          // Monetary amounts are structural, like Date
+            EntityLabel::Quantity => 0.35,      // Measurements are structural, low salience
+            EntityLabel::Time => 0.3,           // Time-of-day is structural, like Date
+            EntityLabel::Other(_) => 0.3,       // Unknown types get low salience
         };
 
         // Proper nouns get a 20% boost
@@ -5450,6 +8431,58 @@ impl EntityExtractor {
             }
 
             // Check for technology keywords (always proper nouns in tech context)
+            // Check extended ontological keyword dictionaries (more specific before generic)
+            if self.database_keywords.contains(&lower) && !seen.contains(&lower) {
+                entities.push(ExtractedEntity {
+                    name: clean_word.to_string(),
+                    label: EntityLabel::Database,
+                    base_salience: Self::calculate_base_salience(&EntityLabel::Database, true),
+                });
+                seen.insert(lower.clone());
+                continue;
+            }
+
+            if self.pipeline_keywords.contains(&lower) && !seen.contains(&lower) {
+                entities.push(ExtractedEntity {
+                    name: clean_word.to_string(),
+                    label: EntityLabel::Pipeline,
+                    base_salience: Self::calculate_base_salience(&EntityLabel::Pipeline, true),
+                });
+                seen.insert(lower.clone());
+                continue;
+            }
+
+            if self.service_keywords.contains(&lower) && !seen.contains(&lower) {
+                entities.push(ExtractedEntity {
+                    name: clean_word.to_string(),
+                    label: EntityLabel::Service,
+                    base_salience: Self::calculate_base_salience(&EntityLabel::Service, true),
+                });
+                seen.insert(lower.clone());
+                continue;
+            }
+
+            if self.environment_keywords.contains(&lower) && !seen.contains(&lower) {
+                entities.push(ExtractedEntity {
+                    name: clean_word.to_string(),
+                    label: EntityLabel::Environment,
+                    base_salience: Self::calculate_base_salience(&EntityLabel::Environment, false),
+                });
+                seen.insert(lower.clone());
+                continue;
+            }
+
+            if self.metric_keywords.contains(&lower) && !seen.contains(&lower) {
+                entities.push(ExtractedEntity {
+                    name: clean_word.to_string(),
+                    label: EntityLabel::Metric,
+                    base_salience: Self::calculate_base_salience(&EntityLabel::Metric, false),
+                });
+                seen.insert(lower.clone());
+                continue;
+            }
+
+            // Generic technology keywords (catch-all for tech not matched above)
             if self.tech_keywords.contains(&lower) && !seen.contains(&lower) {
                 let entity = ExtractedEntity {
                     name: clean_word.to_string(),
@@ -5705,7 +8738,828 @@ impl Default for EntityExtractor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Duration;
+    use chrono::{Duration, TimeZone};
+
+    /// Every one of the 18 schema coarse ids must resolve to a real
+    /// `EntityLabel` variant, never the `Other(String)` fallback. This couples
+    /// the entity-type schema asset (`src/entity_type/entity-type-schema.json`)
+    /// to the type system so future schema drift (a coarse id added to the
+    /// JSON without a matching enum variant) fails CI instead of silently
+    /// degrading GLiNER-typed entities to `Other`.
+    #[test]
+    fn every_schema_coarse_maps_to_a_variant() {
+        for coarse in &crate::entity_type::schema().coarse {
+            let label = EntityLabel::from_coarse_id(&coarse.id);
+            assert!(
+                !matches!(label, EntityLabel::Other(_)),
+                "coarse id `{}` rolled up to Other(_) — EntityLabel::from_coarse_id is missing a variant for it",
+                coarse.id
+            );
+        }
+    }
+
+    /// Every one of the 141 schema fine leaves must roll up (via
+    /// `coarse_of`) to a coarse id that `from_coarse_id` resolves to a real
+    /// `EntityLabel` variant. This is the end-to-end check: a fine label
+    /// GLiNER actually predicts must never dead-end in `Other(_)`.
+    #[test]
+    fn every_fine_rolls_up_to_a_real_variant() {
+        for fine in &crate::entity_type::schema().fine {
+            let coarse_id = crate::entity_type::coarse_of(&fine.label).unwrap_or_else(|| {
+                panic!(
+                    "fine label `{}` has no coarse rollup in the schema",
+                    fine.label
+                )
+            });
+            let label = EntityLabel::from_coarse_id(coarse_id);
+            assert!(
+                !matches!(label, EntityLabel::Other(_)),
+                "fine label `{}` rolls up to coarse `{}` which resolves to Other(_) — EntityLabel::from_coarse_id is missing a variant for it",
+                fine.label,
+                coarse_id
+            );
+        }
+    }
+
+    /// The GLiNER coarse subtypes added alongside the schema (Gpe, Facility,
+    /// Vehicle, Weapon, Title, Work, Law, Cyber, Norp) must roll up through
+    /// `parent_labels()` so type-gated retrieval still matches them — a
+    /// "where"-query expecting `[Location]` must not miss `Gpe`/`Facility`
+    /// entities just because GLiNER typed them at the finer variant.
+    #[test]
+    fn new_coarse_variants_match_their_hierarchy_parent() {
+        assert!(EntityLabel::Gpe.matches_with_hierarchy(&EntityLabel::Location));
+        assert!(EntityLabel::Facility.matches_with_hierarchy(&EntityLabel::Location));
+        assert!(EntityLabel::Vehicle.matches_with_hierarchy(&EntityLabel::Product));
+        assert!(EntityLabel::Weapon.matches_with_hierarchy(&EntityLabel::Product));
+        assert!(EntityLabel::Title.matches_with_hierarchy(&EntityLabel::Role));
+        assert!(EntityLabel::Work.matches_with_hierarchy(&EntityLabel::Concept));
+        assert!(EntityLabel::Law.matches_with_hierarchy(&EntityLabel::Concept));
+        assert!(EntityLabel::Cyber.matches_with_hierarchy(&EntityLabel::Concept));
+        assert!(EntityLabel::Norp.matches_with_hierarchy(&EntityLabel::Organization));
+    }
+
+    #[test]
+    fn spreading_weight_prefers_predicates_over_cooccurrence() {
+        // The load-bearing contrast: a real causal predicate must out-weight bare
+        // co-occurrence so activation flows along meaning, not adjacency.
+        assert!(
+            RelationType::Causes.spreading_weight() > RelationType::CoOccurs.spreading_weight()
+        );
+        assert!(
+            RelationType::Triggers.spreading_weight() > RelationType::RelatedTo.spreading_weight()
+        );
+        assert!(
+            RelationType::WorksAt.spreading_weight() > RelationType::CoOccurs.spreading_weight()
+        );
+        // Co-occurrence is the weakest evidence of meaning.
+        assert_eq!(RelationType::CoOccurs.spreading_weight(), 0.5);
+        assert!((RelationType::Causes.spreading_weight() - 1.3).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn extract_predicate_recovers_causal_relations_from_text() {
+        // The lineage harness phrasing must recover a causal predicate that the
+        // (Event, Event) label heuristic would have flattened to CoOccurs.
+        assert_eq!(
+            extract_predicate_from_text("Vornak set Meslin in motion."),
+            Some(RelationType::Triggers)
+        );
+        assert_eq!(
+            extract_predicate_from_text("the outage caused the rollback"),
+            Some(RelationType::Triggers)
+        );
+        assert_eq!(
+            extract_predicate_from_text("Alice manages the platform team"),
+            Some(RelationType::Manages)
+        );
+        assert_eq!(
+            extract_predicate_from_text("Service A depends on Service B"),
+            Some(RelationType::DependsOn)
+        );
+        // No relational cue → None, so the caller keeps the label-pair inference.
+        assert_eq!(
+            extract_predicate_from_text("the sky is a colour today"),
+            None
+        );
+    }
+
+    #[test]
+    fn extract_directed_predicate_sets_cause_effect_arrow() {
+        // "A set B in motion": A is the cause (appears first) → a_is_source = true.
+        assert_eq!(
+            extract_directed_predicate("Vornak set Meslin in motion.", "Vornak", "Meslin"),
+            Some((RelationType::Triggers, true))
+        );
+        // Same fact, arguments swapped: B is queried first but A is still the cause,
+        // so a_is_source = false (the caller swaps from/to). This is the arrow-
+        // direction fix that the NER-order default got wrong.
+        assert_eq!(
+            extract_directed_predicate("Vornak set Meslin in motion.", "Meslin", "Vornak"),
+            Some((RelationType::Triggers, false))
+        );
+        // Sentence scoping: a cue in a NEIGHBOURING sentence must not be applied to
+        // a pair that merely co-occurs across the boundary.
+        assert_eq!(
+            extract_directed_predicate("Alpha and Beta met. Gamma caused Delta.", "Alpha", "Beta"),
+            None
+        );
+        // Both mentions in the cued sentence → recovered.
+        assert_eq!(
+            extract_directed_predicate("Gamma caused Delta.", "Gamma", "Delta"),
+            Some((RelationType::Triggers, true))
+        );
+        // Missing mention → None (caller keeps label-pair inference).
+        assert_eq!(
+            extract_directed_predicate("Gamma caused Delta.", "Gamma", "Epsilon"),
+            None
+        );
+    }
+
+    #[test]
+    fn extract_directed_predicate_flips_effect_first_constructions() {
+        // "A happened because of B": A appears FIRST but B is the CAUSE.
+        // Surface order alone would mark A the source — the audit's inversion bug.
+        assert_eq!(
+            extract_directed_predicate(
+                "The flood happened because of the dam failure.",
+                "dam failure",
+                "flood"
+            ),
+            Some((RelationType::Triggers, true)),
+            "because-of: the later-mentioned cause must be the source"
+        );
+        // Passive voice: "A was caused by B" — B is the cause despite appearing second.
+        assert_eq!(
+            extract_directed_predicate("The outage was caused by Redis.", "Redis", "outage"),
+            Some((RelationType::Triggers, true)),
+            "passive caused-by: the later-mentioned cause must be the source"
+        );
+        // "due to": same effect-first shape.
+        assert_eq!(
+            extract_directed_predicate("The delay was due to the storm.", "delay", "storm"),
+            Some((RelationType::Triggers, false)),
+            "due-to: the earlier-mentioned effect must NOT be the source"
+        );
+        // Control: cause-first active voice is unchanged by the fix.
+        assert_eq!(
+            extract_directed_predicate("Redis caused the outage.", "Redis", "outage"),
+            Some((RelationType::Triggers, true))
+        );
+    }
+
+    #[test]
+    fn extract_directed_predicate_rejects_cue_fragment_endpoints() {
+        // The fallback NER (no GLiNER assets) mints the cue's OWN words as
+        // entities: "motion" from "in motion", "brought" from "brought about".
+        // Those mentions sit inside the predicate span, so they are the relation
+        // lexeme — never a causal argument. Pairing a real event with such a
+        // fragment must recover NO causal edge, or the shared fragment welds every
+        // chain into a cross-document causal bridge (fallback-path lineage flood).
+        assert_eq!(
+            extract_directed_predicate("Vornak set Meslin in motion.", "Vornak", "motion"),
+            None,
+            "'motion' is part of the 'in motion' cue, not a causal endpoint"
+        );
+        assert_eq!(
+            extract_directed_predicate("Vornak set Meslin in motion.", "Meslin", "motion"),
+            None,
+            "'motion' is part of the 'in motion' cue, not a causal endpoint"
+        );
+        assert_eq!(
+            extract_directed_predicate(
+                "the Meslin incident then brought about the Caldor incident.",
+                "the Meslin incident",
+                "brought"
+            ),
+            None,
+            "'brought' is part of the 'brought about' cue, not a causal endpoint"
+        );
+        assert_eq!(
+            extract_directed_predicate(
+                "the Meslin incident then brought about the Caldor incident.",
+                "brought",
+                "the Caldor incident"
+            ),
+            None,
+            "'brought' is part of the 'brought about' cue, not a causal endpoint"
+        );
+        // The genuine argument pair in the SAME sentences still types causal — the
+        // gate removes only the predicate-fragment endpoints, not the relation.
+        assert_eq!(
+            extract_directed_predicate("Vornak set Meslin in motion.", "Vornak", "Meslin"),
+            Some((RelationType::Triggers, true))
+        );
+        assert_eq!(
+            extract_directed_predicate(
+                "the Meslin incident then brought about the Caldor incident.",
+                "the Meslin incident",
+                "the Caldor incident"
+            ),
+            Some((RelationType::Triggers, true))
+        );
+    }
+
+    #[test]
+    fn trace_causal_origins_walks_back_to_root() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let graph = GraphMemory::new(temp_dir.path(), None).unwrap();
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let c = Uuid::new_v4();
+        let mk = |from: Uuid, to: Uuid, rt: RelationType| RelationshipEdge {
+            uuid: Uuid::new_v4(),
+            from_entity: from,
+            to_entity: to,
+            relation_type: rt,
+            strength: 0.8,
+            created_at: Utc::now(),
+            valid_at: Utc::now(),
+            invalidated_at: None,
+            source_episode_id: None,
+            context: String::new(),
+            last_activated: Utc::now(),
+            activation_count: 1,
+            ltp_status: LtpStatus::None,
+            activation_timestamps: None,
+            tier: EdgeTier::L2Episodic,
+            entity_confidence: None,
+            forman_curvature: None,
+            endpoint_selectivity: None,
+            provenance: Vec::new(),
+        };
+        // Causal chain a → b → c (cause = from_entity).
+        graph
+            .add_relationship(mk(a, b, RelationType::Triggers))
+            .unwrap();
+        graph
+            .add_relationship(mk(b, c, RelationType::Triggers))
+            .unwrap();
+
+        // Origin of the effect c is the root a (walk c ← b ← a), NOT the proximal
+        // cause b. This is the exact failure mode spreading activation cannot solve.
+        let origins = graph.trace_causal_origins(&[c], 8).unwrap();
+        assert_eq!(origins.len(), 1);
+        assert_eq!(origins[0].0, a);
+        // Two hops at strength 0.8 each with HOP_DECAY 0.7: the score is the path
+        // product, strictly positive and below a single-hop score.
+        assert!(
+            origins[0].1 > 0.0 && origins[0].1 < 0.7,
+            "two-hop origin score should be decayed: {}",
+            origins[0].1
+        );
+
+        // A non-causal edge into c must NOT be followed (co-occurrence is not cause).
+        let d = Uuid::new_v4();
+        graph
+            .add_relationship(mk(d, c, RelationType::CoOccurs))
+            .unwrap();
+        let origins = graph.trace_causal_origins(&[c], 8).unwrap();
+        assert_eq!(origins.len(), 1);
+        assert_eq!(origins[0].0, a);
+    }
+
+    #[test]
+    fn typed_neighbors_respects_relation_and_direction() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let graph = GraphMemory::new(temp_dir.path(), None).unwrap();
+        let caroline = Uuid::new_v4();
+        let denver = Uuid::new_v4();
+        let painting = Uuid::new_v4();
+        let melanie = Uuid::new_v4();
+        let mk = |from: Uuid, to: Uuid, rt: RelationType, strength: f32| RelationshipEdge {
+            uuid: Uuid::new_v4(),
+            from_entity: from,
+            to_entity: to,
+            relation_type: rt,
+            strength,
+            created_at: Utc::now(),
+            valid_at: Utc::now(),
+            invalidated_at: None,
+            source_episode_id: None,
+            context: String::new(),
+            last_activated: Utc::now(),
+            activation_count: 1,
+            ltp_status: LtpStatus::None,
+            activation_timestamps: None,
+            tier: EdgeTier::L2Episodic,
+            entity_confidence: None,
+            forman_curvature: None,
+            endpoint_selectivity: None,
+            provenance: Vec::new(),
+        };
+        // Caroline --LocatedIn--> Denver; Melanie --CreatedBy--> painting;
+        // plus a CoOccurs distractor edge Caroline--painting.
+        graph
+            .add_relationship(mk(caroline, denver, RelationType::LocatedIn, 0.8))
+            .unwrap();
+        graph
+            .add_relationship(mk(melanie, painting, RelationType::CreatedBy, 0.9))
+            .unwrap();
+        graph
+            .add_relationship(mk(caroline, painting, RelationType::CoOccurs, 0.9))
+            .unwrap();
+
+        // Outgoing LocatedIn from Caroline → Denver only (CoOccurs filtered).
+        let out = graph
+            .typed_neighbors(&[caroline], &[RelationType::LocatedIn], false, 64)
+            .unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].0, denver);
+
+        // Incoming CreatedBy into the painting → Melanie (the creator).
+        let creators = graph
+            .typed_neighbors(&[painting], &[RelationType::CreatedBy], true, 64)
+            .unwrap();
+        assert_eq!(creators.len(), 1);
+        assert_eq!(creators[0].0, melanie);
+
+        // Wrong direction yields nothing: nobody is LocatedIn Caroline.
+        let incoming_loc = graph
+            .typed_neighbors(&[caroline], &[RelationType::LocatedIn], true, 64)
+            .unwrap();
+        assert!(incoming_loc.is_empty());
+    }
+
+    #[test]
+    fn learned_pair_relation_gates() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let graph = GraphMemory::new(temp_dir.path(), None).unwrap();
+        let person = EntityLabel::Person;
+        let org = EntityLabel::Organization;
+
+        // Below support: 9 observations → None (threshold 10 after the v1
+        // rejection, run 27348362950).
+        for _ in 0..9 {
+            graph
+                .record_relation_evidence(&person, &org, &RelationType::WorksAt)
+                .unwrap();
+        }
+        assert!(graph
+            .lookup_learned_pair_relation(&person, &org)
+            .unwrap()
+            .is_none());
+
+        // Tenth observation clears support: mapping earned, direction settled
+        // (source = Person in all evidence), and it maps to the caller's
+        // mention order in both argument orders.
+        graph
+            .record_relation_evidence(&person, &org, &RelationType::WorksAt)
+            .unwrap();
+        let (rt, a_is_source, support) = graph
+            .lookup_learned_pair_relation(&person, &org)
+            .unwrap()
+            .expect("mapping earned at support 10");
+        assert_eq!(rt, RelationType::WorksAt);
+        assert!(a_is_source, "Person mentioned first is the source");
+        assert_eq!(support, 10);
+        let (_, a_is_source, _) = graph
+            .lookup_learned_pair_relation(&org, &person)
+            .unwrap()
+            .expect("swapped order still maps");
+        assert!(!a_is_source, "Org mentioned first is the target");
+
+        // Purity gate: a near-tie between relations stays generic.
+        for _ in 0..10 {
+            graph
+                .record_relation_evidence(&person, &org, &RelationType::Manages)
+                .unwrap();
+        }
+        assert!(
+            graph
+                .lookup_learned_pair_relation(&person, &org)
+                .unwrap()
+                .is_none(),
+            "10 WorksAt vs 10 Manages = purity 0.5 → no mapping"
+        );
+
+        // Causal exclusion: statistics may NEVER assign causal relations —
+        // a defaulted causal edge is lineage poison (the fragment-bridge class).
+        let event = EntityLabel::Event;
+        let tech = EntityLabel::Technology;
+        for _ in 0..12 {
+            graph
+                .record_relation_evidence(&event, &tech, &RelationType::Triggers)
+                .unwrap();
+        }
+        assert!(
+            graph
+                .lookup_learned_pair_relation(&event, &tech)
+                .unwrap()
+                .is_none(),
+            "causal relations must never be statistically defaulted"
+        );
+
+        // Generic-label exclusion: catch-all labels (Concept/Keyword/Other)
+        // never record and never map — the v1 mass-application vector.
+        let concept = EntityLabel::Concept;
+        for _ in 0..12 {
+            graph
+                .record_relation_evidence(&concept, &org, &RelationType::WorksAt)
+                .unwrap();
+        }
+        assert!(
+            graph
+                .lookup_learned_pair_relation(&concept, &org)
+                .unwrap()
+                .is_none(),
+            "generic labels must never carry learned mappings"
+        );
+    }
+
+    #[test]
+    fn classify_tag_label_maps_known_categories() {
+        assert_eq!(classify_tag_label("production"), EntityLabel::Environment);
+        assert_eq!(classify_tag_label("rocksdb"), EntityLabel::Database);
+        assert_eq!(classify_tag_label("metrics-service"), EntityLabel::Service);
+        assert_eq!(classify_tag_label("README"), EntityLabel::Document);
+        assert_eq!(
+            classify_tag_label("config.toml"),
+            EntityLabel::Configuration
+        );
+        assert_eq!(classify_tag_label("router.rs"), EntityLabel::Module);
+        assert_eq!(classify_tag_label("ci-cd"), EntityLabel::Pipeline);
+        // Unknown → Technology fallback
+        assert_eq!(classify_tag_label("widgetron"), EntityLabel::Technology);
+    }
+
+    #[test]
+    fn entity_node_fine_type_roundtrips() {
+        // Same persistence path production code uses: GraphMemory::add_entity
+        // (crate::serialization::encode over postcard) and get_entity
+        // (decode_entity_node / try_decode_compat).
+        let temp_dir = tempfile::tempdir().unwrap();
+        let graph = GraphMemory::new(temp_dir.path(), None).unwrap();
+        let now = Utc::now();
+
+        let entity = EntityNode {
+            uuid: Uuid::new_v4(),
+            name: "Francis Scott Key Bridge".to_string(),
+            labels: vec![EntityLabel::Facility],
+            created_at: now,
+            last_seen_at: now,
+            mention_count: 1,
+            summary: String::new(),
+            attributes: HashMap::new(),
+            name_embedding: None,
+            salience: 0.5,
+            is_proper_noun: true,
+            selectivity: None,
+            fine_type: Some("bridge".to_string()),
+        };
+        let entity_uuid = graph.add_entity(entity).unwrap();
+
+        let roundtripped = graph.get_entity(&entity_uuid).unwrap().unwrap();
+        assert_eq!(roundtripped.fine_type, Some("bridge".to_string()));
+    }
+
+    #[test]
+    fn add_entity_remention_preserves_existing_fine_type() {
+        // Deferred fix: a re-mention that carries no fine type must NOT wipe the
+        // fine type an earlier mention (e.g. GLiNER) already set. Re-mentions are
+        // the common case (pre-extracted names, tags, fallback entities).
+        let temp_dir = tempfile::tempdir().unwrap();
+        let graph = GraphMemory::new(temp_dir.path(), None).unwrap();
+        let now = Utc::now();
+
+        let make = |fine: Option<String>| EntityNode {
+            uuid: Uuid::new_v4(),
+            name: "Baltimore".to_string(),
+            labels: vec![EntityLabel::Gpe],
+            created_at: now,
+            last_seen_at: now,
+            mention_count: 1,
+            summary: String::new(),
+            attributes: HashMap::new(),
+            name_embedding: None,
+            salience: 0.5,
+            is_proper_noun: true,
+            selectivity: None,
+            fine_type: fine,
+        };
+
+        // First mention: GLiNER typed it "city".
+        let uuid = graph.add_entity(make(Some("city".to_string()))).unwrap();
+        // Re-mention with no fine type (e.g. a tag or fallback entity).
+        let uuid2 = graph.add_entity(make(None)).unwrap();
+        assert_eq!(uuid, uuid2, "re-mention should merge into the same node");
+
+        let merged = graph.get_entity(&uuid).unwrap().unwrap();
+        assert_eq!(
+            merged.fine_type,
+            Some("city".to_string()),
+            "re-mention without a fine type must preserve the existing one"
+        );
+        assert_eq!(merged.mention_count, 2);
+    }
+
+    #[test]
+    fn legacy_entity_node_defaults_fine_type_to_none() {
+        // Mirrors the pre-fine_type EntityNode schema (all fields through
+        // `selectivity`, no trailing `fine_type`) — the exact shape of every
+        // EntityNode already written to the live RocksDB store before this
+        // field existed. `decode_entity_node` must backfill fine_type=None
+        // via ENTITY_NODE_DEFAULT_SUFFIX rather than failing to decode.
+        #[derive(serde::Serialize)]
+        struct LegacyEntityNode {
+            uuid: Uuid,
+            name: String,
+            labels: Vec<EntityLabel>,
+            created_at: DateTime<Utc>,
+            last_seen_at: DateTime<Utc>,
+            mention_count: usize,
+            summary: String,
+            attributes: HashMap<String, String>,
+            name_embedding: Option<Vec<f32>>,
+            salience: f32,
+            is_proper_noun: bool,
+            selectivity: Option<f32>,
+        }
+
+        let now = Utc::now();
+        let uuid = Uuid::new_v4();
+        let legacy = LegacyEntityNode {
+            uuid,
+            name: "Legacy Bridge".to_string(),
+            labels: vec![EntityLabel::Facility],
+            created_at: now,
+            last_seen_at: now,
+            mention_count: 3,
+            summary: "a pre-fine_type record".to_string(),
+            attributes: HashMap::new(),
+            name_embedding: None,
+            salience: 0.7,
+            is_proper_noun: true,
+            selectivity: Some(0.42),
+        };
+
+        let bytes = crate::serialization::encode(&legacy).unwrap();
+        let (decoded, needs_migration) = decode_entity_node(&bytes).unwrap();
+
+        assert_eq!(decoded.uuid, uuid);
+        assert_eq!(decoded.name, "Legacy Bridge");
+        assert_eq!(decoded.selectivity, Some(0.42));
+        assert_eq!(
+            decoded.fine_type, None,
+            "legacy record without fine_type must default to None"
+        );
+        assert!(
+            needs_migration,
+            "legacy-shaped record should be flagged for rewrite-on-read"
+        );
+    }
+
+    #[test]
+    fn delete_entity_scrubs_episode_index() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let graph = GraphMemory::new(temp_dir.path(), None).unwrap();
+        let now = Utc::now();
+
+        let entity = EntityNode {
+            uuid: Uuid::new_v4(),
+            name: "Zephyrine".to_string(),
+            labels: vec![EntityLabel::Concept],
+            created_at: now,
+            last_seen_at: now,
+            mention_count: 1,
+            summary: String::new(),
+            attributes: HashMap::new(),
+            name_embedding: None,
+            salience: 0.5,
+            is_proper_noun: false,
+            selectivity: None,
+            fine_type: None,
+        };
+        let entity_uuid = graph.add_entity(entity).unwrap();
+
+        let episode = EpisodicNode {
+            uuid: Uuid::new_v4(),
+            name: "ep".to_string(),
+            content: "content".to_string(),
+            valid_at: now,
+            created_at: now,
+            entity_refs: vec![entity_uuid],
+            source: EpisodeSource::Message,
+            metadata: HashMap::new(),
+        };
+        graph.add_episode(episode).unwrap();
+
+        assert!(
+            !graph
+                .get_episodes_by_entity(&entity_uuid)
+                .unwrap()
+                .is_empty(),
+            "episode should be indexed under the entity before deletion"
+        );
+
+        assert!(graph.delete_entity(&entity_uuid).unwrap());
+
+        assert!(
+            graph
+                .get_episodes_by_entity(&entity_uuid)
+                .unwrap()
+                .is_empty(),
+            "entity_episodes index entries must be scrubbed when the entity is deleted"
+        );
+    }
+
+    #[test]
+    fn corroboration_meets_gates_on_threshold() {
+        // Feature disabled (None) → never protected, regardless of attestation count.
+        assert!(!corroboration_meets(0, None));
+        assert!(!corroboration_meets(100, None));
+        // Enabled → protected iff distinct attesting episodes >= min.
+        assert!(!corroboration_meets(2, Some(3)));
+        assert!(corroboration_meets(3, Some(3)));
+        assert!(corroboration_meets(8, Some(3)));
+        assert!(!corroboration_meets(0, Some(1)));
+        assert!(corroboration_meets(1, Some(1)));
+    }
+
+    #[test]
+    fn delete_episode_is_multi_source_aware() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let graph = GraphMemory::new(temp_dir.path(), None).unwrap();
+
+        let e1 = Uuid::new_v4();
+        let e2 = Uuid::new_v4();
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let now = Utc::now();
+
+        let make_episode = |uuid: Uuid| EpisodicNode {
+            uuid,
+            name: "ep".to_string(),
+            content: "content".to_string(),
+            valid_at: now,
+            created_at: now,
+            entity_refs: vec![a, b],
+            source: EpisodeSource::Message,
+            metadata: HashMap::new(),
+        };
+        graph.add_episode(make_episode(e1)).unwrap();
+        graph.add_episode(make_episode(e2)).unwrap();
+
+        // Edge A—B attested by BOTH episodes; e1 is the primary source.
+        let make_record = |episode: Uuid| ProvenanceRecord {
+            source_episode_id: episode,
+            mention_count: 1,
+            first_observed: now,
+            last_observed: now,
+            confidence: None,
+            evidence_span: None,
+            typed_by: None,
+        };
+        let edge = RelationshipEdge {
+            uuid: Uuid::new_v4(),
+            from_entity: a,
+            to_entity: b,
+            relation_type: RelationType::CoOccurs,
+            strength: 0.5,
+            created_at: now,
+            valid_at: now,
+            invalidated_at: None,
+            source_episode_id: Some(e1),
+            context: String::new(),
+            last_activated: now,
+            activation_count: 1,
+            ltp_status: LtpStatus::None,
+            tier: EdgeTier::L1Working,
+            activation_timestamps: None,
+            entity_confidence: None,
+            forman_curvature: None,
+            endpoint_selectivity: None,
+            provenance: vec![make_record(e1), make_record(e2)],
+        };
+        let edge_uuid = graph.add_relationship(edge).unwrap();
+
+        // Deleting the primary source must NOT delete a corroborated edge: the
+        // trail is scrubbed of e1 and primacy is promoted to the survivor e2.
+        assert!(graph.delete_episode(&e1).unwrap());
+        let survived = graph
+            .get_relationship(&edge_uuid)
+            .unwrap()
+            .expect("edge corroborated by e2 must survive deletion of its primary source e1");
+        assert_eq!(
+            survived.provenance.len(),
+            1,
+            "e1 must be scrubbed from the trail"
+        );
+        assert_eq!(
+            survived.provenance[0].source_episode_id, e2,
+            "only e2's attestation should remain"
+        );
+        assert_eq!(
+            survived.source_episode_id,
+            Some(e2),
+            "primary source must be promoted to the surviving attester"
+        );
+
+        // Deleting the last attesting episode leaves no attestation → edge removed.
+        assert!(graph.delete_episode(&e2).unwrap());
+        assert!(
+            graph.get_relationship(&edge_uuid).unwrap().is_none(),
+            "an edge with no remaining attesting episode must be deleted"
+        );
+    }
+
+    #[test]
+    fn dormant_reactivation_is_queued_and_drained() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let graph = GraphMemory::new(temp_dir.path(), None).unwrap();
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let now = Utc::now();
+
+        let make_edge = || RelationshipEdge {
+            uuid: Uuid::new_v4(),
+            from_entity: a,
+            to_entity: b,
+            relation_type: RelationType::CoOccurs,
+            strength: 0.5,
+            created_at: now,
+            valid_at: now,
+            invalidated_at: None,
+            source_episode_id: None,
+            context: String::new(),
+            last_activated: now,
+            activation_count: 1,
+            ltp_status: LtpStatus::None,
+            tier: EdgeTier::L2Episodic,
+            activation_timestamps: None,
+            entity_confidence: None,
+            forman_curvature: None,
+            endpoint_selectivity: None,
+            provenance: Vec::new(),
+        };
+
+        let edge_uuid = graph.add_relationship(make_edge()).unwrap();
+
+        // Fresh re-attestation (gap ~0): strengthen fires, but no event.
+        graph.add_relationship(make_edge()).unwrap();
+        assert!(
+            graph.drain_temporal_anomalies().is_empty(),
+            "a fresh re-attestation must not be a dormant reactivation"
+        );
+
+        // Backdate the stored edge 8 days, then re-attest: event queued.
+        let mut stored = graph.get_relationship(&edge_uuid).unwrap().unwrap();
+        stored.last_activated = now - Duration::days(8);
+        let encoded = crate::serialization::encode(&stored).unwrap();
+        graph
+            .db
+            .put_cf(graph.relationships_cf(), stored.uuid.as_bytes(), encoded)
+            .unwrap();
+
+        graph.add_relationship(make_edge()).unwrap();
+        let events = graph.drain_temporal_anomalies();
+        assert_eq!(
+            events.len(),
+            1,
+            "8-day dormancy must queue exactly one event"
+        );
+        let ev = &events[0];
+        assert_eq!(ev.kind, TemporalAnomalyKind::DormantReactivation);
+        assert_eq!(ev.edge_uuid, edge_uuid);
+        assert!(
+            ev.gap_days >= 7.9 && ev.gap_days <= 8.1,
+            "gap_days should be ~8, got {}",
+            ev.gap_days
+        );
+
+        // Drained means drained.
+        assert!(graph.drain_temporal_anomalies().is_empty());
+    }
+
+    #[test]
+    fn rocksdb_memory_breakdown_reflects_writes() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let graph = GraphMemory::new(temp_dir.path(), None).unwrap();
+        // A fresh unflushed write lands in a memtable — the breakdown must see it.
+        let now = Utc::now();
+        graph
+            .add_entity(EntityNode {
+                uuid: Uuid::new_v4(),
+                name: "Breakdown Probe".to_string(),
+                labels: vec![EntityLabel::Concept],
+                created_at: now,
+                last_seen_at: now,
+                mention_count: 1,
+                summary: String::new(),
+                attributes: HashMap::new(),
+                name_embedding: None,
+                salience: 0.5,
+                is_proper_noun: false,
+                selectivity: None,
+                fine_type: None,
+            })
+            .unwrap();
+        let (memtables, _readers) = graph.rocksdb_memory_breakdown();
+        assert!(
+            memtables > 0,
+            "memtable bytes must be visible after an unflushed write, got {memtables}"
+        );
+    }
 
     /// Create a test relationship edge with specified strength and last_activated (L1 tier)
     fn create_test_edge(strength: f32, days_since_activated: i64) -> RelationshipEdge {
@@ -5735,6 +9589,9 @@ mod tests {
             activation_timestamps: None,
             tier,
             entity_confidence: None, // PIPE-5: Default for tests
+            forman_curvature: None,
+            endpoint_selectivity: None,
+            provenance: Vec::new(),
         }
     }
 
@@ -6205,22 +10062,24 @@ mod tests {
 
     #[test]
     fn test_decay_tier_aware() {
-        // Test tier-aware decay: L2 episodic with exponential decay (λ=0.031/day) over 7 days
-        // Expected: e^(-0.031 * 7) ≈ 0.805, so strength decays to ~80%
+        // Test tier-aware decay: L2 episodic with Wixted 2004 hybrid decay over 7 days
+        // 7 days > crossover (3 days), so power-law phase applies:
+        //   value_at_crossover = exp(-0.693 * 3) ≈ 0.125
+        //   power_law = (7/3)^(-0.5) ≈ 0.655
+        //   decay ≈ 0.125 * 0.655 ≈ 0.082
         let mut edge = create_test_edge_with_tier(1.0, 7, EdgeTier::L2Episodic);
 
         edge.decay();
 
-        // After 7 days with L2 exponential decay, expect moderate reduction (~80% retained)
-        // but well above floor since within max age
+        // Hybrid decay is aggressive for non-potentiated edges: ~8% retained at 7 days
         assert!(
-            edge.strength < 0.85,
-            "After 7 days with L2 decay, strength should be below 0.85, got {}",
+            edge.strength < 0.15,
+            "After 7 days with hybrid decay, strength should be below 0.15, got {}",
             edge.strength
         );
         assert!(
-            edge.strength > 0.75,
-            "After 7 days with L2 decay, strength should be above 0.75, got {}",
+            edge.strength > 0.05,
+            "After 7 days with hybrid decay, strength should be above 0.05, got {}",
             edge.strength
         );
         assert!(
@@ -6293,7 +10152,10 @@ mod tests {
     #[test]
     fn test_potentiated_above_floor_never_pruned() {
         // Potentiated edge above LTP_PRUNE_FLOOR should be protected
-        let mut edge = create_test_edge_with_tier(0.1, 30, EdgeTier::L2Episodic);
+        // With hybrid decay at 30 days (potentiated): decay ≈ 0.177
+        // Need initial strength high enough that final > LTP_PRUNE_FLOOR (0.05)
+        // 0.5 * 0.177 ≈ 0.089 > 0.05 ✓
+        let mut edge = create_test_edge_with_tier(0.5, 30, EdgeTier::L2Episodic);
         edge.ltp_status = LtpStatus::Full;
 
         let should_prune = edge.decay();
@@ -6371,6 +10233,8 @@ mod tests {
             name_embedding: None,
             salience: 0.5,
             is_proper_noun: false,
+            selectivity: None,
+            fine_type: None,
         };
         let entity2 = EntityNode {
             uuid: Uuid::new_v4(),
@@ -6384,6 +10248,8 @@ mod tests {
             name_embedding: None,
             salience: 0.5,
             is_proper_noun: false,
+            selectivity: None,
+            fine_type: None,
         };
 
         let entity1_uuid = graph.add_entity(entity1.clone()).unwrap();
@@ -6433,6 +10299,8 @@ mod tests {
             name_embedding: None,
             salience: 0.5,
             is_proper_noun: false,
+            selectivity: None,
+            fine_type: None,
         };
         let entity2 = EntityNode {
             uuid: entity2_uuid,
@@ -6446,6 +10314,8 @@ mod tests {
             name_embedding: None,
             salience: 0.5,
             is_proper_noun: false,
+            selectivity: None,
+            fine_type: None,
         };
 
         graph.add_entity(entity1).unwrap();
@@ -6483,6 +10353,9 @@ mod tests {
             activation_timestamps: None,
             tier: EdgeTier::L2Episodic, // Use L2 since it has activation count
             entity_confidence: None,    // PIPE-5: Default for tests
+            forman_curvature: None,
+            endpoint_selectivity: None,
+            provenance: Vec::new(),
         };
         graph.add_relationship(edge).unwrap();
 
@@ -6491,5 +10364,1666 @@ mod tests {
         assert!(strength.is_some());
         let s = strength.unwrap();
         assert!(s > 0.75 && s <= 0.8, "Strength should be ~0.8, got {}", s);
+    }
+
+    #[test]
+    fn apply_decay_at_ages_a_real_graph_at_cadence() {
+        // End-to-end check of the virtual-clock decay plumbing: drive
+        // apply_decay_at over simulated time at the production ~6h cadence and
+        // confirm a real on-disk edge actually decays. This is the mechanism the
+        // decay-evaluation harness uses to age a graph for recall@k-vs-age
+        // measurement without waiting wall-clock days.
+        let temp_dir = tempfile::tempdir().unwrap();
+        let graph = GraphMemory::new(temp_dir.path(), None).unwrap();
+
+        let edge = RelationshipEdge {
+            uuid: Uuid::new_v4(),
+            from_entity: Uuid::new_v4(),
+            to_entity: Uuid::new_v4(),
+            relation_type: RelationType::RelatedTo,
+            strength: 0.8,
+            created_at: Utc::now(),
+            valid_at: Utc::now(),
+            invalidated_at: None,
+            source_episode_id: None,
+            context: String::new(),
+            last_activated: Utc::now(),
+            activation_count: 1,
+            ltp_status: LtpStatus::None,
+            activation_timestamps: None,
+            tier: EdgeTier::L2Episodic,
+            entity_confidence: None,
+            forman_curvature: None,
+            endpoint_selectivity: None,
+            provenance: Vec::new(),
+        };
+        let edge_id = graph.add_relationship(edge).unwrap();
+        let start = graph.get_relationship(&edge_id).unwrap().unwrap().strength;
+
+        // Age ~10 days at the 6h cadence (40 cycles), advancing a virtual clock.
+        let t0 = Utc::now();
+        for step in 1..=40 {
+            let now = t0 + Duration::hours(6 * step);
+            graph.apply_decay_at(now).unwrap();
+        }
+
+        // Under the real cadence an L2 edge floors below its 0.2 prune threshold
+        // within ~2 days (chained ~daily-half-life exponential), and decay()'s
+        // return (`exceeded_max_age || strength <= prune_threshold`) then prunes
+        // it — the min-prune-age gate is OR'd, not a hard floor. So after 10
+        // simulated days the edge is either pruned or sitting at the decay floor.
+        // Either outcome proves the virtual clock drove real decay end-to-end.
+        assert!(start > 0.5, "sanity: edge started strong, got {start}");
+        match graph.get_relationship(&edge_id).unwrap() {
+            None => { /* pruned after flooring — the expected outcome */ }
+            Some(aged) => assert!(
+                aged.strength < 0.3,
+                "edge should have decayed near the floor under cadenced aging: \
+                 start={start}, aged={}",
+                aged.strength
+            ),
+        }
+    }
+
+    // =========================================================================
+    // BEHAVIORAL LOOP TESTS
+    // Verify cognitive loops are closed (not just structurally present).
+    // =========================================================================
+
+    #[test]
+    fn test_loop_episode_idempotency() {
+        // Verify: calling add_episode() twice with same UUID doesn't inflate episode_count
+        let temp_dir = tempfile::tempdir().unwrap();
+        let graph = GraphMemory::new(temp_dir.path(), None).unwrap();
+
+        let memory_uuid = Uuid::new_v4();
+        let entity_uuid = Uuid::new_v4();
+
+        let entity = EntityNode {
+            uuid: entity_uuid,
+            name: "IdempotentEntity".to_string(),
+            labels: vec![EntityLabel::Concept],
+            created_at: Utc::now(),
+            last_seen_at: Utc::now(),
+            mention_count: 1,
+            summary: String::new(),
+            attributes: std::collections::HashMap::new(),
+            name_embedding: None,
+            salience: 0.5,
+            is_proper_noun: false,
+            selectivity: None,
+            fine_type: None,
+        };
+        graph.add_entity(entity).unwrap();
+
+        let episode = EpisodicNode {
+            uuid: memory_uuid,
+            name: "Test Episode".to_string(),
+            content: "Test content for idempotency".to_string(),
+            valid_at: Utc::now(),
+            created_at: Utc::now(),
+            entity_refs: vec![entity_uuid],
+            source: EpisodeSource::Message,
+            metadata: std::collections::HashMap::new(),
+        };
+
+        // First insert
+        graph.add_episode(episode.clone()).unwrap();
+        let count_after_first = graph.episode_count.load(Ordering::Relaxed);
+
+        // Second insert (same UUID — simulates retry)
+        graph.add_episode(episode).unwrap();
+        let count_after_second = graph.episode_count.load(Ordering::Relaxed);
+
+        assert_eq!(
+            count_after_first, count_after_second,
+            "episode_count should not inflate on overwrite (got {} then {})",
+            count_after_first, count_after_second
+        );
+    }
+
+    #[test]
+    fn test_loop_decay_reduces_edge_strength() {
+        // Verify: apply_decay() actually reduces edge strength (decay loop is closed)
+        let temp_dir = tempfile::tempdir().unwrap();
+        let graph = GraphMemory::new(temp_dir.path(), None).unwrap();
+
+        let from_uuid = Uuid::new_v4();
+        let to_uuid = Uuid::new_v4();
+
+        // Create entities
+        for (uuid, name) in [(from_uuid, "DecayFrom"), (to_uuid, "DecayTo")] {
+            let entity = EntityNode {
+                uuid,
+                name: name.to_string(),
+                labels: vec![EntityLabel::Concept],
+                created_at: Utc::now(),
+                last_seen_at: Utc::now(),
+                mention_count: 1,
+                summary: String::new(),
+                attributes: std::collections::HashMap::new(),
+                name_embedding: None,
+                salience: 0.5,
+                is_proper_noun: false,
+                selectivity: None,
+                fine_type: None,
+            };
+            graph.add_entity(entity).unwrap();
+        }
+
+        // Create edge with strength 0.5, last activated 30 days ago (well past decay threshold)
+        let edge_uuid = Uuid::new_v4();
+        let edge = RelationshipEdge {
+            uuid: edge_uuid,
+            from_entity: from_uuid,
+            to_entity: to_uuid,
+            relation_type: RelationType::RelatedTo,
+            strength: 0.5,
+            created_at: Utc::now() - Duration::days(60),
+            valid_at: Utc::now(),
+            invalidated_at: None,
+            source_episode_id: None,
+            context: "decay test".to_string(),
+            last_activated: Utc::now() - Duration::days(30),
+            activation_count: 1,
+            ltp_status: LtpStatus::None,
+            activation_timestamps: None,
+            tier: EdgeTier::L1Working,
+            entity_confidence: None,
+            forman_curvature: None,
+            endpoint_selectivity: None,
+            provenance: Vec::new(),
+        };
+        graph.add_relationship(edge).unwrap();
+
+        // Run decay
+        let result = graph.apply_decay().unwrap();
+
+        // Edge should have been affected (either decayed or pruned)
+        if result.pruned_count == 0 {
+            // Not pruned — check it was weakened
+            let updated = graph.get_relationship(&edge_uuid).unwrap();
+            if let Some(updated_edge) = updated {
+                assert!(
+                    updated_edge.strength < 0.5,
+                    "Edge strength should have decayed from 0.5, got {}",
+                    updated_edge.strength
+                );
+            }
+        }
+        // If pruned, the loop is working (edge was weak enough to remove)
+    }
+
+    #[test]
+    fn test_loop_feedback_strengthens_edges() {
+        // Verify: batch_strengthen_synapses() actually increases edge strength (feedback loop)
+        let temp_dir = tempfile::tempdir().unwrap();
+        let graph = GraphMemory::new(temp_dir.path(), None).unwrap();
+
+        let from_uuid = Uuid::new_v4();
+        let to_uuid = Uuid::new_v4();
+
+        for (uuid, name) in [(from_uuid, "FeedbackFrom"), (to_uuid, "FeedbackTo")] {
+            let entity = EntityNode {
+                uuid,
+                name: name.to_string(),
+                labels: vec![EntityLabel::Concept],
+                created_at: Utc::now(),
+                last_seen_at: Utc::now(),
+                mention_count: 1,
+                summary: String::new(),
+                attributes: std::collections::HashMap::new(),
+                name_embedding: None,
+                salience: 0.5,
+                is_proper_noun: false,
+                selectivity: None,
+                fine_type: None,
+            };
+            graph.add_entity(entity).unwrap();
+        }
+
+        let initial_strength = 0.3;
+        let edge = RelationshipEdge {
+            uuid: Uuid::new_v4(), // add_relationship() will assign a new UUID
+            from_entity: from_uuid,
+            to_entity: to_uuid,
+            relation_type: RelationType::RelatedTo,
+            strength: initial_strength,
+            created_at: Utc::now(),
+            valid_at: Utc::now(),
+            invalidated_at: None,
+            source_episode_id: None,
+            context: "feedback test".to_string(),
+            last_activated: Utc::now(),
+            activation_count: 1,
+            ltp_status: LtpStatus::None,
+            activation_timestamps: None,
+            tier: EdgeTier::L2Episodic,
+            entity_confidence: None,
+            forman_curvature: None,
+            endpoint_selectivity: None,
+            provenance: Vec::new(),
+        };
+        let edge_uuid = graph.add_relationship(edge).unwrap();
+
+        // Simulate "Helpful" feedback → strengthen
+        let count = graph.batch_strengthen_synapses(&[edge_uuid]).unwrap();
+        assert_eq!(count, 1, "Should have strengthened 1 edge");
+
+        let updated = graph.get_relationship(&edge_uuid).unwrap().unwrap();
+        assert!(
+            updated.strength > initial_strength,
+            "Edge strength should increase after Helpful feedback: {} -> {}",
+            initial_strength,
+            updated.strength
+        );
+    }
+
+    #[test]
+    fn test_strengthen_with_importance_scales_boost() {
+        // Verify: high-importance strengthening produces stronger edges than low-importance,
+        // and low-importance still strengthens (floor = STRENGTHEN_IMPORTANCE_FLOOR = 0.2).
+        let temp_dir = tempfile::tempdir().unwrap();
+        let graph = GraphMemory::new(temp_dir.path(), None).unwrap();
+
+        // Use separate entity pairs so add_relationship doesn't dedup
+        // (same from+to+relation_type gets merged into existing edge)
+        let high_from = Uuid::new_v4();
+        let high_to = Uuid::new_v4();
+        let low_from = Uuid::new_v4();
+        let low_to = Uuid::new_v4();
+
+        for (uuid, name) in [
+            (high_from, "HighFrom"),
+            (high_to, "HighTo"),
+            (low_from, "LowFrom"),
+            (low_to, "LowTo"),
+        ] {
+            let entity = EntityNode {
+                uuid,
+                name: name.to_string(),
+                labels: vec![EntityLabel::Concept],
+                created_at: Utc::now(),
+                last_seen_at: Utc::now(),
+                mention_count: 1,
+                summary: String::new(),
+                attributes: std::collections::HashMap::new(),
+                name_embedding: None,
+                salience: 0.5,
+                is_proper_noun: false,
+                selectivity: None,
+                fine_type: None,
+            };
+            graph.add_entity(entity).unwrap();
+        }
+
+        let initial_strength = 0.3;
+
+        let make_edge = |from: Uuid, to: Uuid| RelationshipEdge {
+            uuid: Uuid::new_v4(),
+            from_entity: from,
+            to_entity: to,
+            relation_type: RelationType::RelatedTo,
+            strength: initial_strength,
+            created_at: Utc::now(),
+            valid_at: Utc::now(),
+            invalidated_at: None,
+            source_episode_id: None,
+            context: "importance test".to_string(),
+            last_activated: Utc::now(),
+            activation_count: 1,
+            ltp_status: LtpStatus::None,
+            activation_timestamps: None,
+            tier: EdgeTier::L2Episodic,
+            entity_confidence: None,
+            forman_curvature: None,
+            endpoint_selectivity: None,
+            provenance: Vec::new(),
+        };
+
+        let high_edge_uuid = graph
+            .add_relationship(make_edge(high_from, high_to))
+            .unwrap();
+        let low_edge_uuid = graph.add_relationship(make_edge(low_from, low_to)).unwrap();
+
+        // Strengthen with high importance (1.0) — should get full boost
+        graph
+            .batch_strengthen_synapses_with_importance(&[high_edge_uuid], 1.0)
+            .unwrap();
+
+        // Strengthen with low importance (0.0) — should get floor boost (0.2x)
+        graph
+            .batch_strengthen_synapses_with_importance(&[low_edge_uuid], 0.0)
+            .unwrap();
+
+        let high_edge = graph.get_relationship(&high_edge_uuid).unwrap().unwrap();
+        let low_edge = graph.get_relationship(&low_edge_uuid).unwrap().unwrap();
+
+        // Both should be stronger than initial
+        assert!(
+            high_edge.strength > initial_strength,
+            "High-importance edge should strengthen: {} > {}",
+            high_edge.strength,
+            initial_strength
+        );
+        assert!(
+            low_edge.strength > initial_strength,
+            "Low-importance edge should still strengthen (floor=0.2): {} > {}",
+            low_edge.strength,
+            initial_strength
+        );
+
+        // High-importance should be stronger than low-importance
+        assert!(
+            high_edge.strength > low_edge.strength,
+            "High-importance edge should be stronger: {} > {}",
+            high_edge.strength,
+            low_edge.strength
+        );
+
+        // Verify the ratio roughly matches expected scaling:
+        // high boost ≈ base * 1.0, low boost ≈ base * 0.2
+        let high_delta = high_edge.strength - initial_strength;
+        let low_delta = low_edge.strength - initial_strength;
+        let ratio = high_delta / low_delta;
+        // Expected ratio ≈ 1.0 / 0.2 = 5.0 (not exact due to (1-strength) term)
+        assert!(
+            ratio > 3.0 && ratio < 7.0,
+            "Boost ratio should be ~5x (floor=0.2), got {:.2}x (high_delta={:.4}, low_delta={:.4})",
+            ratio,
+            high_delta,
+            low_delta
+        );
+    }
+
+    // =========================================================================
+    // Forman-Ricci Curvature Tests
+    // Reference: Leal, Restrepo, Stadler, Jost (2018) arXiv:1811.07825
+    // =========================================================================
+
+    /// Helper: create an entity node with a given name
+    fn make_entity(graph: &GraphMemory, name: &str) -> Uuid {
+        let uuid = Uuid::new_v4();
+        let entity = EntityNode {
+            uuid,
+            name: name.to_string(),
+            labels: vec![EntityLabel::Concept],
+            created_at: Utc::now(),
+            last_seen_at: Utc::now(),
+            mention_count: 1,
+            summary: String::new(),
+            attributes: std::collections::HashMap::new(),
+            name_embedding: None,
+            salience: 0.5,
+            is_proper_noun: false,
+            selectivity: None,
+            fine_type: None,
+        };
+        // add_entity may dedup and return a different UUID
+        graph.add_entity(entity).unwrap()
+    }
+
+    #[test]
+    fn alias_resolves_surface_to_canonical() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let graph = GraphMemory::new(temp_dir.path(), None).unwrap();
+
+        let dali = make_entity(&graph, "Dali");
+        graph.put_alias("cargo ship", dali).unwrap();
+
+        // Direct resolution, case-insensitive; unknown surfaces miss.
+        assert_eq!(graph.resolve_alias("cargo ship"), Some(dali));
+        assert_eq!(graph.resolve_alias("Cargo Ship"), Some(dali));
+        assert_eq!(graph.resolve_alias("unknown surface"), None);
+
+        // find_entity_by_name redirects the alias to the canonical node (Tier 0).
+        let found = graph.find_entity_by_name("cargo ship").unwrap().unwrap();
+        assert_eq!(found.uuid, dali);
+        assert_eq!(found.name, "Dali");
+    }
+
+    #[test]
+    fn aliases_persist_across_reopen() {
+        // "Canonical set stable across re-runs": the alias table is CF-backed and
+        // reloads into the in-memory index on open.
+        let temp_dir = tempfile::tempdir().unwrap();
+        let dali = {
+            let graph = GraphMemory::new(temp_dir.path(), None).unwrap();
+            let dali = make_entity(&graph, "Dali");
+            graph.put_alias("the vessel", dali).unwrap();
+            assert_eq!(graph.resolve_alias("the vessel"), Some(dali));
+            dali
+        };
+        let graph = GraphMemory::new(temp_dir.path(), None).unwrap();
+        assert_eq!(graph.resolve_alias("the vessel"), Some(dali));
+        assert_eq!(
+            graph
+                .find_entity_by_name("the vessel")
+                .unwrap()
+                .unwrap()
+                .name,
+            "Dali"
+        );
+    }
+
+    #[test]
+    fn seed_aliases_writes_batch() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let graph = GraphMemory::new(temp_dir.path(), None).unwrap();
+        let bridge = make_entity(&graph, "Francis Scott Key Bridge");
+
+        let written = graph
+            .seed_aliases([
+                ("Key Bridge".to_string(), bridge),
+                ("the bridge".to_string(), bridge),
+                ("   ".to_string(), bridge), // blank surface is skipped
+            ])
+            .unwrap();
+
+        assert_eq!(written, 2, "blank surface must be skipped");
+        assert_eq!(graph.resolve_alias("key bridge"), Some(bridge));
+        assert_eq!(graph.resolve_alias("the bridge"), Some(bridge));
+        assert_eq!(graph.alias_count(), 2);
+    }
+
+    #[test]
+    fn dangling_alias_falls_through_to_name_lookup() {
+        // An alias pointing at a non-existent canonical UUID must not shadow the
+        // real entity of that surface: Tier 0 returns None, the tiers continue.
+        let temp_dir = tempfile::tempdir().unwrap();
+        let graph = GraphMemory::new(temp_dir.path(), None).unwrap();
+        let real = make_entity(&graph, "Baltimore");
+        graph.put_alias("baltimore", Uuid::new_v4()).unwrap();
+
+        let found = graph.find_entity_by_name("Baltimore").unwrap().unwrap();
+        assert_eq!(
+            found.uuid, real,
+            "dangling alias must not shadow the real node"
+        );
+    }
+
+    #[test]
+    fn clear_all_wipes_aliases() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let graph = GraphMemory::new(temp_dir.path(), None).unwrap();
+        let dali = make_entity(&graph, "Dali");
+        graph.put_alias("cargo ship", dali).unwrap();
+        assert_eq!(graph.alias_count(), 1);
+
+        graph.clear_all().unwrap();
+        assert_eq!(graph.alias_count(), 0, "GDPR erasure must wipe aliases");
+        assert_eq!(graph.resolve_alias("cargo ship"), None);
+    }
+
+    #[test]
+    fn causal_spine_noops_without_parser() {
+        // No SHODH_SPACY_MODEL_PATH in unit tests → the causal-spine pass is a
+        // graceful no-op (additive, never load-bearing for ingest).
+        let temp_dir = tempfile::tempdir().unwrap();
+        let graph = GraphMemory::new(temp_dir.path(), None).unwrap();
+        let ship = make_entity(&graph, "ship");
+        let bridge = make_entity(&graph, "bridge");
+        let entities = vec![
+            ("ship".to_string(), ship, EntityLabel::Concept),
+            ("bridge".to_string(), bridge, EntityLabel::Concept),
+        ];
+        if crate::dep_parser::is_available() {
+            return;
+        }
+        let minted = graph.mint_causal_spine_edges(
+            "the ship rammed the bridge, causing the collapse",
+            &entities,
+            Uuid::new_v4(),
+            Utc::now(),
+        );
+        assert_eq!(minted, 0, "no parser → no causal-spine edges");
+    }
+
+    /// Helper: create a directed edge from → to
+    fn make_edge(graph: &GraphMemory, from: Uuid, to: Uuid) -> Uuid {
+        let edge = RelationshipEdge {
+            uuid: Uuid::new_v4(),
+            from_entity: from,
+            to_entity: to,
+            relation_type: RelationType::RelatedTo,
+            strength: 0.5,
+            created_at: Utc::now(),
+            valid_at: Utc::now(),
+            invalidated_at: None,
+            source_episode_id: None,
+            context: String::new(),
+            last_activated: Utc::now(),
+            activation_count: 1,
+            ltp_status: LtpStatus::None,
+            activation_timestamps: None,
+            tier: EdgeTier::L2Episodic,
+            entity_confidence: None,
+            forman_curvature: None,
+            endpoint_selectivity: None,
+            provenance: Vec::new(),
+        };
+        graph.add_relationship(edge).unwrap()
+    }
+
+    #[test]
+    fn test_forman_curvature_isolated_edge() {
+        // Single edge A → B: deg(A) = 1, deg(B) = 1
+        // F(e) = 4 - 1 - 1 = 2 (positive = tight community)
+        let temp_dir = tempfile::tempdir().unwrap();
+        let graph = GraphMemory::new(temp_dir.path(), None).unwrap();
+
+        let a = make_entity(&graph, "NodeA");
+        let b = make_entity(&graph, "NodeB");
+        let edge_id = make_edge(&graph, a, b);
+
+        let stats = graph.compute_forman_ricci_curvature().unwrap();
+        assert_eq!(stats.edges_computed, 1);
+        assert_eq!(stats.positive_count, 1);
+        assert_eq!(stats.negative_count, 0);
+
+        let edge = graph.get_relationship(&edge_id).unwrap().unwrap();
+        let curv = edge.forman_curvature.expect("curvature should be computed");
+        // F(e) = 4 - deg(A) - deg(B) = 4 - 1 - 1 = 2
+        assert!(
+            (curv - 2.0).abs() < f32::EPSILON,
+            "Isolated edge curvature should be 2.0, got {}",
+            curv
+        );
+    }
+
+    #[test]
+    fn test_forman_curvature_hub_topology() {
+        // Star topology: Hub → {A, B, C, D}
+        // For edge Hub→A: deg(Hub) = 4 (out), deg(A) = 1 (in)
+        //   in_deg(Hub) = 0, out_deg(Hub) = 4
+        //   in_deg(A) = 1, out_deg(A) = 0
+        //   F(→e→) = 2 - in(Hub) - out(A) = 2 - 0 - 0 = 2
+        //   F(←e←) = 2 - out(Hub) - in(A) = 2 - 4 - 1 = -3
+        //   F(e) = 2 + (-3) = -1
+        // Equivalently: F(e) = 4 - deg(Hub) - deg(A) = 4 - 4 - 1 = -1
+        let temp_dir = tempfile::tempdir().unwrap();
+        let graph = GraphMemory::new(temp_dir.path(), None).unwrap();
+
+        let hub = make_entity(&graph, "Hub");
+        let a = make_entity(&graph, "SpokeA");
+        let b = make_entity(&graph, "SpokeB");
+        let c = make_entity(&graph, "SpokeC");
+        let d = make_entity(&graph, "SpokeD");
+
+        let edge_a = make_edge(&graph, hub, a);
+        make_edge(&graph, hub, b);
+        make_edge(&graph, hub, c);
+        make_edge(&graph, hub, d);
+
+        let stats = graph.compute_forman_ricci_curvature().unwrap();
+        assert_eq!(stats.edges_computed, 4);
+        // All edges should have negative curvature (hub bridges)
+        assert_eq!(
+            stats.negative_count, 4,
+            "All hub edges should be negative, got {} negative",
+            stats.negative_count
+        );
+
+        let edge = graph.get_relationship(&edge_a).unwrap().unwrap();
+        let curv = edge.forman_curvature.unwrap();
+        // F(e) = 4 - 4 - 1 = -1
+        assert!(
+            (curv - (-1.0)).abs() < f32::EPSILON,
+            "Hub→Spoke curvature should be -1.0, got {}",
+            curv
+        );
+    }
+
+    #[test]
+    fn test_forman_curvature_triangle() {
+        // Triangle: A→B, B→C, C→A
+        // Each node: in_deg=1, out_deg=1, total deg=2
+        // F(e) = 4 - 2 - 2 = 0 (neutral / transitional)
+        let temp_dir = tempfile::tempdir().unwrap();
+        let graph = GraphMemory::new(temp_dir.path(), None).unwrap();
+
+        let a = make_entity(&graph, "TriA");
+        let b = make_entity(&graph, "TriB");
+        let c = make_entity(&graph, "TriC");
+
+        make_edge(&graph, a, b);
+        make_edge(&graph, b, c);
+        make_edge(&graph, c, a);
+
+        let stats = graph.compute_forman_ricci_curvature().unwrap();
+        assert_eq!(stats.edges_computed, 3);
+        assert_eq!(
+            stats.zero_count, 3,
+            "Triangle edges should all be zero curvature"
+        );
+        assert!(
+            stats.mean_curvature.abs() < f32::EPSILON,
+            "Mean curvature of triangle should be 0.0, got {}",
+            stats.mean_curvature
+        );
+    }
+
+    #[test]
+    fn test_forman_curvature_empty_graph() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let graph = GraphMemory::new(temp_dir.path(), None).unwrap();
+
+        let stats = graph.compute_forman_ricci_curvature().unwrap();
+        assert_eq!(stats.edges_computed, 0);
+        assert_eq!(stats.mean_curvature, 0.0);
+    }
+
+    #[test]
+    fn test_forman_curvature_bridge_detection() {
+        // Two triangles connected by a bridge:
+        // Triangle 1: A→B, B→C, C→A
+        // Bridge: C→D
+        // Triangle 2: D→E, E→F, F→D
+        //
+        // Bridge edge C→D: deg(C) = 3 (in from B, out to A, out to D)
+        //                  deg(D) = 3 (in from C, in from F, out to E)
+        // F(C→D) = 4 - 3 - 3 = -2 (most negative = bottleneck)
+        let temp_dir = tempfile::tempdir().unwrap();
+        let graph = GraphMemory::new(temp_dir.path(), None).unwrap();
+
+        let a = make_entity(&graph, "BridgeA");
+        let b = make_entity(&graph, "BridgeB");
+        let c = make_entity(&graph, "BridgeC");
+        let d = make_entity(&graph, "BridgeD");
+        let e = make_entity(&graph, "BridgeE");
+        let f = make_entity(&graph, "BridgeF");
+
+        // Triangle 1
+        make_edge(&graph, a, b);
+        make_edge(&graph, b, c);
+        make_edge(&graph, c, a);
+        // Bridge
+        let bridge_id = make_edge(&graph, c, d);
+        // Triangle 2
+        make_edge(&graph, d, e);
+        make_edge(&graph, e, f);
+        make_edge(&graph, f, d);
+
+        let stats = graph.compute_forman_ricci_curvature().unwrap();
+        assert_eq!(stats.edges_computed, 7);
+
+        // Bridge should be the most negative edge
+        let bridge = graph.get_relationship(&bridge_id).unwrap().unwrap();
+        let bridge_curv = bridge.forman_curvature.unwrap();
+        assert!(
+            bridge_curv <= stats.min_curvature + f32::EPSILON,
+            "Bridge should be among most negative edges: bridge={}, min={}",
+            bridge_curv,
+            stats.min_curvature
+        );
+        assert!(
+            bridge_curv < 0.0,
+            "Bridge curvature should be negative, got {}",
+            bridge_curv
+        );
+    }
+
+    #[test]
+    fn test_selectivity_hub_vs_concept() {
+        // Hub connected to many unrelated spokes → uniform curvature → LOW selectivity
+        // Concept node in a tight cluster → varied curvature → HIGH selectivity
+        //
+        // Topology:
+        //   Hub → {S1, S2, S3, S4, S5, S6}  (star — uniform edges)
+        //   A → B → C → A  (triangle — tight community)
+        //   A → Hub  (bridge connecting triangle to star)
+        //
+        // Hub: all incident edges have similar curvature (uniform negative)
+        //   → low stdev/degree → low selectivity
+        // A: participates in triangle (curvature=0-ish) AND bridge to hub (curvature<<0)
+        //   → high stdev across incident edges → high selectivity
+        let temp_dir = tempfile::tempdir().unwrap();
+        let graph = GraphMemory::new(temp_dir.path(), None).unwrap();
+
+        let hub = make_entity(&graph, "SelectHub");
+        let s1 = make_entity(&graph, "Spoke1");
+        let s2 = make_entity(&graph, "Spoke2");
+        let s3 = make_entity(&graph, "Spoke3");
+        let s4 = make_entity(&graph, "Spoke4");
+        let s5 = make_entity(&graph, "Spoke5");
+        let s6 = make_entity(&graph, "Spoke6");
+        let a = make_entity(&graph, "ConceptA");
+        let b = make_entity(&graph, "ConceptB");
+        let c = make_entity(&graph, "ConceptC");
+
+        // Star
+        make_edge(&graph, hub, s1);
+        make_edge(&graph, hub, s2);
+        make_edge(&graph, hub, s3);
+        make_edge(&graph, hub, s4);
+        make_edge(&graph, hub, s5);
+        make_edge(&graph, hub, s6);
+
+        // Triangle
+        make_edge(&graph, a, b);
+        make_edge(&graph, b, c);
+        make_edge(&graph, c, a);
+
+        // Bridge
+        make_edge(&graph, a, hub);
+
+        graph.compute_forman_ricci_curvature().unwrap();
+
+        let hub_entity = graph.get_entity(&hub).unwrap().unwrap();
+        let a_entity = graph.get_entity(&a).unwrap().unwrap();
+
+        let hub_sel = hub_entity.selectivity.expect("hub should have selectivity");
+        let a_sel = a_entity
+            .selectivity
+            .expect("concept A should have selectivity");
+
+        // Concept node A should have higher selectivity than the hub
+        // because A's incident edges span different curvature regimes
+        assert!(
+            a_sel > hub_sel,
+            "Concept node selectivity ({}) should exceed hub selectivity ({})",
+            a_sel,
+            hub_sel
+        );
+    }
+
+    #[test]
+    fn test_selectivity_gated_ltp_decay() {
+        // Two edges with identical LTP (Full) but different endpoint_selectivity.
+        // Low-selectivity edge should decay MORE (less LTP protection).
+        // High-selectivity edge should decay LESS (full LTP protection).
+        let now = Utc::now();
+        let one_hour_ago = now - chrono::Duration::hours(1);
+
+        let mut low_sel_edge = RelationshipEdge {
+            uuid: Uuid::new_v4(),
+            from_entity: Uuid::new_v4(),
+            to_entity: Uuid::new_v4(),
+            relation_type: RelationType::RelatedTo,
+            strength: 0.8,
+            created_at: one_hour_ago,
+            valid_at: one_hour_ago,
+            invalidated_at: None,
+            source_episode_id: None,
+            context: String::new(),
+            last_activated: one_hour_ago,
+            activation_count: 20,
+            ltp_status: LtpStatus::Full,
+            activation_timestamps: None,
+            tier: EdgeTier::L2Episodic,
+            entity_confidence: None,
+            forman_curvature: Some(-5.0),
+            endpoint_selectivity: Some(0.05), // very low = stop-word
+            provenance: Vec::new(),
+        };
+
+        let mut high_sel_edge = RelationshipEdge {
+            uuid: Uuid::new_v4(),
+            from_entity: Uuid::new_v4(),
+            to_entity: Uuid::new_v4(),
+            relation_type: RelationType::RelatedTo,
+            strength: 0.8,
+            created_at: one_hour_ago,
+            valid_at: one_hour_ago,
+            invalidated_at: None,
+            source_episode_id: None,
+            context: String::new(),
+            last_activated: one_hour_ago,
+            activation_count: 20,
+            ltp_status: LtpStatus::Full,
+            activation_timestamps: None,
+            tier: EdgeTier::L2Episodic,
+            entity_confidence: None,
+            forman_curvature: Some(-5.0),
+            endpoint_selectivity: Some(2.0), // high = concept, above threshold
+            provenance: Vec::new(),
+        };
+
+        low_sel_edge.decay();
+        high_sel_edge.decay();
+
+        // Both started at 0.8. Low-selectivity should have decayed more.
+        assert!(
+            low_sel_edge.strength < high_sel_edge.strength,
+            "Low-selectivity edge ({}) should decay more than high-selectivity edge ({})",
+            low_sel_edge.strength,
+            high_sel_edge.strength
+        );
+
+        // High-selectivity edge with Full LTP should retain most of its strength
+        // LTP_DECAY_FACTOR = 0.1 → 10x slower decay → after 1 hour should be ~0.79+
+        assert!(
+            high_sel_edge.strength > 0.7,
+            "High-selectivity Full LTP edge should retain most strength, got {}",
+            high_sel_edge.strength
+        );
+    }
+
+    #[test]
+    fn test_selectivity_none_preserves_ltp() {
+        // Edge with endpoint_selectivity=None (not yet computed) should get
+        // full LTP protection — conservative default.
+        let now = Utc::now();
+        let one_hour_ago = now - chrono::Duration::hours(1);
+
+        let mut edge_none = RelationshipEdge {
+            uuid: Uuid::new_v4(),
+            from_entity: Uuid::new_v4(),
+            to_entity: Uuid::new_v4(),
+            relation_type: RelationType::RelatedTo,
+            strength: 0.8,
+            created_at: one_hour_ago,
+            valid_at: one_hour_ago,
+            invalidated_at: None,
+            source_episode_id: None,
+            context: String::new(),
+            last_activated: one_hour_ago,
+            activation_count: 20,
+            ltp_status: LtpStatus::Full,
+            activation_timestamps: None,
+            tier: EdgeTier::L2Episodic,
+            entity_confidence: None,
+            forman_curvature: None,
+            endpoint_selectivity: None, // not computed yet
+            provenance: Vec::new(),
+        };
+
+        let mut edge_high = RelationshipEdge {
+            uuid: Uuid::new_v4(),
+            from_entity: Uuid::new_v4(),
+            to_entity: Uuid::new_v4(),
+            relation_type: RelationType::RelatedTo,
+            strength: 0.8,
+            created_at: one_hour_ago,
+            valid_at: one_hour_ago,
+            invalidated_at: None,
+            source_episode_id: None,
+            context: String::new(),
+            last_activated: one_hour_ago,
+            activation_count: 20,
+            ltp_status: LtpStatus::Full,
+            activation_timestamps: None,
+            tier: EdgeTier::L2Episodic,
+            entity_confidence: None,
+            forman_curvature: Some(-2.0),
+            endpoint_selectivity: Some(5.0), // high selectivity
+            provenance: Vec::new(),
+        };
+
+        edge_none.decay();
+        edge_high.decay();
+
+        // Both should get full LTP protection, so strengths should be equal
+        let diff = (edge_none.strength - edge_high.strength).abs();
+        assert!(
+            diff < 0.001,
+            "None selectivity should match high selectivity: none={}, high={}, diff={}",
+            edge_none.strength,
+            edge_high.strength,
+            diff
+        );
+    }
+
+    #[test]
+    fn test_endpoint_selectivity_written_to_edges() {
+        // After compute_forman_ricci_curvature(), edges should have
+        // endpoint_selectivity set based on their source entity's selectivity.
+        let temp_dir = tempfile::tempdir().unwrap();
+        let graph = GraphMemory::new(temp_dir.path(), None).unwrap();
+
+        let a = make_entity(&graph, "EndpointA");
+        let b = make_entity(&graph, "EndpointB");
+        let c = make_entity(&graph, "EndpointC");
+
+        let e1 = make_edge(&graph, a, b);
+        let e2 = make_edge(&graph, b, c);
+
+        graph.compute_forman_ricci_curvature().unwrap();
+
+        let edge1 = graph.get_relationship(&e1).unwrap().unwrap();
+        let edge2 = graph.get_relationship(&e2).unwrap().unwrap();
+
+        // All edges should have endpoint_selectivity set after curvature pass
+        assert!(
+            edge1.endpoint_selectivity.is_some(),
+            "Edge 1 should have endpoint_selectivity after curvature computation"
+        );
+        assert!(
+            edge2.endpoint_selectivity.is_some(),
+            "Edge 2 should have endpoint_selectivity after curvature computation"
+        );
+
+        // A has degree 1 (only outgoing to B) — selectivity = stdev/degree = 0/1 = 0
+        // B has degree 2 (in from A, out to C) — selectivity = stdev/degree
+        let entity_a = graph.get_entity(&a).unwrap().unwrap();
+        let entity_b = graph.get_entity(&b).unwrap().unwrap();
+        assert!(
+            entity_a.selectivity.is_some(),
+            "Entity A should have selectivity"
+        );
+        assert!(
+            entity_b.selectivity.is_some(),
+            "Entity B should have selectivity"
+        );
+    }
+
+    #[test]
+    fn test_entity_reputation_returns_none_for_unknown() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let graph = GraphMemory::new(temp_dir.path(), None).unwrap();
+        assert!(graph.get_entity_reputation("nonexistent").is_none());
+    }
+
+    #[test]
+    fn test_entity_reputation_reflects_graph_state() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let graph = GraphMemory::new(temp_dir.path(), None).unwrap();
+
+        let hub = make_entity(&graph, "HubEntity");
+        let a = make_entity(&graph, "SpokeA");
+        let b = make_entity(&graph, "SpokeB");
+        let c = make_entity(&graph, "SpokeC");
+
+        make_edge(&graph, hub, a);
+        make_edge(&graph, hub, b);
+        make_edge(&graph, hub, c);
+        make_edge(&graph, a, b); // give a,b some edges too
+
+        graph.compute_forman_ricci_curvature().unwrap();
+
+        let rep = graph.get_entity_reputation("HubEntity").unwrap();
+        assert_eq!(rep.degree, 3);
+        assert_eq!(rep.mention_count, 1);
+        // Hub has lower selectivity than spokes
+        let rep_a = graph.get_entity_reputation("SpokeA").unwrap();
+        assert!(
+            rep.selectivity <= rep_a.selectivity || rep.degree > rep_a.degree,
+            "Hub should have lower selectivity or higher degree than spoke"
+        );
+    }
+
+    #[test]
+    fn test_entity_reputation_case_insensitive() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let graph = GraphMemory::new(temp_dir.path(), None).unwrap();
+        make_entity(&graph, "TestEntity");
+        assert!(graph.get_entity_reputation("testentity").is_some());
+        assert!(graph.get_entity_reputation("TESTENTITY").is_some());
+    }
+
+    #[test]
+    fn test_get_all_episodes() {
+        let dir = tempfile::tempdir().unwrap();
+        let graph = GraphMemory::new(dir.path(), None).unwrap();
+
+        // Empty graph returns empty vec
+        let episodes = graph.get_all_episodes().unwrap();
+        assert!(episodes.is_empty(), "Expected empty vec for fresh graph");
+
+        // Add an episode
+        let now = Utc::now();
+        let episode = EpisodicNode {
+            uuid: Uuid::new_v4(),
+            name: "Test Episode".to_string(),
+            content: "Test content for get_all_episodes".to_string(),
+            valid_at: now,
+            created_at: now,
+            entity_refs: Vec::new(),
+            source: EpisodeSource::Message,
+            metadata: std::collections::HashMap::new(),
+        };
+        let episode_uuid = episode.uuid;
+        let episode_name = episode.name.clone();
+        let episode_content = episode.content.clone();
+        graph.add_episode(episode).unwrap();
+
+        // Verify it's returned
+        let episodes = graph.get_all_episodes().unwrap();
+        assert_eq!(episodes.len(), 1, "Expected one episode");
+
+        // Verify fields match
+        let returned = &episodes[0];
+        assert_eq!(returned.uuid, episode_uuid);
+        assert_eq!(returned.name, episode_name);
+        assert_eq!(returned.content, episode_content);
+        assert_eq!(returned.source, EpisodeSource::Message);
+    }
+
+    #[test]
+    fn test_infer_relation_person_org() {
+        assert_eq!(
+            infer_relation_type_for_pair(&EntityLabel::Person, &EntityLabel::Organization),
+            RelationType::WorksAt
+        );
+    }
+
+    #[test]
+    fn test_infer_relation_person_technology() {
+        assert_eq!(
+            infer_relation_type_for_pair(&EntityLabel::Person, &EntityLabel::Technology),
+            RelationType::Uses
+        );
+    }
+
+    #[test]
+    fn test_infer_relation_service_database() {
+        assert_eq!(
+            infer_relation_type_for_pair(&EntityLabel::Service, &EntityLabel::Database),
+            RelationType::Uses
+        );
+    }
+
+    #[test]
+    fn test_infer_relation_module_module() {
+        assert_eq!(
+            infer_relation_type_for_pair(&EntityLabel::Module, &EntityLabel::Module),
+            RelationType::DependsOn
+        );
+    }
+
+    #[test]
+    fn test_infer_relation_pipeline_env() {
+        assert_eq!(
+            infer_relation_type_for_pair(&EntityLabel::Pipeline, &EntityLabel::Environment),
+            RelationType::DeploysTo
+        );
+    }
+
+    #[test]
+    fn test_infer_relation_config_service() {
+        assert_eq!(
+            infer_relation_type_for_pair(&EntityLabel::Configuration, &EntityLabel::Service),
+            RelationType::Configures
+        );
+    }
+
+    #[test]
+    fn test_infer_relation_task_project() {
+        assert_eq!(
+            infer_relation_type_for_pair(&EntityLabel::Task, &EntityLabel::Project),
+            RelationType::PartOf
+        );
+    }
+
+    #[test]
+    fn test_infer_relation_default_cooccurs() {
+        assert_eq!(
+            infer_relation_type_for_pair(&EntityLabel::Concept, &EntityLabel::Event),
+            RelationType::CoOccurs
+        );
+    }
+
+    // ===================================================================
+    // Increment 1: robust edge provenance
+    // ===================================================================
+
+    /// Build a typed edge between two entities attributed to a source episode.
+    fn provenance_edge(from: Uuid, to: Uuid, source_episode_id: Uuid) -> RelationshipEdge {
+        let now = Utc::now();
+        RelationshipEdge {
+            uuid: Uuid::new_v4(),
+            from_entity: from,
+            to_entity: to,
+            // A non-generic type so find_relationship_between_typed matches a
+            // single edge across re-attestations.
+            relation_type: RelationType::WorksWith,
+            strength: 0.5,
+            created_at: now,
+            valid_at: now,
+            invalidated_at: None,
+            source_episode_id: Some(source_episode_id),
+            context: String::new(),
+            last_activated: now,
+            activation_count: 1,
+            ltp_status: LtpStatus::None,
+            activation_timestamps: None,
+            tier: EdgeTier::L2Episodic,
+            entity_confidence: Some(0.9),
+            forman_curvature: None,
+            endpoint_selectivity: None,
+            provenance: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn test_provenance_create_seeds_from_source_episode() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let graph = GraphMemory::new(temp_dir.path(), None).unwrap();
+
+        let a = make_entity(&graph, "ProvCreateA");
+        let b = make_entity(&graph, "ProvCreateB");
+        let episode = Uuid::new_v4();
+
+        let edge_id = graph
+            .add_relationship(provenance_edge(a, b, episode))
+            .unwrap();
+
+        let edge = graph.get_relationship(&edge_id).unwrap().unwrap();
+        assert_eq!(
+            edge.provenance.len(),
+            1,
+            "create path must seed exactly one provenance record"
+        );
+        assert_eq!(edge.provenance[0].source_episode_id, episode);
+        assert_eq!(edge.provenance[0].mention_count, 1);
+        assert_eq!(
+            edge.provenance[0].confidence,
+            Some(0.9),
+            "confidence should be seeded from entity_confidence"
+        );
+    }
+
+    #[test]
+    fn test_provenance_strengthen_accumulates_sources() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let graph = GraphMemory::new(temp_dir.path(), None).unwrap();
+
+        let a = make_entity(&graph, "ProvAccA");
+        let b = make_entity(&graph, "ProvAccB");
+        let episode_a = Uuid::new_v4();
+        let episode_b = Uuid::new_v4();
+
+        // First attestation from episode A creates the edge.
+        let edge_id = graph
+            .add_relationship(provenance_edge(a, b, episode_a))
+            .unwrap();
+
+        // Second attestation from episode B must strengthen the SAME edge and
+        // ADD a provenance record — the bug was that this episode was discarded.
+        let edge_id_2 = graph
+            .add_relationship(provenance_edge(a, b, episode_b))
+            .unwrap();
+        assert_eq!(edge_id, edge_id_2, "same entity pair + type = same edge");
+
+        let edge = graph.get_relationship(&edge_id).unwrap().unwrap();
+        assert_eq!(
+            edge.provenance.len(),
+            2,
+            "strengthen must accumulate the second source episode (bug fix)"
+        );
+
+        // Re-attest from episode A: no new record, A's mention_count bumps to 2.
+        graph
+            .add_relationship(provenance_edge(a, b, episode_a))
+            .unwrap();
+        let edge = graph.get_relationship(&edge_id).unwrap().unwrap();
+        assert_eq!(
+            edge.provenance.len(),
+            2,
+            "re-attesting an existing episode must not add a record"
+        );
+        let rec_a = edge
+            .provenance
+            .iter()
+            .find(|p| p.source_episode_id == episode_a)
+            .expect("episode A record present");
+        assert_eq!(
+            rec_a.mention_count, 2,
+            "re-attested episode A must have mention_count == 2"
+        );
+    }
+
+    #[test]
+    fn test_provenance_cap_enforced() {
+        // Pin the cap low and deterministically so the test is hermetic.
+        std::env::set_var("SHODH_PROVENANCE_MAX_SOURCES", "3");
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let graph = GraphMemory::new(temp_dir.path(), None).unwrap();
+
+        let a = make_entity(&graph, "ProvCapA");
+        let b = make_entity(&graph, "ProvCapB");
+
+        // Attest from 5 distinct episodes; the trail must be capped at 3.
+        let mut episodes = Vec::new();
+        let mut edge_id = None;
+        for _ in 0..5 {
+            let ep = Uuid::new_v4();
+            episodes.push(ep);
+            edge_id = Some(graph.add_relationship(provenance_edge(a, b, ep)).unwrap());
+        }
+        let edge_id = edge_id.unwrap();
+
+        let edge = graph.get_relationship(&edge_id).unwrap().unwrap();
+        assert_eq!(
+            edge.provenance.len(),
+            3,
+            "provenance must be capped at SHODH_PROVENANCE_MAX_SOURCES"
+        );
+        // The most recently added episode must survive the cap.
+        let last_episode = *episodes.last().unwrap();
+        assert!(
+            edge.provenance
+                .iter()
+                .any(|p| p.source_episode_id == last_episode),
+            "the just-added episode must never be dropped by the cap"
+        );
+
+        std::env::remove_var("SHODH_PROVENANCE_MAX_SOURCES");
+    }
+
+    #[test]
+    fn test_provenance_serde_backward_compat() {
+        // Simulate a LEGACY edge serialized before the `provenance` field
+        // existed: a struct identical to RelationshipEdge minus that trailing
+        // field. Encoding it and decoding as the current RelationshipEdge must
+        // succeed and yield an EMPTY provenance trail (the #[serde(default)]).
+        #[derive(Serialize)]
+        struct LegacyEdge {
+            uuid: Uuid,
+            from_entity: Uuid,
+            to_entity: Uuid,
+            relation_type: RelationType,
+            strength: f32,
+            created_at: DateTime<Utc>,
+            valid_at: DateTime<Utc>,
+            invalidated_at: Option<DateTime<Utc>>,
+            source_episode_id: Option<Uuid>,
+            context: String,
+            last_activated: DateTime<Utc>,
+            activation_count: u32,
+            ltp_status: LtpStatus,
+            tier: EdgeTier,
+            activation_timestamps: Option<VecDeque<DateTime<Utc>>>,
+            entity_confidence: Option<f32>,
+            endpoint_selectivity: Option<f32>,
+            forman_curvature: Option<f32>,
+        }
+
+        let legacy = LegacyEdge {
+            uuid: Uuid::new_v4(),
+            from_entity: Uuid::new_v4(),
+            to_entity: Uuid::new_v4(),
+            relation_type: RelationType::WorksWith,
+            strength: 0.42,
+            created_at: Utc::now(),
+            valid_at: Utc::now(),
+            invalidated_at: None,
+            source_episode_id: Some(Uuid::new_v4()),
+            context: "legacy".to_string(),
+            last_activated: Utc::now(),
+            activation_count: 7,
+            ltp_status: LtpStatus::None,
+            tier: EdgeTier::L2Episodic,
+            activation_timestamps: None,
+            entity_confidence: Some(0.5),
+            endpoint_selectivity: None,
+            forman_curvature: None,
+        };
+
+        let bytes = crate::serialization::encode(&legacy).unwrap();
+
+        // Postcard is NOT self-describing: a record missing the trailing
+        // `provenance` field cannot be decoded by the plain `decode` path (it
+        // runs off the end of the buffer), so `#[serde(default)]` alone does not
+        // grant backward-compat. The edge read path goes through
+        // `decode_relationship_edge`, which supplies the field's postcard default
+        // on EOF — that is the path production uses, so that is what we assert.
+        assert!(
+            crate::serialization::decode::<RelationshipEdge>(&bytes).is_err(),
+            "plain postcard decode of a pre-provenance edge must fail on EOF"
+        );
+
+        let (decoded, needs_migration) = decode_relationship_edge(&bytes).unwrap();
+        assert!(
+            needs_migration,
+            "a pre-provenance edge should be flagged for rewrite"
+        );
+        assert_eq!(decoded.strength, 0.42);
+        assert_eq!(decoded.activation_count, 7);
+        assert_eq!(decoded.context, "legacy");
+        assert_eq!(decoded.entity_confidence, Some(0.5));
+        assert!(
+            decoded.provenance.is_empty(),
+            "legacy edge without provenance must decode to an empty trail"
+        );
+
+        // Forward round-trip: a current edge WITH provenance survives both the
+        // plain decode and the compat decode unchanged (no migration needed).
+        let mut edge = provenance_edge(Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        edge.provenance = vec![ProvenanceRecord {
+            source_episode_id: Uuid::new_v4(),
+            mention_count: 3,
+            first_observed: Utc::now(),
+            last_observed: Utc::now(),
+            confidence: Some(0.8),
+            evidence_span: Some((0, 42)),
+            typed_by: Some(TypingMethod::Cue),
+        }];
+        let bytes = crate::serialization::encode(&edge).unwrap();
+        let decoded: RelationshipEdge = crate::serialization::decode(&bytes).unwrap();
+        assert_eq!(decoded.provenance.len(), 1);
+        assert_eq!(decoded.provenance[0].mention_count, 3);
+        assert_eq!(decoded.provenance[0].evidence_span, Some((0, 42)));
+        assert_eq!(decoded.provenance[0].typed_by, Some(TypingMethod::Cue));
+
+        let (decoded, needs_migration) = decode_relationship_edge(&bytes).unwrap();
+        assert!(
+            !needs_migration,
+            "a current-schema edge must not be flagged for migration"
+        );
+        assert_eq!(decoded.provenance.len(), 1);
+    }
+
+    #[test]
+    fn coactivation_strengthen_only_creates_no_new_edges() {
+        // CoRetrieved recall-time flood fix: strengthen-only must never mint a new
+        // CoRetrieved edge for a co-retrieved pair that has no prior edge.
+        let temp = tempfile::tempdir().unwrap();
+        let graph = GraphMemory::new(temp.path(), None).unwrap();
+        let mems: Vec<Uuid> = (0..5).map(|_| Uuid::new_v4()).collect();
+
+        // Default (flag off) floods all C(5,2)=10 CoRetrieved edges.
+        let created = graph.record_memory_coactivation_impl(&mems, false).unwrap();
+        assert_eq!(
+            created, 10,
+            "default coactivation floods all-pairs CoRetrieved edges"
+        );
+
+        // Strengthen-only on a FRESH graph: no existing edges => nothing created.
+        let temp2 = tempfile::tempdir().unwrap();
+        let graph2 = GraphMemory::new(temp2.path(), None).unwrap();
+        let created2 = graph2.record_memory_coactivation_impl(&mems, true).unwrap();
+        assert_eq!(
+            created2, 0,
+            "strengthen-only must create no new edges on a fresh graph"
+        );
+    }
+
+    #[test]
+    fn coactivation_strengthen_only_still_strengthens_existing() {
+        // Strengthen-only keeps the good half: it reinforces edges that already exist.
+        let temp = tempfile::tempdir().unwrap();
+        let graph = GraphMemory::new(temp.path(), None).unwrap();
+        let mems: Vec<Uuid> = (0..3).map(|_| Uuid::new_v4()).collect();
+        // First pass creates the C(3,2)=3 edges.
+        graph.record_memory_coactivation_impl(&mems, false).unwrap();
+        // Strengthen-only pass: all 3 now exist => all strengthened, none created.
+        let strengthened = graph.record_memory_coactivation_impl(&mems, true).unwrap();
+        assert_eq!(
+            strengthened, 3,
+            "strengthen-only reinforces the existing edges"
+        );
+    }
+
+    // =========================================================================
+    // W1-B measurement — articulation/bridge signal distribution on a REAL graph.
+    //
+    // The surviving demo RocksDB stores are unloadable (`demo-data/bridge/graph`
+    // has only its WAL `000004.log`; the MANIFEST/CURRENT were lost to OneDrive
+    // sync — the documented file-watcher failure mode — and `defence-live` is
+    // empty), so this uses the task's sanctioned fallback: ingest the W1-C bridge
+    // corpus through the real production pipeline (neural NER mints the entity
+    // nodes) and measure the resulting graph. Ignored (pays one full pipeline
+    // ingest; not run in CI). Run explicitly:
+    //   cargo test --lib measure_topology_signal_on_real_graph -- --ignored --nocapture
+    // Override unit count with SHODH_TOPO_MEASURE_UNITS (default 24, the e2e size).
+    // =========================================================================
+    #[test]
+    #[ignore = "pays one full pipeline ingest; run explicitly for the W1-B numbers table."]
+    fn measure_topology_signal_on_real_graph() {
+        use crate::recall_harness::bridge_harness::generate_bridge_fixtures;
+        use crate::recall_harness::runner::{build_manager, ingest_corpus, EVAL_USER};
+
+        // Deterministic single-threaded NER so the ingested topology is reproducible.
+        unsafe {
+            for (k, v) in [("SHODH_ONNX_THREADS", "1"), ("RAYON_NUM_THREADS", "1")] {
+                if std::env::var_os(k).is_none() {
+                    std::env::set_var(k, v);
+                }
+            }
+        }
+
+        let units: usize = std::env::var("SHODH_TOPO_MEASURE_UNITS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(24);
+        let fx = generate_bridge_fixtures(units, 6, 1);
+
+        let storage =
+            std::env::temp_dir().join(format!("shodh-topo-measure-{}", Uuid::new_v4().simple()));
+        let _ = std::fs::remove_dir_all(&storage);
+        let manager = build_manager(&storage).expect("build manager");
+        ingest_corpus(&manager, &fx.corpus).expect("ingest bridge corpus");
+        let graph = manager.get_user_graph(EVAL_USER).expect("user graph");
+        let edges = graph.read().get_all_relationships().expect("relationships");
+        let pairs: Vec<(Uuid, Uuid)> = edges.iter().map(|e| (e.from_entity, e.to_entity)).collect();
+
+        // Distinct entities that appear in an active edge (the structural graph).
+        let mut distinct: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
+        for (a, b) in &pairs {
+            distinct.insert(*a);
+            distinct.insert(*b);
+        }
+        let node_count = distinct.len();
+
+        let prot = crate::decay::compute_topology_protection(&pairs);
+        let artic_nodes = prot.node_protection.len(); // only critical nodes are stored
+        let bridge_edges = prot.bridge_pairs.len();
+
+        // Continuous score distribution over the critical (nonzero) nodes.
+        let mut scores: Vec<f32> = prot.node_protection.values().copied().collect();
+        scores.sort_by(|a, b| a.total_cmp(b));
+        let pct = |p: f64| -> f32 {
+            if scores.is_empty() {
+                return 0.0;
+            }
+            let idx = ((p / 100.0) * (scores.len() as f64 - 1.0)).round() as usize;
+            scores[idx.min(scores.len() - 1)]
+        };
+        let artic_frac = if node_count > 0 {
+            artic_nodes as f64 / node_count as f64
+        } else {
+            0.0
+        };
+        // Fraction of nodes above a candidate rescue floor (0.15) — the true
+        // "would be rescued" population, which the budget cap then bounds.
+        let above_floor = scores.iter().filter(|&&s| s >= 0.15).count();
+
+        eprintln!("W1B_MEASURE corpus=bridge-fixtures units={units}");
+        eprintln!(
+            "W1B_MEASURE nodes={node_count} active_edges={} distinct_undirected_edges={}",
+            pairs.len(),
+            {
+                let mut u: std::collections::HashSet<(Uuid, Uuid)> =
+                    std::collections::HashSet::new();
+                for (a, b) in &pairs {
+                    if a != b {
+                        u.insert(if a <= b { (*a, *b) } else { (*b, *a) });
+                    }
+                }
+                u.len()
+            }
+        );
+        eprintln!(
+            "W1B_MEASURE critical_nodes={artic_nodes} articulation_fraction={artic_frac:.4} bridge_edges={bridge_edges}"
+        );
+        eprintln!(
+            "W1B_MEASURE score_pctile p50={:.3} p75={:.3} p90={:.3} p95={:.3} p99={:.3} max={:.3}",
+            pct(50.0),
+            pct(75.0),
+            pct(90.0),
+            pct(95.0),
+            pct(99.0),
+            scores.last().copied().unwrap_or(0.0)
+        );
+        eprintln!(
+            "W1B_MEASURE nodes_at_or_above_0.15={above_floor} ({:.4} of all nodes)",
+            if node_count > 0 {
+                above_floor as f64 / node_count as f64
+            } else {
+                0.0
+            }
+        );
+
+        drop(graph);
+        drop(manager);
+        let _ = std::fs::remove_dir_all(&storage);
+    }
+
+    // =========================================================================
+    // W1-B two-cluster decay simulation.
+    //
+    // Two dense clusters (triangles, so intra-cluster edges are redundant — NOT
+    // bridges) joined by a SINGLE bridge edge. Age every edge equally past the
+    // L2 prune threshold; the base gate flags all of them. With topology-aware
+    // decay the bridge is rescued while the equally-old redundant cluster edges
+    // are pruned; with the feature off, every flagged edge (bridge included) is
+    // pruned — today's byte-identical behaviour.
+    // =========================================================================
+
+    fn l2_edge(from: Uuid, to: Uuid, last_activated: DateTime<Utc>) -> RelationshipEdge {
+        RelationshipEdge {
+            uuid: Uuid::new_v4(), // overwritten by add_relationship
+            from_entity: from,
+            to_entity: to,
+            relation_type: RelationType::RelatedTo,
+            strength: 0.5,
+            created_at: last_activated,
+            valid_at: last_activated,
+            invalidated_at: None,
+            source_episode_id: None,
+            context: String::new(),
+            last_activated,
+            activation_count: 1,
+            ltp_status: LtpStatus::None,
+            activation_timestamps: None,
+            tier: EdgeTier::L2Episodic,
+            entity_confidence: None,
+            forman_curvature: None,
+            endpoint_selectivity: None,
+            provenance: Vec::new(),
+        }
+    }
+
+    /// Build two triangle clusters joined by one bridge edge. Returns the graph,
+    /// its tempdir (kept alive), and the bridge edge's uuid. All edges share
+    /// `origin` as `last_activated`, so a single aged `decay_at(now)` flags them
+    /// together.
+    fn build_two_cluster_bridge_graph(
+        origin: DateTime<Utc>,
+    ) -> (GraphMemory, tempfile::TempDir, Uuid) {
+        let dir = tempfile::tempdir().unwrap();
+        let graph = GraphMemory::new(dir.path(), None).unwrap();
+
+        // Cluster A = {a0,a1,a2}, Cluster B = {b0,b1,b2}. a0<->b0 is the bridge.
+        let a: [Uuid; 3] = [
+            Uuid::from_u128(0xA0),
+            Uuid::from_u128(0xA1),
+            Uuid::from_u128(0xA2),
+        ];
+        let b: [Uuid; 3] = [
+            Uuid::from_u128(0xB0),
+            Uuid::from_u128(0xB1),
+            Uuid::from_u128(0xB2),
+        ];
+        for &id in a.iter().chain(b.iter()) {
+            let entity = EntityNode {
+                uuid: id,
+                name: format!("e{id}"),
+                labels: vec![EntityLabel::Concept],
+                created_at: origin,
+                last_seen_at: origin,
+                mention_count: 1,
+                summary: String::new(),
+                attributes: std::collections::HashMap::new(),
+                name_embedding: None,
+                salience: 0.5,
+                is_proper_noun: false,
+                selectivity: None,
+                fine_type: None,
+            };
+            graph.add_entity(entity).unwrap();
+        }
+
+        // Dense (triangle) intra-cluster edges — redundant, never bridges.
+        for &(x, y) in &[(0usize, 1usize), (1, 2), (2, 0)] {
+            graph.add_relationship(l2_edge(a[x], a[y], origin)).unwrap();
+            graph.add_relationship(l2_edge(b[x], b[y], origin)).unwrap();
+        }
+        // The single bridge edge.
+        let bridge_uuid = graph.add_relationship(l2_edge(a[0], b[0], origin)).unwrap();
+
+        (graph, dir, bridge_uuid)
+    }
+
+    #[test]
+    fn topology_decay_rescues_bridge_prunes_redundant_cluster_edges() {
+        let origin = Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
+        let (graph, _dir, bridge_uuid) = build_two_cluster_bridge_graph(origin);
+
+        // Snapshot the active edges, then age them ~60 days in one jump so the L2
+        // min-prune-age (30d) is cleared and strength floors below threshold.
+        let mut edges = graph.get_all_relationships().unwrap();
+        assert_eq!(edges.len(), 7, "6 cluster edges + 1 bridge");
+        let now = origin + Duration::days(60);
+
+        let mut flagged: Vec<usize> = Vec::new();
+        for (i, e) in edges.iter_mut().enumerate() {
+            if e.decay_at(now) {
+                flagged.push(i);
+            }
+        }
+        assert_eq!(
+            flagged.len(),
+            7,
+            "all equally-aged edges flagged by base gate"
+        );
+
+        // Topology protection over the (connectivity-unchanged) edge set.
+        let prot = graph.compute_and_smooth_topology(&edges);
+        assert!(
+            prot.bridge_pairs.len() == 1,
+            "exactly one bridge pair, got {}",
+            prot.bridge_pairs.len()
+        );
+
+        // FLAG OFF (None): byte-identical to today — every flagged edge pruned.
+        let off = graph.select_prune_set(&edges, &flagged, None);
+        assert_eq!(off.len(), 7, "flag off prunes all flagged edges");
+        assert!(off.contains(&bridge_uuid), "flag off prunes the bridge too");
+
+        // FLAG ON: the bridge is rescued; the 6 redundant edges are pruned.
+        let on = graph.select_prune_set(&edges, &flagged, Some(&prot));
+        assert_eq!(on.len(), 6, "flag on rescues exactly the bridge");
+        assert!(
+            !on.contains(&bridge_uuid),
+            "the single bridge edge must survive the prune pass"
+        );
+        // The rescue removes exactly the bridge from the prune set.
+        let off_set: std::collections::HashSet<Uuid> = off.into_iter().collect();
+        let on_set: std::collections::HashSet<Uuid> = on.into_iter().collect();
+        let diff: Vec<&Uuid> = off_set.difference(&on_set).collect();
+        assert_eq!(
+            diff,
+            vec![&bridge_uuid],
+            "ON differs from OFF by only the bridge"
+        );
+    }
+
+    #[test]
+    fn topology_decay_flag_off_is_end_to_end_byte_identical() {
+        // Full apply_decay_at path with the env flag UNSET (default): the prune
+        // outcome must equal a graph with no topology consideration at all. We
+        // assert the bridge is NOT spared when the feature is off.
+        // Guard: this test's premise is "feature off". If the flag is set in the
+        // environment the byte-identical claim can't be exercised — skip rather
+        // than fail spuriously. No in-suite test sets it, so this is normally live.
+        if std::env::var_os("SHODH_TOPOLOGY_AWARE_DECAY").is_some() {
+            return;
+        }
+        let origin = Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
+        let (graph, _dir, bridge_uuid) = build_two_cluster_bridge_graph(origin);
+
+        let now = origin + Duration::days(60);
+        let result = graph.apply_decay_at(now).unwrap();
+        assert!(
+            result.pruned_count >= 7,
+            "all aged edges pruned when flag off"
+        );
+        assert!(
+            graph.get_relationship(&bridge_uuid).unwrap().is_none(),
+            "with the feature off the bridge is pruned like any other edge"
+        );
     }
 }

@@ -165,7 +165,7 @@ impl TodoStore {
                     for (key, value) in old_db.iterator(rocksdb::IteratorMode::Start).flatten() {
                         batch.put_cf(cf, &key, &value);
                         count += 1;
-                        if count % 10_000 == 0 {
+                        if count.is_multiple_of(10_000) {
                             db.write(std::mem::take(&mut batch))?;
                         }
                     }
@@ -176,6 +176,9 @@ impl TodoStore {
                     tracing::info!("  todos/{old_name}: migrated {count} entries to {cf_name} CF");
 
                     let backup = todos_path.join(format!("{old_name}.pre_cf_migration"));
+                    if backup.exists() {
+                        let _ = std::fs::remove_dir_all(&backup);
+                    }
                     if let Err(e) = std::fs::rename(&old_dir, &backup) {
                         tracing::warn!("Could not rename old {old_name} dir: {e}");
                     }
@@ -508,28 +511,39 @@ impl TodoStore {
             batch.delete_cf(index_cf, parent_key.as_bytes());
         }
 
-        // Clean up vector index mapping: look up vector_id from reverse mapping
+        // Clean up vector index mapping: look up vector_id from reverse mapping.
+        // We capture the vector_id BEFORE the batch write so we can mark_deleted AFTER
+        // the batch commits — this ensures the index only reflects committed deletes.
         let rev_key = format!("todo_vector:{}:{}", todo.user_id, id_str);
-        if let Some(vid_bytes) = self.db.get_cf(index_cf, rev_key.as_bytes())? {
+        let pending_vector_delete = if let Some(vid_bytes) =
+            self.db.get_cf(index_cf, rev_key.as_bytes())?
+        {
             if vid_bytes.len() >= 4 {
                 let vector_id =
                     u32::from_le_bytes([vid_bytes[0], vid_bytes[1], vid_bytes[2], vid_bytes[3]]);
 
-                // Mark deleted in Vamana index
-                let indices = self.vector_indices.read();
-                if let Some(index) = indices.get(&todo.user_id) {
-                    index.mark_deleted(vector_id);
-                }
-
-                // Remove forward mapping
+                // Remove forward mapping in batch (will commit atomically)
                 let fwd_key = format!("vector_id:{}:{}", todo.user_id, vector_id);
                 batch.delete_cf(index_cf, fwd_key.as_bytes());
+                Some((todo.user_id.clone(), vector_id))
+            } else {
+                None
             }
-            // Remove reverse mapping
-            batch.delete_cf(index_cf, rev_key.as_bytes());
-        }
+        } else {
+            None
+        };
+        // Remove reverse mapping in batch
+        batch.delete_cf(index_cf, rev_key.as_bytes());
 
         self.db.write(batch)?;
+
+        // Mark deleted in Vamana index AFTER batch commit succeeds
+        if let Some((ref user_id, vector_id)) = pending_vector_delete {
+            let indices = self.vector_indices.read();
+            if let Some(index) = indices.get(user_id) {
+                index.mark_deleted(vector_id);
+            }
+        }
         Ok(())
     }
 
@@ -799,7 +813,7 @@ impl TodoStore {
 
         // Get all todos with the same status
         let mut same_status_todos: Vec<Todo> = self
-            .list_todos_for_user(user_id, Some(&[todo.status.clone()]))?
+            .list_todos_for_user(user_id, Some(std::slice::from_ref(&todo.status)))?
             .into_iter()
             .collect();
 
@@ -1194,6 +1208,7 @@ impl TodoStore {
     }
 
     /// Update a project's properties
+    #[allow(clippy::too_many_arguments)]
     pub fn update_project(
         &self,
         user_id: &str,

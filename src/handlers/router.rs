@@ -11,33 +11,54 @@ use std::sync::Arc;
 
 use super::state::MultiUserMemoryManager;
 use super::{
-    ab_testing, compression, consolidation, crud, facts, files, graph, health, integrations,
-    lineage, mif, recall, remember, search, sessions, todos, users, visualization, webhooks,
+    ab_testing, anomalies, compression, consolidation, crud, export, facts, files, graph, health,
+    integrations, lineage, mif, recall, remember, search, sessions, todos, users, visualization,
+    webhooks,
 };
 
 /// Application state type alias
 pub type AppState = Arc<MultiUserMemoryManager>;
 
-/// Build the public routes (no authentication required)
+/// Whether `/metrics` is served without authentication.
 ///
-/// These routes must always be accessible for:
-/// - Health checks (Kubernetes probes)
-/// - Metrics (Prometheus scraping)
-/// - Context status (local Claude Code status line script)
-/// - External webhooks (have their own signature verification)
-pub fn build_public_routes(state: AppState) -> Router {
+/// Secure default is `false` — `/metrics` is registered under the authenticated
+/// routes. Set `SHODH_METRICS_PUBLIC=true` to expose it to unauthenticated
+/// scrapers (it is still rate-limited as a public route).
+fn metrics_is_public() -> bool {
+    std::env::var("SHODH_METRICS_PUBLIC")
+        .map(|v| {
+            let v = v.to_lowercase();
+            v == "true" || v == "1"
+        })
+        .unwrap_or(false)
+}
+
+/// Build the health/liveness probe routes.
+///
+/// These are kept separate from the other public routes because they must
+/// NEVER be rate-limited — a throttled `/health` would cause spurious
+/// Kubernetes restarts. The caller merges this router WITHOUT a rate-limit
+/// layer, regardless of `SHODH_PUBLIC_RATE_LIMIT`.
+pub fn build_probe_routes(state: AppState) -> Router {
     Router::new()
-        // =================================================================
-        // HEALTH & KUBERNETES PROBES
-        // =================================================================
         .route("/health", get(health::health))
         .route("/health/live", get(health::health_live))
         .route("/health/ready", get(health::health_ready))
         .route("/health/index", get(health::health_index))
-        // =================================================================
-        // METRICS (PROMETHEUS)
-        // =================================================================
-        .route("/metrics", get(health::metrics_endpoint))
+        .with_state(state)
+}
+
+/// Build the public routes (no authentication required, but rate-limited).
+///
+/// Unlike the probe routes, the caller applies a rate-limit layer to these
+/// (subject to `SHODH_PUBLIC_RATE_LIMIT`). Routes:
+/// - Context status (local Claude Code status line script)
+/// - External webhooks (verified by HMAC signature internally)
+/// - Graph visualization HTML viewer
+/// - Metrics — ONLY when `SHODH_METRICS_PUBLIC=true`; otherwise `/metrics` is
+///   an authenticated route in `build_protected_routes`.
+pub fn build_public_routes(state: AppState) -> Router {
+    let mut router = Router::new()
         // =================================================================
         // CONTEXT STATUS (LOCAL SCRIPT - NO AUTH)
         // =================================================================
@@ -55,10 +76,15 @@ pub fn build_public_routes(state: AppState) -> Router {
         // GRAPH VISUALIZATION (PUBLIC - HTML VIEWER ONLY)
         // =================================================================
         .route("/graph/view", get(visualization::graph_view))
-        // =================================================================
-        // STATE
-        // =================================================================
-        .with_state(state)
+        .route("/dashboard", get(visualization::dashboard));
+
+    // /metrics is an authenticated route by default; expose it here only when
+    // the operator has explicitly opted in via SHODH_METRICS_PUBLIC.
+    if metrics_is_public() {
+        router = router.route("/metrics", get(health::metrics_endpoint));
+    }
+
+    router.with_state(state)
 }
 
 /// Build the protected API routes (authentication required)
@@ -66,7 +92,7 @@ pub fn build_public_routes(state: AppState) -> Router {
 /// These routes require API key authentication and are rate-limited.
 /// The auth middleware and rate limiter should be applied by the caller.
 pub fn build_protected_routes(state: AppState) -> Router {
-    Router::new()
+    let mut router = Router::new()
         // =================================================================
         // REMEMBER/RECORD ENDPOINTS
         // =================================================================
@@ -82,6 +108,7 @@ pub fn build_protected_routes(state: AppState) -> Router {
         .route("/api/recall/tags", post(recall::recall_by_tags))
         .route("/api/recall/by-tags", post(recall::recall_by_tags)) // OpenAPI alias
         .route("/api/recall/date", post(recall::recall_by_date))
+        .route("/api/recall/paginated", post(recall::paginated_recall))
         // =================================================================
         // PROACTIVE CONTEXT & RELEVANCE
         // =================================================================
@@ -165,6 +192,7 @@ pub fn build_protected_routes(state: AppState) -> Router {
             "/api/consolidation/events",
             get(consolidation::get_consolidation_events),
         )
+        .route("/api/anomalies", post(anomalies::list_anomalies))
         .route("/api/backup/create", post(consolidation::create_backup))
         .route("/api/backup/list", post(consolidation::list_backups))
         .route("/api/backups", post(consolidation::list_backups)) // MCP alias
@@ -179,6 +207,8 @@ pub fn build_protected_routes(state: AppState) -> Router {
         .route("/api/facts/search", post(facts::search_facts))
         .route("/api/facts/by-entity", post(facts::facts_by_entity))
         .route("/api/facts/stats", post(facts::get_facts_stats))
+        .route("/api/facts/narratives", post(facts::fact_narratives))
+        .route("/api/facts/purge", post(facts::purge_facts))
         // =================================================================
         // LINEAGE
         // =================================================================
@@ -193,10 +223,15 @@ pub fn build_protected_routes(state: AppState) -> Router {
             post(lineage::lineage_list_branches),
         )
         .route("/api/lineage/branch", post(lineage::lineage_create_branch))
+        .route("/api/lineage/root-cause", post(lineage::lineage_root_cause))
         // =================================================================
         // KNOWLEDGE GRAPH (ADVANCED)
         // =================================================================
         .route("/api/graph/{user_id}/stats", get(graph::get_graph_stats))
+        .route(
+            "/api/graph/{user_id}/curvature",
+            post(graph::compute_curvature),
+        )
         .route(
             "/api/graph/{user_id}/universe",
             get(graph::get_memory_universe),
@@ -209,6 +244,10 @@ pub fn build_protected_routes(state: AppState) -> Router {
             "/api/graph/{user_id}/rebuild",
             post(graph::rebuild_user_graph),
         )
+        .route(
+            "/api/graph/{user_id}/canonicalize",
+            post(graph::canonicalize_user_graph),
+        )
         .route("/api/graph/entity/find", post(graph::find_entity))
         .route("/api/graph/entities/all", post(graph::get_all_entities))
         .route(
@@ -217,6 +256,7 @@ pub fn build_protected_routes(state: AppState) -> Router {
         )
         .route("/api/graph/traverse", post(graph::traverse_graph))
         .route("/api/graph/episode/get", post(graph::get_episode))
+        .route("/api/graph/{user_id}/export", get(export::export_graph))
         // =================================================================
         // KNOWLEDGE GRAPH (BASIC)
         // =================================================================
@@ -342,6 +382,12 @@ pub fn build_protected_routes(state: AppState) -> Router {
         .route("/api/sessions", post(sessions::list_sessions))
         .route("/api/sessions/stats", get(sessions::get_session_stats))
         .route("/api/sessions/end", post(sessions::end_session))
+        .route("/api/sessions/digest", post(sessions::get_session_digest))
+        .route(
+            "/api/sessions/context-compressed",
+            post(sessions::context_compressed),
+        )
+        .route("/api/sessions/history", post(sessions::session_history))
         .route("/api/sessions/{session_id}", get(sessions::get_session))
         // =================================================================
         // A/B TESTING
@@ -408,20 +454,29 @@ pub fn build_protected_routes(state: AppState) -> Router {
         // =================================================================
         .route("/api/export/mif", post(mif::export_mif))
         .route("/api/import/mif", post(mif::import_mif))
-        .route("/api/mif/adapters", get(mif::list_adapters))
-        // =================================================================
-        // STATE
-        // =================================================================
-        .with_state(state)
+        .route("/api/mif/adapters", get(mif::list_adapters));
+
+    // /metrics requires authentication unless SHODH_METRICS_PUBLIC=true, in
+    // which case build_public_routes serves it instead (exactly-one placement).
+    if !metrics_is_public() {
+        router = router.route("/metrics", get(health::metrics_endpoint));
+    }
+
+    // =================================================================
+    // STATE
+    // =================================================================
+    router.with_state(state)
 }
 
-/// Build the complete router with both public and protected routes
+/// Build the complete router with probe, public, and protected routes.
 ///
 /// Note: This function does NOT apply auth middleware or rate limiting.
-/// The caller (main.rs) should apply those layers as needed.
+/// The caller (server.rs) should apply those layers as needed — in particular
+/// the probe routes must be merged WITHOUT a rate-limit layer.
 pub fn build_router(state: AppState) -> Router {
+    let probe = build_probe_routes(state.clone());
     let public = build_public_routes(state.clone());
     let protected = build_protected_routes(state);
 
-    Router::new().merge(public).merge(protected)
+    Router::new().merge(probe).merge(public).merge(protected)
 }

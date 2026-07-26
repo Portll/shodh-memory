@@ -52,6 +52,45 @@ const SIGNAL_IGNORED_PENALTY: f32 = -0.2; // Memory shown but completely unused
 const ENTITY_WEIGHT: f32 = 0.4;
 const SEMANTIC_WEIGHT: f32 = 0.6;
 
+/// Tool-usage attribution constants
+/// Minimum Jaccard token overlap between memory content and tool action inputs.
+/// Lower than entity overlap (0.1) because tool inputs are short with high
+/// information density per token (file paths, commands, coordinates).
+const TOOL_USAGE_MIN_OVERLAP: f32 = 0.08;
+/// Above this Jaccard overlap, signal gets high confidence (0.9).
+const TOOL_USAGE_STRONG_THRESHOLD: f32 = 0.25;
+/// Positive signal when tool action matches memory and succeeds.
+/// Stronger than SIGNAL_STRONG_MULTIPLIER (0.8) because tool usage is
+/// a concrete behavioral signal, not just word overlap.
+const TOOL_USAGE_SUCCESS_SIGNAL: f32 = 0.7;
+/// Negative signal when tool action matches memory but fails.
+const TOOL_USAGE_FAILURE_SIGNAL: f32 = -0.4;
+/// Blend weight for tool signal vs entity+semantic.
+/// When a tool action matches, 35% of final signal comes from tool attribution.
+const TOOL_USAGE_WEIGHT: f32 = 0.35;
+
+/// Information-theoretic attribution constants
+/// Uses vector projection to factor out query-shared information from memory↔response
+/// similarity, isolating the memory's unique causal contribution.
+/// Minimum residual-cosine score to count as a positive signal.
+/// Below this, memory's unique content wasn't reflected in the response.
+const INFO_ATTRIBUTION_MIN: f32 = 0.05;
+/// Strong attribution — memory clearly influenced the response beyond query overlap.
+const INFO_ATTRIBUTION_STRONG: f32 = 0.25;
+/// Signal value for strong attribution (scaled by score).
+const INFO_ATTRIBUTION_STRONG_SIGNAL: f32 = 0.85;
+/// Signal value for weak-but-present attribution (scaled by score).
+const INFO_ATTRIBUTION_WEAK_SIGNAL: f32 = 0.3;
+/// Penalty when memory was surfaced but its unique content is absent from response.
+const INFO_ATTRIBUTION_NO_SIGNAL: f32 = -0.15;
+/// Weight in combined signal when info attribution is available.
+/// Takes 35% from the combination, reducing semantic from 60% to 35%.
+const INFO_ATTRIBUTION_WEIGHT: f32 = 0.35;
+/// Adjusted entity weight when info attribution available (was 0.4).
+const ENTITY_WEIGHT_WITH_INFO: f32 = 0.30;
+/// Adjusted semantic weight when info attribution available (was 0.6).
+const SEMANTIC_WEIGHT_WITH_INFO: f32 = 0.35;
+
 /// Stability adjustment rates
 const STABILITY_INCREMENT: f32 = 0.05;
 const STABILITY_DECREMENT_MULTIPLIER: f32 = 0.1;
@@ -141,6 +180,73 @@ pub enum SignalTrigger {
         memory_entities_used: usize,
         response_entities_total: usize,
     },
+
+    /// Tool/actuator action matched surfaced memory content.
+    /// The agent performed a concrete action aligned with the memory's guidance.
+    /// Covers both Claude Code tools (Read, Edit, Bash) and robot actuators
+    /// (navigate, grasp, sense).
+    ToolUsage {
+        /// Jaccard token overlap between memory content and tool inputs (0.0-1.0)
+        content_overlap: f32,
+        /// Tool or actuator name
+        tool_name: String,
+        /// Whether the tool action succeeded
+        success: bool,
+    },
+
+    /// Information-theoretic attribution: measures unique information
+    /// the memory contributed beyond what the query already provided.
+    /// Uses vector projection to factor out query-shared components.
+    InformationAttribution {
+        /// Cosine similarity between memory and response residuals (query projected out)
+        attribution_score: f32,
+        /// Raw cosine similarity before projection (for comparison/diagnostics)
+        raw_similarity: f32,
+    },
+
+    /// Temporal credit from multi-turn attribution.
+    /// Aggregated discounted signals from N turns after memory was surfaced.
+    /// Reference: Sutton & Barto (2018) "Reinforcement Learning", Ch. 7 (n-step TD)
+    TemporalCredit {
+        /// Number of turns whose signals were aggregated
+        turns_aggregated: u32,
+        /// Sum of raw (undiscounted) signal values before gamma scaling
+        raw_total: f32,
+    },
+}
+
+/// A tool or actuator action performed between feedback cycles.
+///
+/// Unified abstraction covering Claude Code tools (Read, Edit, Write, Bash)
+/// and robot actuator commands (navigate, grasp, sense). The feedback system
+/// matches action inputs/outputs against surfaced memory content to determine
+/// whether a memory influenced a concrete action.
+///
+/// For Claude Code: collected by hooks between proactive_context calls.
+/// For robotics: constructed from Experience fields when remember() follows recall().
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolAction {
+    /// Tool or actuator name: "Edit", "Bash", "navigate", "grasp"
+    pub tool_name: String,
+
+    /// Key-value inputs.
+    /// Claude Code: {"file_path": "/src/main.rs", "command": "cargo build"}.
+    /// Robotics: {"target": "waypoint_7", "speed": "0.5"}.
+    #[serde(default)]
+    pub inputs: HashMap<String, String>,
+
+    /// Whether the action succeeded.
+    /// Claude Code: true unless tool_output contains error markers.
+    /// Robotics: derived from outcome_type (success/partial = true).
+    pub success: bool,
+
+    /// First 200 chars of output. Used for content matching.
+    #[serde(default)]
+    pub output_snippet: Option<String>,
+
+    /// Reward signal (robotics only, -1.0 to 1.0). None for Claude Code tools.
+    #[serde(default)]
+    pub reward: Option<f32>,
 }
 
 /// A single feedback signal
@@ -279,9 +385,9 @@ impl ContextFingerprint {
         // Compress embedding to 16 components by taking evenly spaced samples
         let mut signature = [0.0f32; 16];
         if !embedding.is_empty() {
-            let step = embedding.len() / 16;
+            let len = embedding.len();
             for (i, sig) in signature.iter_mut().enumerate() {
-                let idx = (i * step).min(embedding.len() - 1);
+                let idx = (i * len / 16).min(len - 1);
                 *sig = embedding[idx];
             }
         }
@@ -609,6 +715,11 @@ pub struct PendingFeedback {
     pub surfaced_memories: Vec<SurfacedMemoryInfo>,
     pub context: String,
     pub context_embedding: Vec<f32>,
+    /// Tool/actuator actions performed after memories were surfaced.
+    /// Claude Code: collected by hooks between proactive_context calls.
+    /// Robotics: populated from action-outcome Experience fields.
+    #[serde(default)]
+    pub tool_actions: Vec<ToolAction>,
 }
 
 impl PendingFeedback {
@@ -624,12 +735,230 @@ impl PendingFeedback {
             surfaced_memories: memories,
             context,
             context_embedding,
+            tool_actions: Vec::new(),
         }
     }
 
     /// Check if this pending feedback has expired (older than 1 hour)
     pub fn is_expired(&self) -> bool {
         Utc::now() - self.surfaced_at > Duration::hours(1)
+    }
+}
+
+// =============================================================================
+// TEMPORAL CREDIT ASSIGNMENT (Issue #125)
+// Multi-turn feedback attribution with exponential discounting.
+//
+// Instead of single-turn evaluation (PendingFeedback consumed on next call),
+// FeedbackWindow tracks the last N turns so memories surfaced at turn T can
+// receive discounted credit from signals at turns T+1 through T+W.
+//
+// Reference: Sutton & Barto (2018) "Reinforcement Learning", Ch. 7 (n-step TD)
+// =============================================================================
+
+/// A sliding window of recent turns for multi-turn temporal credit assignment.
+///
+/// The window tracks surfaced memories from recent turns so they can receive
+/// discounted credit from future turn signals. Works alongside PendingFeedback:
+/// - PendingFeedback handles the immediate T-1 signal (highest confidence)
+/// - FeedbackWindow handles T-2 through T-W (temporally discounted)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FeedbackWindow {
+    pub user_id: String,
+    /// Current turn counter (monotonically increasing within a session).
+    pub turn_counter: u32,
+    /// Sliding window of recent turns (most recent at back).
+    pub entries: VecDeque<WindowEntry>,
+    /// Maximum entries before oldest is evicted.
+    pub window_size: usize,
+    /// When this window was created (session start proxy).
+    pub created_at: DateTime<Utc>,
+    /// Timestamp of the last turn added. Used for session gap detection.
+    pub last_turn_at: DateTime<Utc>,
+    /// Accumulated deferred credits: memory_id -> Vec<DeferredCredit>.
+    /// Applied incrementally on eviction and on session close.
+    pub deferred_credits: HashMap<MemoryId, Vec<DeferredCredit>>,
+}
+
+/// A single turn's surfaced memories and context, stored in the window.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WindowEntry {
+    /// Which turn this represents (0-indexed within session).
+    pub turn_number: u32,
+    /// Memories surfaced on this turn.
+    pub surfaced_memories: Vec<SurfacedMemoryInfo>,
+    /// When this turn occurred.
+    pub surfaced_at: DateTime<Utc>,
+    /// Context embedding from the proactive_context request.
+    pub context_embedding: Vec<f32>,
+    /// Context text (truncated for storage efficiency).
+    pub context_preview: String,
+    /// Tool actions reported on the NEXT turn (filled retroactively).
+    #[serde(default)]
+    pub tool_actions: Vec<ToolAction>,
+}
+
+/// A discounted credit from a future turn applied to a past-surfaced memory.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeferredCredit {
+    /// The signal value from attribution computation.
+    pub raw_signal: f32,
+    /// Confidence of the signal.
+    pub confidence: f32,
+    /// The trigger type that produced this signal.
+    pub trigger: SignalTrigger,
+    /// Turns elapsed between surfacing and this signal.
+    pub turns_elapsed: u32,
+    /// Discounted signal value: raw_signal * gamma^turns_elapsed.
+    pub discounted_value: f32,
+    /// When this credit was computed.
+    pub computed_at: DateTime<Utc>,
+}
+
+/// Session-level outcome detected from conversation patterns.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum SessionOutcome {
+    /// 3+ turns sustained engagement then topic change → task completed.
+    TaskCompletion {
+        turns_engaged: u32,
+        final_similarity: f32,
+    },
+    /// Gap > SESSION_GAP_THRESHOLD or frustration keywords → memories didn't help.
+    Abandonment {
+        gap_seconds: i64,
+        frustration_detected: bool,
+    },
+    /// Return to a topic after a gap → delayed positive signal.
+    ReEngagement {
+        gap_turns: u32,
+        topic_similarity: f32,
+    },
+    /// Session ended naturally — neutral.
+    NaturalEnd,
+}
+
+impl FeedbackWindow {
+    /// Create a new empty window for a user.
+    pub fn new(user_id: String) -> Self {
+        let now = Utc::now();
+        Self {
+            user_id,
+            turn_counter: 0,
+            entries: VecDeque::with_capacity(crate::constants::FEEDBACK_WINDOW_SIZE + 1),
+            window_size: crate::constants::FEEDBACK_WINDOW_SIZE,
+            created_at: now,
+            last_turn_at: now,
+            deferred_credits: HashMap::new(),
+        }
+    }
+
+    /// Check if the window has a session gap (stale).
+    pub fn has_session_gap(&self) -> bool {
+        let gap = (Utc::now() - self.last_turn_at).num_seconds();
+        gap > crate::constants::FEEDBACK_SESSION_GAP_SECS
+    }
+
+    /// Check if window is expired (older than 2 hours — cleanup threshold).
+    pub fn is_expired(&self) -> bool {
+        (Utc::now() - self.last_turn_at).num_seconds() > 7200
+    }
+
+    /// Collect all unique memory IDs across all window entries.
+    pub fn all_memory_ids(&self) -> Vec<MemoryId> {
+        let mut ids = Vec::new();
+        for entry in &self.entries {
+            for mem in &entry.surfaced_memories {
+                if !ids.contains(&mem.id) {
+                    ids.push(mem.id.clone());
+                }
+            }
+        }
+        ids
+    }
+
+    /// Detect session-level outcomes by analyzing the full window.
+    pub fn detect_session_outcome(&self) -> Option<SessionOutcome> {
+        if self.entries.len() < 2 {
+            return None;
+        }
+
+        let entries: Vec<&WindowEntry> = self.entries.iter().collect();
+        let len = entries.len();
+
+        // Task completion: N+ turns on same topic, then topic change
+        let mut sustained_turns = 0u32;
+        for i in 1..len {
+            if entries[i - 1].context_embedding.is_empty()
+                || entries[i].context_embedding.is_empty()
+            {
+                sustained_turns = 0;
+                continue;
+            }
+            let sim = cosine_similarity_vecs(
+                &entries[i - 1].context_embedding,
+                &entries[i].context_embedding,
+            );
+            if sim > 0.5 {
+                sustained_turns += 1;
+            } else {
+                if sustained_turns >= crate::constants::SESSION_COMPLETION_MIN_TURNS && sim < 0.3 {
+                    return Some(SessionOutcome::TaskCompletion {
+                        turns_engaged: sustained_turns,
+                        final_similarity: sim,
+                    });
+                }
+                sustained_turns = 0;
+            }
+        }
+
+        // Re-engagement: topic return after gap
+        if len >= 4 {
+            for i in 2..len {
+                if entries[0].context_embedding.is_empty()
+                    || entries[i].context_embedding.is_empty()
+                    || entries[i - 1].context_embedding.is_empty()
+                {
+                    continue;
+                }
+                let sim_to_earlier = cosine_similarity_vecs(
+                    &entries[0].context_embedding,
+                    &entries[i].context_embedding,
+                );
+                let sim_to_mid = cosine_similarity_vecs(
+                    &entries[0].context_embedding,
+                    &entries[i - 1].context_embedding,
+                );
+                if sim_to_mid < 0.3 && sim_to_earlier > 0.6 {
+                    return Some(SessionOutcome::ReEngagement {
+                        gap_turns: i as u32 - 1,
+                        topic_similarity: sim_to_earlier,
+                    });
+                }
+            }
+        }
+
+        None
+    }
+}
+
+/// Compute cosine similarity between two embedding vectors.
+fn cosine_similarity_vecs(a: &[f32], b: &[f32]) -> f32 {
+    if a.len() != b.len() || a.is_empty() {
+        return 0.0;
+    }
+    let mut dot = 0.0f32;
+    let mut norm_a = 0.0f32;
+    let mut norm_b = 0.0f32;
+    for (x, y) in a.iter().zip(b.iter()) {
+        dot += x * y;
+        norm_a += x * x;
+        norm_b += y * y;
+    }
+    let denom = norm_a.sqrt() * norm_b.sqrt();
+    if denom < 1e-10 {
+        0.0
+    } else {
+        (dot / denom).clamp(-1.0, 1.0)
     }
 }
 
@@ -675,6 +1004,57 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     }
 
     (dot / (norm_a * norm_b)).clamp(-1.0, 1.0)
+}
+
+/// Compute information-theoretic attribution using vector projection.
+///
+/// Projects out the query component from both memory and response embeddings,
+/// then measures cosine similarity of the residuals. This isolates what the
+/// memory uniquely contributed vs what was already in the query.
+///
+/// Returns `(attribution_score, raw_similarity)` or None if embeddings are
+/// empty or have mismatched dimensions.
+fn compute_information_attribution(
+    query_emb: &[f32],
+    memory_emb: &[f32],
+    response_emb: &[f32],
+) -> Option<(f32, f32)> {
+    if query_emb.is_empty()
+        || memory_emb.len() != query_emb.len()
+        || response_emb.len() != query_emb.len()
+    {
+        return None;
+    }
+
+    // query · query (projection denominator)
+    let query_dot_query: f32 = query_emb.iter().map(|x| x * x).sum();
+    if query_dot_query < 1e-10 {
+        return None; // degenerate query embedding
+    }
+
+    // Scalar projections onto query direction
+    let mem_dot_query: f32 = memory_emb.iter().zip(query_emb).map(|(m, q)| m * q).sum();
+    let resp_dot_query: f32 = response_emb.iter().zip(query_emb).map(|(r, q)| r * q).sum();
+
+    let mem_proj_scale = mem_dot_query / query_dot_query;
+    let resp_proj_scale = resp_dot_query / query_dot_query;
+
+    // Residuals: original vector minus its projection onto query
+    let mem_residual: Vec<f32> = memory_emb
+        .iter()
+        .zip(query_emb)
+        .map(|(m, q)| m - mem_proj_scale * q)
+        .collect();
+    let resp_residual: Vec<f32> = response_emb
+        .iter()
+        .zip(query_emb)
+        .map(|(r, q)| r - resp_proj_scale * q)
+        .collect();
+
+    let attribution = cosine_similarity(&mem_residual, &resp_residual).max(0.0);
+    let raw_similarity = cosine_similarity(memory_emb, response_emb);
+
+    Some((attribution, raw_similarity))
 }
 
 /// Create signal from semantic similarity
@@ -829,23 +1209,56 @@ pub fn process_implicit_feedback_with_semantics(
             };
 
         // Combine signals with weights
+        // When info-theoretic attribution is available (all 3 embeddings present),
+        // use 3-signal combination that isolates the memory's unique causal contribution.
+        // Otherwise fall back to entity+semantic weighted sum.
         let (combined_value, combined_confidence, trigger) = if has_semantic {
-            let value = (ENTITY_WEIGHT * entity_value) + (SEMANTIC_WEIGHT * semantic_value);
-            let confidence = (ENTITY_WEIGHT * entity_conf) + (SEMANTIC_WEIGHT * semantic_conf);
+            if let Some((attr_score, raw_sim)) = response_embedding.and_then(|resp_emb| {
+                compute_information_attribution(
+                    &pending.context_embedding,
+                    &memory.embedding,
+                    resp_emb,
+                )
+            }) {
+                // Three-signal combination: entity + semantic + info attribution
+                let (info_value, info_conf) = if attr_score >= INFO_ATTRIBUTION_STRONG {
+                    (INFO_ATTRIBUTION_STRONG_SIGNAL * attr_score.min(1.0), 0.9)
+                } else if attr_score >= INFO_ATTRIBUTION_MIN {
+                    (INFO_ATTRIBUTION_WEAK_SIGNAL * attr_score, 0.65)
+                } else {
+                    (INFO_ATTRIBUTION_NO_SIGNAL, 0.5)
+                };
 
-            // Use semantic similarity as trigger since it's the primary signal
-            let similarity = if let Some(resp_emb) = response_embedding {
-                cosine_similarity(&memory.embedding, resp_emb)
+                let value = (ENTITY_WEIGHT_WITH_INFO * entity_value)
+                    + (SEMANTIC_WEIGHT_WITH_INFO * semantic_value)
+                    + (INFO_ATTRIBUTION_WEIGHT * info_value);
+                let confidence = (ENTITY_WEIGHT_WITH_INFO * entity_conf)
+                    + (SEMANTIC_WEIGHT_WITH_INFO * semantic_conf)
+                    + (INFO_ATTRIBUTION_WEIGHT * info_conf);
+
+                (
+                    value,
+                    confidence,
+                    SignalTrigger::InformationAttribution {
+                        attribution_score: attr_score,
+                        raw_similarity: raw_sim,
+                    },
+                )
             } else {
-                0.0
-            };
-            (
-                value,
-                confidence,
-                SignalTrigger::SemanticSimilarity { similarity },
-            )
+                // Fallback: entity + semantic only (context_embedding empty or dim mismatch)
+                let value = (ENTITY_WEIGHT * entity_value) + (SEMANTIC_WEIGHT * semantic_value);
+                let confidence = (ENTITY_WEIGHT * entity_conf) + (SEMANTIC_WEIGHT * semantic_conf);
+                let similarity = response_embedding
+                    .map(|resp_emb| cosine_similarity(&memory.embedding, resp_emb))
+                    .unwrap_or(0.0);
+                (
+                    value,
+                    confidence,
+                    SignalTrigger::SemanticSimilarity { similarity },
+                )
+            }
         } else {
-            // Fallback to entity-only signal
+            // No embeddings at all — entity-only
             (
                 entity_value,
                 entity_conf,
@@ -854,6 +1267,27 @@ pub fn process_implicit_feedback_with_semantics(
                 },
             )
         };
+
+        // Tool-usage attribution: blend if tool actions matched this memory
+        let (combined_value, combined_confidence, trigger) =
+            if let Some((tool_val, tool_conf, tool_name, tool_overlap)) =
+                compute_tool_usage_signal(memory, &pending.tool_actions)
+            {
+                let blended_value =
+                    (TOOL_USAGE_WEIGHT * tool_val) + ((1.0 - TOOL_USAGE_WEIGHT) * combined_value);
+                let blended_conf = tool_conf.max(combined_confidence);
+                (
+                    blended_value,
+                    blended_conf,
+                    SignalTrigger::ToolUsage {
+                        content_overlap: tool_overlap,
+                        tool_name,
+                        success: tool_val > 0.0,
+                    },
+                )
+            } else {
+                (combined_value, combined_confidence, trigger)
+            };
 
         let mut signal = SignalRecord::new(combined_value, combined_confidence, trigger);
 
@@ -871,6 +1305,96 @@ pub fn process_implicit_feedback_with_semantics(
     }
 
     signals
+}
+
+/// Compute tool-usage attribution signal for a single memory.
+///
+/// Checks whether any tool action's inputs or output contain content
+/// from the surfaced memory. Uses normalized Jaccard token overlap
+/// because tool inputs are short and keyword-heavy (file paths, commands,
+/// coordinates, waypoints).
+///
+/// Returns `(signal_value, confidence, tool_name, overlap)` for the best
+/// matching tool action, or None if no match above threshold.
+pub fn compute_tool_usage_signal(
+    memory: &SurfacedMemoryInfo,
+    tool_actions: &[ToolAction],
+) -> Option<(f32, f32, String, f32)> {
+    if tool_actions.is_empty() {
+        return None;
+    }
+
+    let memory_tokens: HashSet<&str> = memory
+        .content_preview
+        .split(|c: char| !c.is_alphanumeric() && c != '_' && c != '-' && c != '.' && c != '/')
+        .filter(|w| w.len() >= 3)
+        .collect();
+
+    if memory_tokens.is_empty() {
+        return None;
+    }
+
+    let mut best_overlap = 0.0f32;
+    let mut best_tool = String::new();
+    let mut best_success = false;
+    let mut best_reward: Option<f32> = None;
+
+    for action in tool_actions {
+        let mut action_text = String::new();
+        for value in action.inputs.values() {
+            action_text.push(' ');
+            action_text.push_str(value);
+        }
+        if let Some(ref snippet) = action.output_snippet {
+            action_text.push(' ');
+            action_text.push_str(snippet);
+        }
+
+        let action_tokens: HashSet<&str> = action_text
+            .split(|c: char| !c.is_alphanumeric() && c != '_' && c != '-' && c != '.' && c != '/')
+            .filter(|w| w.len() >= 3)
+            .collect();
+
+        if action_tokens.is_empty() {
+            continue;
+        }
+
+        let intersection = memory_tokens.intersection(&action_tokens).count() as f32;
+        let union = memory_tokens.union(&action_tokens).count() as f32;
+        let overlap = if union > 0.0 {
+            intersection / union
+        } else {
+            0.0
+        };
+
+        if overlap > best_overlap {
+            best_overlap = overlap;
+            best_tool = action.tool_name.clone();
+            best_success = action.success;
+            best_reward = action.reward;
+        }
+    }
+
+    if best_overlap < TOOL_USAGE_MIN_OVERLAP {
+        return None;
+    }
+
+    // For robotics actions with explicit reward, use the reward directly
+    let base_value = if let Some(reward) = best_reward {
+        reward * best_overlap
+    } else if best_success {
+        TOOL_USAGE_SUCCESS_SIGNAL * best_overlap
+    } else {
+        TOOL_USAGE_FAILURE_SIGNAL * best_overlap
+    };
+
+    let confidence = if best_overlap >= TOOL_USAGE_STRONG_THRESHOLD {
+        0.9
+    } else {
+        0.65
+    };
+
+    Some((base_value, confidence, best_tool, best_overlap))
 }
 
 /// Apply context pattern signals (repetition/topic change) to existing signals
@@ -963,12 +1487,18 @@ pub struct PreviousContext {
 }
 
 /// Persistent store for feedback momentum with in-memory cache
+#[derive(Default)]
 pub struct FeedbackStore {
     /// In-memory cache: memory_id -> FeedbackMomentum
     pub momentum: HashMap<MemoryId, FeedbackMomentum>,
 
     /// Pending feedback per user: user_id -> PendingFeedback (in-memory only)
     pending: HashMap<String, PendingFeedback>,
+
+    /// Feedback windows per user for multi-turn temporal credit assignment.
+    /// The window tracks surfaced memories from the last N turns so they can
+    /// receive discounted credit from future signals.
+    windows: HashMap<String, FeedbackWindow>,
 
     /// Previous context per user: for repetition/topic change detection
     /// Tracks what the user asked last time to detect patterns
@@ -986,22 +1516,11 @@ impl std::fmt::Debug for FeedbackStore {
         f.debug_struct("FeedbackStore")
             .field("momentum_count", &self.momentum.len())
             .field("pending_count", &self.pending.len())
+            .field("windows_count", &self.windows.len())
             .field("previous_context_count", &self.previous_context.len())
             .field("has_db", &self.db.is_some())
             .field("dirty_count", &self.dirty.len())
             .finish()
-    }
-}
-
-impl Default for FeedbackStore {
-    fn default() -> Self {
-        Self {
-            momentum: HashMap::new(),
-            pending: HashMap::new(),
-            previous_context: HashMap::new(),
-            db: None,
-            dirty: HashSet::new(),
-        }
     }
 }
 
@@ -1030,33 +1549,29 @@ impl FeedbackStore {
         // Load all momentum entries from the feedback CF
         let mut momentum = HashMap::new();
         let iter = db.prefix_iterator_cf(cf, b"momentum:");
-        for item in iter {
-            if let Ok((key, value)) = item {
-                if let Ok(key_str) = std::str::from_utf8(&key) {
-                    if !key_str.starts_with("momentum:") {
-                        break;
-                    }
-                    if let Ok(m) = serde_json::from_slice::<FeedbackMomentum>(&value) {
-                        momentum.insert(m.memory_id.clone(), m);
-                    }
+        for (key, value) in iter.flatten() {
+            if let Ok(key_str) = std::str::from_utf8(&key) {
+                if !key_str.starts_with("momentum:") {
+                    break;
+                }
+                if let Ok(m) = serde_json::from_slice::<FeedbackMomentum>(&value) {
+                    momentum.insert(m.memory_id.clone(), m);
                 }
             }
         }
 
         let mut pending = HashMap::new();
         let iter = db.prefix_iterator_cf(cf, b"pending:");
-        for item in iter {
-            if let Ok((key, value)) = item {
-                if let Ok(key_str) = std::str::from_utf8(&key) {
-                    if !key_str.starts_with("pending:") {
-                        break;
-                    }
-                    if let Ok(p) = serde_json::from_slice::<PendingFeedback>(&value) {
-                        if !p.is_expired() {
-                            pending.insert(p.user_id.clone(), p);
-                        } else {
-                            let _ = db.delete_cf(cf, key_str.as_bytes());
-                        }
+        for (key, value) in iter.flatten() {
+            if let Ok(key_str) = std::str::from_utf8(&key) {
+                if !key_str.starts_with("pending:") {
+                    break;
+                }
+                if let Ok(p) = serde_json::from_slice::<PendingFeedback>(&value) {
+                    if !p.is_expired() {
+                        pending.insert(p.user_id.clone(), p);
+                    } else {
+                        let _ = db.delete_cf(cf, key_str.as_bytes());
                     }
                 }
             }
@@ -1064,30 +1579,48 @@ impl FeedbackStore {
 
         let mut previous_context = HashMap::new();
         let iter = db.prefix_iterator_cf(cf, b"prev_ctx:");
-        for item in iter {
-            if let Ok((key, value)) = item {
-                if let Ok(key_str) = std::str::from_utf8(&key) {
-                    if !key_str.starts_with("prev_ctx:") {
-                        break;
-                    }
-                    if let Ok(ctx) = serde_json::from_slice::<PreviousContext>(&value) {
-                        let user_id = key_str.strip_prefix("prev_ctx:").unwrap_or("");
-                        previous_context.insert(user_id.to_string(), ctx);
+        for (key, value) in iter.flatten() {
+            if let Ok(key_str) = std::str::from_utf8(&key) {
+                if !key_str.starts_with("prev_ctx:") {
+                    break;
+                }
+                if let Ok(ctx) = serde_json::from_slice::<PreviousContext>(&value) {
+                    let user_id = key_str.strip_prefix("prev_ctx:").unwrap_or("");
+                    previous_context.insert(user_id.to_string(), ctx);
+                }
+            }
+        }
+
+        // Load feedback windows (discard stale ones older than 2 hours)
+        let mut windows = HashMap::new();
+        let iter = db.prefix_iterator_cf(cf, b"window:");
+        for (key, value) in iter.flatten() {
+            if let Ok(key_str) = std::str::from_utf8(&key) {
+                if !key_str.starts_with("window:") {
+                    break;
+                }
+                if let Ok(w) = serde_json::from_slice::<FeedbackWindow>(&value) {
+                    if !w.is_expired() {
+                        windows.insert(w.user_id.clone(), w);
+                    } else {
+                        let _ = db.delete_cf(cf, key_str.as_bytes());
                     }
                 }
             }
         }
 
         tracing::info!(
-            "Loaded {} momentum, {} pending, {} previous context from shared feedback CF",
+            "Loaded {} momentum, {} pending, {} windows, {} previous context from shared feedback CF",
             momentum.len(),
             pending.len(),
+            windows.len(),
             previous_context.len()
         );
 
         Ok(Self {
             momentum,
             pending,
+            windows,
             previous_context,
             db: Some(db),
             dirty: HashSet::new(),
@@ -1112,12 +1645,13 @@ impl FeedbackStore {
                 let mut batch = WriteBatch::default();
                 let mut count = 0usize;
                 for item in old_db.iterator(IteratorMode::Start) {
-                    if let Ok((key, value)) = item {
-                        batch.put_cf(cf, &key, &value);
-                        count += 1;
-                        if count % 10_000 == 0 {
-                            db.write(std::mem::take(&mut batch))?;
-                        }
+                    let (key, value) = item.map_err(|e| {
+                        anyhow::anyhow!("RocksDB iterator error during feedback migration: {e}")
+                    })?;
+                    batch.put_cf(cf, &key, &value);
+                    count += 1;
+                    if count.is_multiple_of(10_000) {
+                        db.write(std::mem::take(&mut batch))?;
                     }
                 }
                 if !batch.is_empty() {
@@ -1127,6 +1661,9 @@ impl FeedbackStore {
                 tracing::info!("  feedback: migrated {count} entries to {CF_FEEDBACK} CF");
 
                 let backup = base_path.join("feedback.pre_cf_migration");
+                if backup.exists() {
+                    let _ = std::fs::remove_dir_all(&backup);
+                }
                 if let Err(e) = std::fs::rename(&old_dir, &backup) {
                     tracing::warn!("Could not rename old feedback dir: {e}");
                 }
@@ -1162,15 +1699,13 @@ impl FeedbackStore {
         // Load all momentum entries from the feedback CF
         let mut momentum = HashMap::new();
         let iter = db.prefix_iterator_cf(cf, b"momentum:");
-        for item in iter {
-            if let Ok((key, value)) = item {
-                if let Ok(key_str) = std::str::from_utf8(&key) {
-                    if !key_str.starts_with("momentum:") {
-                        break;
-                    }
-                    if let Ok(m) = serde_json::from_slice::<FeedbackMomentum>(&value) {
-                        momentum.insert(m.memory_id.clone(), m);
-                    }
+        for (key, value) in iter.flatten() {
+            if let Ok(key_str) = std::str::from_utf8(&key) {
+                if !key_str.starts_with("momentum:") {
+                    break;
+                }
+                if let Ok(m) = serde_json::from_slice::<FeedbackMomentum>(&value) {
+                    momentum.insert(m.memory_id.clone(), m);
                 }
             }
         }
@@ -1178,19 +1713,16 @@ impl FeedbackStore {
         // Also load pending feedback entries (filter expired ones)
         let mut pending = HashMap::new();
         let iter = db.prefix_iterator_cf(cf, b"pending:");
-        for item in iter {
-            if let Ok((key, value)) = item {
-                if let Ok(key_str) = std::str::from_utf8(&key) {
-                    if !key_str.starts_with("pending:") {
-                        break;
-                    }
-                    if let Ok(p) = serde_json::from_slice::<PendingFeedback>(&value) {
-                        if !p.is_expired() {
-                            pending.insert(p.user_id.clone(), p);
-                        } else {
-                            // Clean up expired pending feedback from disk
-                            let _ = db.delete_cf(cf, key_str.as_bytes());
-                        }
+        for (key, value) in iter.flatten() {
+            if let Ok(key_str) = std::str::from_utf8(&key) {
+                if !key_str.starts_with("pending:") {
+                    break;
+                }
+                if let Ok(p) = serde_json::from_slice::<PendingFeedback>(&value) {
+                    if !p.is_expired() {
+                        pending.insert(p.user_id.clone(), p);
+                    } else {
+                        let _ = db.delete_cf(cf, key_str.as_bytes());
                     }
                 }
             }
@@ -1199,16 +1731,14 @@ impl FeedbackStore {
         // Load previous context entries
         let mut previous_context = HashMap::new();
         let iter = db.prefix_iterator_cf(cf, b"prev_ctx:");
-        for item in iter {
-            if let Ok((key, value)) = item {
-                if let Ok(key_str) = std::str::from_utf8(&key) {
-                    if !key_str.starts_with("prev_ctx:") {
-                        break;
-                    }
-                    if let Ok(ctx) = serde_json::from_slice::<PreviousContext>(&value) {
-                        let user_id = key_str.strip_prefix("prev_ctx:").unwrap_or("");
-                        previous_context.insert(user_id.to_string(), ctx);
-                    }
+        for (key, value) in iter.flatten() {
+            if let Ok(key_str) = std::str::from_utf8(&key) {
+                if !key_str.starts_with("prev_ctx:") {
+                    break;
+                }
+                if let Ok(ctx) = serde_json::from_slice::<PreviousContext>(&value) {
+                    let user_id = key_str.strip_prefix("prev_ctx:").unwrap_or("");
+                    previous_context.insert(user_id.to_string(), ctx);
                 }
             }
         }
@@ -1223,6 +1753,7 @@ impl FeedbackStore {
         Ok(Self {
             momentum,
             pending,
+            windows: HashMap::new(),
             previous_context,
             db: Some(db),
             dirty: HashSet::new(),
@@ -1313,6 +1844,214 @@ impl FeedbackStore {
     /// Clean up expired pending feedback
     pub fn cleanup_expired(&mut self) {
         self.pending.retain(|_, p| !p.is_expired());
+        // Also clean up expired windows
+        let expired_users: Vec<String> = self
+            .windows
+            .iter()
+            .filter(|(_, w)| w.is_expired())
+            .map(|(k, _)| k.clone())
+            .collect();
+        for user_id in &expired_users {
+            self.flush_window(user_id);
+        }
+    }
+
+    // =========================================================================
+    // FEEDBACK WINDOW METHODS (Temporal Credit Assignment)
+    // =========================================================================
+
+    /// Get or create a FeedbackWindow for a user.
+    ///
+    /// If the existing window has a session gap > FEEDBACK_SESSION_GAP_SECS,
+    /// the old window is flushed (credits applied to momentum) and a new one
+    /// is created.
+    pub fn get_or_create_window(&mut self, user_id: &str) -> &mut FeedbackWindow {
+        // Check for session gap — flush stale window before creating new
+        if let Some(window) = self.windows.get(user_id) {
+            if window.has_session_gap() {
+                // Flush the stale window's deferred credits
+                let stale = self.windows.remove(user_id).unwrap();
+                self.apply_window_credits(&stale);
+                // Delete from disk
+                if let (Some(db), Some(cf)) = (&self.db, self.feedback_cf()) {
+                    let key = format!("window:{}", user_id);
+                    let _ = db.delete_cf(cf, key.as_bytes());
+                }
+            }
+        }
+
+        self.windows
+            .entry(user_id.to_string())
+            .or_insert_with(|| FeedbackWindow::new(user_id.to_string()))
+    }
+
+    /// Push a new turn entry into the user's window.
+    ///
+    /// If the window is full, the oldest entry is evicted and its deferred
+    /// credits are flushed to momentum.
+    ///
+    /// Returns memory IDs from any evicted entry (for caller to know which
+    /// memories received their final credit).
+    pub fn push_window_entry(&mut self, user_id: &str, entry: WindowEntry) -> Vec<MemoryId> {
+        let window = self.get_or_create_window(user_id);
+        window.turn_counter = entry.turn_number + 1;
+        window.last_turn_at = entry.surfaced_at;
+        window.entries.push_back(entry);
+
+        let mut evicted_ids = Vec::new();
+
+        // Evict oldest if over capacity
+        if window.entries.len() > window.window_size {
+            if let Some(evicted) = window.entries.pop_front() {
+                for mem in &evicted.surfaced_memories {
+                    evicted_ids.push(mem.id.clone());
+                }
+            }
+        }
+
+        // Apply deferred credits for evicted memories
+        if !evicted_ids.is_empty() {
+            // Collect credits for evicted memories, then apply them
+            let mut credits_to_apply: Vec<(MemoryId, Vec<DeferredCredit>)> = Vec::new();
+            let window = self.windows.get_mut(user_id).unwrap();
+            for id in &evicted_ids {
+                if let Some(credits) = window.deferred_credits.remove(id) {
+                    if !credits.is_empty() {
+                        credits_to_apply.push((id.clone(), credits));
+                    }
+                }
+            }
+            for (id, credits) in credits_to_apply {
+                self.apply_deferred_credit(&id, &credits);
+            }
+        }
+
+        // Persist window
+        self.persist_window(user_id);
+
+        evicted_ids
+    }
+
+    /// Accumulate deferred credits for a memory in a user's window.
+    pub fn accumulate_deferred_credit(
+        &mut self,
+        user_id: &str,
+        memory_id: &MemoryId,
+        credit: DeferredCredit,
+    ) {
+        if let Some(window) = self.windows.get_mut(user_id) {
+            window
+                .deferred_credits
+                .entry(memory_id.clone())
+                .or_default()
+                .push(credit);
+        }
+    }
+
+    /// Get a read-only snapshot of the window entries for a user.
+    /// Used in Phase 2 (no lock) to compute signals without holding the store lock.
+    pub fn snapshot_window_entries(&self, user_id: &str) -> Vec<WindowEntry> {
+        self.windows
+            .get(user_id)
+            .map(|w| w.entries.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Get the current turn counter for a user's window.
+    pub fn window_turn_counter(&self, user_id: &str) -> u32 {
+        self.windows
+            .get(user_id)
+            .map(|w| w.turn_counter)
+            .unwrap_or(0)
+    }
+
+    /// Detect session outcome from a user's window.
+    pub fn detect_session_outcome(&self, user_id: &str) -> Option<SessionOutcome> {
+        self.windows
+            .get(user_id)
+            .and_then(|w| w.detect_session_outcome())
+    }
+
+    /// Flush a window: apply all deferred credits to momentum, then remove.
+    pub fn flush_window(&mut self, user_id: &str) {
+        if let Some(window) = self.windows.remove(user_id) {
+            self.apply_window_credits(&window);
+            // Remove from disk
+            if let (Some(db), Some(cf)) = (&self.db, self.feedback_cf()) {
+                let key = format!("window:{}", user_id);
+                let _ = db.delete_cf(cf, key.as_bytes());
+            }
+        }
+    }
+
+    /// Apply all deferred credits from a window to momentum.
+    fn apply_window_credits(&mut self, window: &FeedbackWindow) {
+        for (memory_id, credits) in &window.deferred_credits {
+            self.apply_deferred_credit(memory_id, credits);
+        }
+    }
+
+    /// Apply deferred credits for a single memory to its momentum.
+    ///
+    /// Sums discounted values weighted by confidence, creates a synthetic
+    /// SignalRecord, and updates momentum via the standard EMA path.
+    fn apply_deferred_credit(&mut self, memory_id: &MemoryId, credits: &[DeferredCredit]) {
+        if credits.is_empty() {
+            return;
+        }
+
+        let total: f32 = credits
+            .iter()
+            .map(|c| c.discounted_value * c.confidence)
+            .sum();
+        let avg_confidence: f32 =
+            credits.iter().map(|c| c.confidence).sum::<f32>() / credits.len() as f32;
+
+        // Skip if below noise threshold
+        if total.abs() < crate::constants::TEMPORAL_CREDIT_MIN_THRESHOLD {
+            return;
+        }
+
+        // Clamp to prevent single flush from overwhelming momentum
+        let clamped = total.clamp(-0.5, 0.5);
+
+        let signal = SignalRecord::new(
+            clamped,
+            // Slightly reduced confidence for deferred signals
+            (avg_confidence * 0.8).clamp(0.0, 1.0),
+            SignalTrigger::TemporalCredit {
+                turns_aggregated: credits.len() as u32,
+                raw_total: total,
+            },
+        );
+
+        let momentum = self.get_or_create_momentum(
+            memory_id.clone(),
+            crate::memory::types::ExperienceType::Context,
+        );
+        momentum.update(signal);
+        self.dirty.insert(memory_id.clone());
+
+        tracing::debug!(
+            memory_id = %memory_id.0,
+            credits = credits.len(),
+            total_discounted = format!("{:.3}", clamped),
+            "Applied temporal deferred credits to momentum"
+        );
+    }
+
+    /// Persist a window to RocksDB.
+    fn persist_window(&self, user_id: &str) {
+        if let Some(window) = self.windows.get(user_id) {
+            if let (Some(db), Some(cf)) = (&self.db, self.feedback_cf()) {
+                let key = format!("window:{}", user_id);
+                if let Ok(value) = serde_json::to_vec(window) {
+                    if let Err(e) = db.put_cf(cf, key.as_bytes(), &value) {
+                        tracing::warn!("Failed to persist feedback window: {}", e);
+                    }
+                }
+            }
+        }
     }
 
     /// Set previous context for a user (for repetition/topic change detection)
@@ -1404,6 +2143,13 @@ impl FeedbackStore {
             db.put_cf(cf, key.as_bytes(), &value)?;
         }
 
+        // Persist feedback windows
+        for (user_id, window) in &self.windows {
+            let key = format!("window:{}", user_id);
+            let value = serde_json::to_vec(window)?;
+            db.put_cf(cf, key.as_bytes(), &value)?;
+        }
+
         // Flush the feedback CF to ensure data persistence (critical for graceful shutdown)
         use rocksdb::FlushOptions;
         let mut flush_opts = FlushOptions::default();
@@ -1431,7 +2177,11 @@ impl FeedbackStore {
             avg_ema: if self.momentum.is_empty() {
                 0.0
             } else {
-                self.momentum.values().map(|m| m.ema).sum::<f32>() / self.momentum.len() as f32
+                self.momentum
+                    .values()
+                    .map(|m| m.ema_with_decay())
+                    .sum::<f32>()
+                    / self.momentum.len() as f32
             },
             avg_stability: if self.momentum.is_empty() {
                 0.0
@@ -1439,6 +2189,12 @@ impl FeedbackStore {
                 self.momentum.values().map(|m| m.stability).sum::<f32>()
                     / self.momentum.len() as f32
             },
+            total_windows: self.windows.len(),
+            total_deferred_credits: self
+                .windows
+                .values()
+                .map(|w| w.deferred_credits.values().map(|v| v.len()).sum::<usize>())
+                .sum(),
         }
     }
 }
@@ -1450,6 +2206,8 @@ pub struct FeedbackStoreStats {
     pub total_pending: usize,
     pub avg_ema: f32,
     pub avg_stability: f32,
+    pub total_windows: usize,
+    pub total_deferred_credits: usize,
 }
 
 #[cfg(test)]
@@ -1832,22 +2590,36 @@ mod tests {
         let (_, sig1_semantic) = &signals_with_semantic[0];
         assert_eq!(id1, &memory_id1);
 
-        // Semantic signal should use SemanticSimilarity trigger
+        // With context_embedding available, should use InformationAttribution trigger
+        // (projects out query component to isolate memory's unique contribution)
         match &sig1_semantic.trigger {
-            SignalTrigger::SemanticSimilarity { similarity } => {
-                assert!(*similarity > 0.9); // High similarity since embeddings are same
+            SignalTrigger::InformationAttribution {
+                attribution_score,
+                raw_similarity,
+            } => {
+                // Raw similarity is high (response_emb == memory_emb)
+                assert!(*raw_similarity > 0.9);
+                // Attribution score measures residual after projecting out query
+                assert!(*attribution_score >= 0.0);
             }
-            _ => panic!("Expected SemanticSimilarity trigger"),
+            SignalTrigger::SemanticSimilarity { similarity } => {
+                // Fallback if context_embedding is degenerate
+                assert!(*similarity > 0.9);
+            }
+            _ => panic!("Expected InformationAttribution or SemanticSimilarity trigger"),
         }
 
-        // Second memory (python) should have low semantic score since embedding is different
+        // Second memory (python) should have low score since embedding is different
         let (id2, sig2_semantic) = &signals_with_semantic[1];
         assert_eq!(id2, &memory_id2);
         match &sig2_semantic.trigger {
-            SignalTrigger::SemanticSimilarity { similarity } => {
-                assert!(*similarity < 0.5); // Low similarity - different embeddings
+            SignalTrigger::InformationAttribution { raw_similarity, .. } => {
+                assert!(*raw_similarity < 0.5); // Different embeddings
             }
-            _ => panic!("Expected SemanticSimilarity trigger"),
+            SignalTrigger::SemanticSimilarity { similarity } => {
+                assert!(*similarity < 0.5);
+            }
+            _ => panic!("Expected InformationAttribution or SemanticSimilarity trigger"),
         }
     }
 

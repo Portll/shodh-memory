@@ -77,12 +77,15 @@ pub struct PyGeoLocation {
 impl PyGeoLocation {
     #[new]
     #[pyo3(signature = (latitude=0.0, longitude=0.0, altitude=0.0))]
-    fn new(latitude: f64, longitude: f64, altitude: f64) -> Self {
-        PyGeoLocation {
+    fn new(latitude: f64, longitude: f64, altitude: f64) -> PyResult<Self> {
+        use crate::validation::validate_geo_location;
+        validate_geo_location(&[latitude, longitude, altitude])
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        Ok(PyGeoLocation {
             latitude,
             longitude,
             altitude,
-        }
+        })
     }
 
     fn to_list(&self) -> Vec<f64> {
@@ -472,6 +475,7 @@ impl PyMemorySystem {
             // NER + co-occurrence (populated by handler pipeline, empty for direct Python API)
             ner_entities: vec![],
             cooccurrence_pairs: vec![],
+            importance_override: None,
         };
 
         let memory_id = self
@@ -793,9 +797,11 @@ impl PyMemorySystem {
             prospective_signals: None,
             episode_id: None,
             recency_weight: None,
+            session_id: None,
             max_results: limit,
             retrieval_mode,
             offset: 0,
+            layers: crate::memory::types::LayerMode::Full,
         };
 
         let memories = self
@@ -1226,6 +1232,7 @@ impl PyMemorySystem {
             let mut dict = HashMap::new();
             dict.insert("node_count".to_string(), stats.node_count.into_py(py));
             dict.insert("edge_count".to_string(), stats.edge_count.into_py(py));
+            dict.insert("episode_count".to_string(), stats.episode_count.into_py(py));
             dict.insert("avg_strength".to_string(), stats.avg_strength.into_py(py));
             dict.insert(
                 "potentiated_count".to_string(),
@@ -1828,9 +1835,11 @@ impl PyMemorySystem {
             prospective_signals: None,
             episode_id: None,
             recency_weight: None,
+            session_id: None,
             max_results: max_results * 2, // Get more for filtering
             retrieval_mode: RetrievalMode::Hybrid,
             offset: 0,
+            layers: crate::memory::types::LayerMode::Full,
         };
 
         let memories = self

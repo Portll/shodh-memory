@@ -29,7 +29,6 @@ use tracing::{debug, info};
 
 use super::types::MemoryId;
 use crate::embeddings::minilm::MiniLMEmbedder;
-use crate::embeddings::Embedder;
 
 /// Configuration for hybrid search
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -42,8 +41,9 @@ pub struct HybridSearchConfig {
     #[serde(default = "default_vector_weight")]
     pub vector_weight: f32,
 
-    /// Weight for graph (spreading activation) scores in RRF (0.0-1.0) (SHO-D4)
-    /// Graph weight is dynamic based on graph density and memory tier
+    /// DEPRECATED: Graph fusion happens in mod.rs Layer 4 (not in hybrid_search).
+    /// This field is kept for deserialization compatibility but is not used.
+    /// Actual graph weight is computed dynamically by graph_retrieval.rs based on density.
     #[serde(default = "default_graph_weight")]
     pub graph_weight: f32,
 
@@ -54,14 +54,6 @@ pub struct HybridSearchConfig {
     /// Number of candidates to fetch from each retriever
     #[serde(default = "default_candidate_count")]
     pub candidate_count: usize,
-
-    /// Number of top results to rerank with cross-encoder
-    #[serde(default = "default_rerank_count")]
-    pub rerank_count: usize,
-
-    /// Whether to use cross-encoder reranking
-    #[serde(default = "default_use_reranking")]
-    pub use_reranking: bool,
 
     /// Minimum BM25 score to consider (filters noise)
     #[serde(default = "default_min_bm25_score")]
@@ -82,16 +74,10 @@ fn default_graph_weight() -> f32 {
     0.25 // Graph spreading activation for associative retrieval (SHO-D4)
 }
 fn default_rrf_k() -> f32 {
-    45.0 // Lower k = more emphasis on top-ranked results
+    crate::constants::RRF_K_HYBRID_FUSION
 }
 fn default_candidate_count() -> usize {
     100 // Increased for better recall; slight latency tradeoff acceptable
-}
-fn default_rerank_count() -> usize {
-    20
-}
-fn default_use_reranking() -> bool {
-    false // Disabled: current implementation is bi-encoder, not true cross-encoder
 }
 fn default_min_bm25_score() -> f32 {
     0.01 // Lower threshold to capture more keyword matches
@@ -108,8 +94,6 @@ impl Default for HybridSearchConfig {
             graph_weight: default_graph_weight(),
             rrf_k: default_rrf_k(),
             candidate_count: default_candidate_count(),
-            rerank_count: default_rerank_count(),
-            use_reranking: default_use_reranking(),
             min_bm25_score: default_min_bm25_score(),
             min_graph_score: default_min_graph_score(),
         }
@@ -134,11 +118,8 @@ pub struct HybridSearchResult {
     /// Graph activation score from spreading activation (if matched) (SHO-D4)
     pub graph_score: Option<f32>,
 
-    /// RRF score before reranking
+    /// RRF score before post-processing
     pub rrf_score: f32,
-
-    /// Cross-encoder score (if reranked)
-    pub rerank_score: Option<f32>,
 
     /// Rank from BM25 (if matched)
     pub bm25_rank: Option<usize>,
@@ -159,6 +140,14 @@ pub struct BM25Index {
     content_field: Field,
     tags_field: Field,
     entities_field: Field,
+    /// Commits that failed even after retries. A nonzero count means the
+    /// searchable index is silently missing documents — callers that need
+    /// read-your-writes integrity (the recall harness) check this and bail
+    /// instead of measuring a partial index. Observed in the wild: external
+    /// processes (Windows Search indexer on the Documents tree, antivirus
+    /// real-time scans) intermittently locking freshly written segment
+    /// files, which made eval rankings depend on ambient machine state.
+    commit_failures: std::sync::atomic::AtomicU64,
 }
 
 impl BM25Index {
@@ -229,6 +218,7 @@ impl BM25Index {
             content_field,
             tags_field,
             entities_field,
+            commit_failures: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -266,11 +256,48 @@ impl BM25Index {
         Ok(())
     }
 
-    /// Commit pending changes to disk
+    /// Commit pending changes to disk.
+    ///
+    /// Retries transient failures with backoff: tantivy commits can fail when
+    /// an external process (antivirus scan, search indexer, sync daemon)
+    /// briefly holds a lock on a segment file. Those locks clear in tens of
+    /// milliseconds; without the retry a single hiccup silently drops every
+    /// document in the pending batch from the searchable index.
     pub fn commit(&self) -> Result<()> {
+        const ATTEMPTS: u32 = 4;
         let mut writer = self.writer.write();
-        writer.commit().context("Failed to commit BM25 index")?;
-        Ok(())
+        let mut last_err = None;
+        for attempt in 0..ATTEMPTS {
+            match writer.commit() {
+                Ok(_) => return Ok(()),
+                Err(e) => {
+                    if attempt + 1 < ATTEMPTS {
+                        let backoff = std::time::Duration::from_millis(50 << attempt);
+                        tracing::warn!(
+                            "BM25 commit attempt {}/{} failed ({e}); retrying in {:?}",
+                            attempt + 1,
+                            ATTEMPTS,
+                            backoff
+                        );
+                        std::thread::sleep(backoff);
+                    }
+                    last_err = Some(e);
+                }
+            }
+        }
+        self.commit_failures
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Err(anyhow::anyhow!(
+            "Failed to commit BM25 index after {ATTEMPTS} attempts: {}",
+            last_err.expect("loop ran at least once")
+        ))
+    }
+
+    /// Number of commit batches lost after exhausting retries. Nonzero means
+    /// the searchable index is missing documents.
+    pub fn commit_failure_count(&self) -> u64 {
+        self.commit_failures
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Search using BM25
@@ -424,10 +451,71 @@ impl BM25Index {
         self.len() == 0
     }
 
-    /// Reload the reader to see committed changes
+    /// Reload the reader to see committed changes. A failed reload leaves the
+    /// reader serving a stale (partial) view — counted as a commit failure
+    /// because the read-your-writes effect is identical.
     pub fn reload(&self) -> Result<()> {
-        self.reader.reload()?;
+        if let Err(e) = self.reader.reload() {
+            self.commit_failures
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Err(anyhow::anyhow!("Failed to reload BM25 reader: {e}"));
+        }
         Ok(())
+    }
+
+    /// Merge all segments into a single segment.
+    ///
+    /// Tantivy accumulates segments from commits. Deleted documents (from upserts)
+    /// remain as tombstones until segments are merged. Without periodic merging:
+    /// - Ghost state from overwrites pollutes BM25 scoring
+    /// - Disk usage grows unboundedly
+    /// - Search latency increases with segment count
+    ///
+    /// This is expensive (rewrites entire index) so should only run on heavy
+    /// maintenance cycles, not per-request.
+    pub fn optimize(&self) -> Result<usize> {
+        let segment_count = {
+            let searcher = self.reader.searcher();
+            searcher.segment_readers().len()
+        };
+
+        if segment_count <= 1 {
+            return Ok(0);
+        }
+
+        let mut writer = self.writer.write();
+
+        // Collect all segment IDs for merging
+        let segment_ids: Vec<_> = self
+            .index
+            .searchable_segment_ids()
+            .context("Failed to get segment IDs")?;
+
+        if segment_ids.len() <= 1 {
+            return Ok(0);
+        }
+
+        let merged = segment_ids.len();
+        writer
+            .merge(&segment_ids)
+            .wait()
+            .context("Failed to merge BM25 segments")?;
+        writer
+            .commit()
+            .context("Failed to commit after BM25 merge")?;
+        drop(writer);
+
+        self.reader.reload()?;
+
+        tracing::info!("BM25 index optimized: merged {} segments into 1", merged);
+
+        Ok(merged)
+    }
+
+    /// Get the current number of segments (for health/metrics)
+    pub fn segment_count(&self) -> usize {
+        let searcher = self.reader.searcher();
+        searcher.segment_readers().len()
     }
 }
 
@@ -490,116 +578,40 @@ impl RRFusion {
             }
         }
 
-        // Sort by RRF score descending
+        // Sort by RRF score descending, with a deterministic MemoryId tie-break.
+        // RRF scores collide constantly by construction (any two docs at the
+        // same rank in their respective lists contribute identical amounts), and
+        // `scores` is a HashMap whose iteration order is randomized per process.
+        // Without the tie-break, equal-scored candidates are ordered arbitrarily
+        // and differently across runs, which propagates into the downstream
+        // rank-based fusion (mod.rs Layer 4) and can flip candidates in/out of
+        // the truncated top-k between identical queries. Every other sort in the
+        // pipeline already tie-breaks on MemoryId; this was the lone exception.
         let mut results: Vec<_> = scores.into_iter().collect();
-        results.sort_by(|a, b| b.1.total_cmp(&a.1));
+        results.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
 
         results
     }
 }
 
-/// Cross-encoder reranker using the same MiniLM model
-///
-/// For true cross-encoder reranking, you'd use a model trained for
-/// query-document scoring (e.g., cross-encoder/ms-marco-MiniLM-L-6-v2).
-/// This implementation uses cosine similarity as a proxy, which works
-/// but isn't as accurate as a dedicated cross-encoder.
-///
-/// Future: Replace with actual cross-encoder model for better accuracy.
-pub struct CrossEncoderReranker {
-    embedder: Arc<MiniLMEmbedder>,
-}
-
-impl CrossEncoderReranker {
-    /// Create reranker with shared embedder
-    pub fn new(embedder: Arc<MiniLMEmbedder>) -> Self {
-        Self { embedder }
-    }
-
-    /// Rerank candidates based on query-document similarity
-    ///
-    /// Takes (memory_id, content, current_score) and returns reranked scores.
-    ///
-    /// Note: This uses bi-encoder (separate query/doc embeddings) not true
-    /// cross-encoder (joint query+doc encoding). True cross-encoders are
-    /// more accurate but slower. This is a reasonable approximation.
-    pub fn rerank(
-        &self,
-        query: &str,
-        candidates: Vec<(MemoryId, String, f32)>,
-    ) -> Result<Vec<(MemoryId, f32)>> {
-        if candidates.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        // Encode query
-        let query_embedding = self.embedder.encode(query)?;
-
-        let mut results: Vec<(MemoryId, f32)> = Vec::with_capacity(candidates.len());
-
-        for (memory_id, content, _original_score) in candidates {
-            // Encode document
-            let doc_embedding = self.embedder.encode(&content)?;
-
-            // Cosine similarity
-            let similarity = cosine_similarity(&query_embedding, &doc_embedding);
-
-            results.push((memory_id, similarity));
-        }
-
-        // Sort by reranked score descending
-        results.sort_by(|a, b| b.1.total_cmp(&a.1));
-
-        Ok(results)
-    }
-}
-
-/// Compute cosine similarity between two vectors
-fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
-    if a.len() != b.len() || a.is_empty() {
-        return 0.0;
-    }
-
-    let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
-    let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
-    let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
-
-    if norm_a == 0.0 || norm_b == 0.0 {
-        return 0.0;
-    }
-
-    dot / (norm_a * norm_b)
-}
-
 /// Unified hybrid search engine
 ///
-/// Combines BM25 + Vector + RRF + Cross-encoder + Cognitive signals
+/// Combines BM25 + Vector + RRF fusion + cognitive post-processing
 pub struct HybridSearchEngine {
     bm25_index: BM25Index,
     config: HybridSearchConfig,
-    reranker: Option<CrossEncoderReranker>,
 }
 
 impl HybridSearchEngine {
     /// Create hybrid search engine
     pub fn new(
         bm25_path: &Path,
-        embedder: Arc<MiniLMEmbedder>,
+        _embedder: Arc<MiniLMEmbedder>,
         config: HybridSearchConfig,
     ) -> Result<Self> {
         let bm25_index = BM25Index::new(bm25_path)?;
 
-        let reranker = if config.use_reranking {
-            Some(CrossEncoderReranker::new(embedder))
-        } else {
-            None
-        };
-
-        Ok(Self {
-            bm25_index,
-            config,
-            reranker,
-        })
+        Ok(Self { bm25_index, config })
     }
 
     /// Index a memory for BM25 search
@@ -623,6 +635,15 @@ impl HybridSearchEngine {
         self.bm25_index.commit()
     }
 
+    /// Configured BM25 candidate pool depth (top-K passed to Tantivy by default).
+    ///
+    /// Exposed so callers (e.g., the polarity-aware retrieval path in
+    /// `MemorySystem::semantic_retrieve_inner`, RH-14) can derive overrides
+    /// proportional to the configured baseline rather than hardcoding a value.
+    pub fn candidate_count(&self) -> usize {
+        self.config.candidate_count
+    }
+
     /// Reload BM25 reader to see committed changes immediately
     pub fn reload(&self) -> Result<()> {
         self.bm25_index.reload()
@@ -632,6 +653,22 @@ impl HybridSearchEngine {
     pub fn commit_and_reload(&self) -> Result<()> {
         self.bm25_index.commit()?;
         self.bm25_index.reload()
+    }
+
+    /// Commit batches lost after retries — see [`BM25Index::commit_failure_count`].
+    pub fn bm25_commit_failure_count(&self) -> u64 {
+        self.bm25_index.commit_failure_count()
+    }
+
+    /// Merge BM25 segments to remove ghost state and reclaim space.
+    /// Returns the number of segments merged (0 if already optimal).
+    pub fn optimize_bm25(&self) -> Result<usize> {
+        self.bm25_index.optimize()
+    }
+
+    /// Get BM25 segment count for health metrics
+    pub fn bm25_segment_count(&self) -> usize {
+        self.bm25_index.segment_count()
     }
 
     /// Get BM25 index reference for direct searches
@@ -740,10 +777,44 @@ impl HybridSearchEngine {
     where
         F: Fn(&MemoryId) -> Option<String>,
     {
+        self.search_with_dynamic_weights_pool(
+            query,
+            vector_results,
+            get_content,
+            term_weights,
+            phrase_boosts,
+            keyword_discriminativeness,
+            None,
+        )
+    }
+
+    /// Variant of `search_with_dynamic_weights` that allows the caller to
+    /// override the BM25 candidate pool depth.
+    ///
+    /// Used by the polarity-aware retrieval path (RH-14): when the query is
+    /// polar/negation-sensitive, the pool is multiplied by
+    /// `POLAR_QUERY_BM25_POOL_MULTIPLIER` so that passages containing negation
+    /// markers near the focal entity have a chance to enter the candidate set.
+    /// Pure post-fusion reranking cannot rescue passages that were never
+    /// retrieved — see arXiv 2603.17580 ("Negation is Not Semantic").
+    pub fn search_with_dynamic_weights_pool<F>(
+        &self,
+        query: &str,
+        vector_results: Vec<(MemoryId, f32)>,
+        _get_content: F,
+        term_weights: Option<&HashMap<String, f32>>,
+        phrase_boosts: Option<&[(String, f32)]>,
+        keyword_discriminativeness: Option<f32>,
+        bm25_pool_override: Option<usize>,
+    ) -> Result<Vec<HybridSearchResult>>
+    where
+        F: Fn(&MemoryId) -> Option<String>,
+    {
         // 1. BM25 search with IC-weighted term boosting AND phrase matching
+        let bm25_pool = bm25_pool_override.unwrap_or(self.config.candidate_count);
         let bm25_results = self.bm25_index.search_with_term_and_phrase_weights(
             query,
-            self.config.candidate_count,
+            bm25_pool,
             term_weights,
             phrase_boosts,
         )?;
@@ -788,7 +859,9 @@ impl HybridSearchEngine {
                 bm25_weight,
                 vector_weight,
                 keyword_discriminativeness,
-                &query[..query.len().min(50)]
+                // Char-safe preview: `&query[..50]` would panic if byte 50 lands
+                // inside a multi-byte UTF-8 codepoint (CJK/emoji/accented input).
+                super::char_truncate(query, 50)
             );
         }
 
@@ -810,113 +883,26 @@ impl HybridSearchEngine {
             .map(|(rank, (id, score))| (id.clone(), (*score, rank)))
             .collect();
 
-        // 3. Optional cross-encoder reranking
-        let final_results = if let Some(ref reranker) = self.reranker {
-            // Take top-k for reranking
-            let to_rerank: Vec<_> = fused
-                .iter()
-                .take(self.config.rerank_count)
-                .filter_map(|(id, _score)| {
-                    get_content(id).map(|content| (id.clone(), content, *_score))
-                })
-                .collect();
+        // 3. Build final results from RRF-fused scores
+        let final_results: Vec<HybridSearchResult> = fused
+            .into_iter()
+            .map(|(memory_id, rrf_score)| {
+                let bm25_info = bm25_map.get(&memory_id);
+                let vector_info = vector_map.get(&memory_id);
 
-            if !to_rerank.is_empty() {
-                let reranked = reranker.rerank(query, to_rerank)?;
-
-                // Build rerank map with cosine similarities (range [-1, 1])
-                let rerank_map: HashMap<MemoryId, f32> = reranked.into_iter().collect();
-
-                // Normalize rerank scores to [0, 1] for scale-compatible blending
-                // Cosine similarity ∈ [-1, 1] → shift to [0, 1]
-                let rerank_normalized: HashMap<MemoryId, f32> = rerank_map
-                    .iter()
-                    .map(|(id, s)| (id.clone(), (s + 1.0) / 2.0))
-                    .collect();
-
-                // Combine reranked results with non-reranked
-                // Blend: 0.6 * RRF + 0.4 * normalized_rerank (preserves RRF scale)
-                const RERANK_BLEND: f32 = 0.4;
-                let mut results: Vec<HybridSearchResult> = Vec::new();
-
-                for (memory_id, rrf_score) in fused {
-                    let bm25_info = bm25_map.get(&memory_id);
-                    let vector_info = vector_map.get(&memory_id);
-                    let rerank_score = rerank_map.get(&memory_id).copied();
-
-                    // Blend rerank with RRF to preserve score scale
-                    let final_score = if let Some(norm_rerank) =
-                        rerank_normalized.get(&memory_id).copied()
-                    {
-                        (1.0 - RERANK_BLEND) * rrf_score + RERANK_BLEND * norm_rerank * rrf_score
-                    } else {
-                        rrf_score
-                    };
-
-                    results.push(HybridSearchResult {
-                        memory_id,
-                        score: final_score,
-                        bm25_score: bm25_info.map(|(s, _)| *s),
-                        vector_score: vector_info.map(|(s, _)| *s),
-                        graph_score: None,
-                        rrf_score,
-                        rerank_score,
-                        bm25_rank: bm25_info.map(|(_, r)| *r),
-                        vector_rank: vector_info.map(|(_, r)| *r),
-                        graph_rank: None,
-                    });
+                HybridSearchResult {
+                    memory_id,
+                    score: rrf_score,
+                    bm25_score: bm25_info.map(|(s, _)| *s),
+                    vector_score: vector_info.map(|(s, _)| *s),
+                    graph_score: None,
+                    rrf_score,
+                    bm25_rank: bm25_info.map(|(_, r)| *r),
+                    vector_rank: vector_info.map(|(_, r)| *r),
+                    graph_rank: None,
                 }
-
-                // Re-sort by final score
-                results.sort_by(|a, b| b.score.total_cmp(&a.score));
-
-                results
-            } else {
-                // No content available for reranking, use RRF scores
-                fused
-                    .into_iter()
-                    .map(|(memory_id, rrf_score)| {
-                        let bm25_info = bm25_map.get(&memory_id);
-                        let vector_info = vector_map.get(&memory_id);
-
-                        HybridSearchResult {
-                            memory_id,
-                            score: rrf_score,
-                            bm25_score: bm25_info.map(|(s, _)| *s),
-                            vector_score: vector_info.map(|(s, _)| *s),
-                            graph_score: None,
-                            rrf_score,
-                            rerank_score: None,
-                            bm25_rank: bm25_info.map(|(_, r)| *r),
-                            vector_rank: vector_info.map(|(_, r)| *r),
-                            graph_rank: None,
-                        }
-                    })
-                    .collect()
-            }
-        } else {
-            // No reranking, use RRF scores directly
-            fused
-                .into_iter()
-                .map(|(memory_id, rrf_score)| {
-                    let bm25_info = bm25_map.get(&memory_id);
-                    let vector_info = vector_map.get(&memory_id);
-
-                    HybridSearchResult {
-                        memory_id,
-                        score: rrf_score,
-                        bm25_score: bm25_info.map(|(s, _)| *s),
-                        vector_score: vector_info.map(|(s, _)| *s),
-                        graph_score: None,
-                        rrf_score,
-                        rerank_score: None,
-                        bm25_rank: bm25_info.map(|(_, r)| *r),
-                        vector_rank: vector_info.map(|(_, r)| *r),
-                        graph_rank: None,
-                    }
-                })
-                .collect()
-        };
+            })
+            .collect();
 
         Ok(final_results)
     }
@@ -1043,16 +1029,30 @@ mod tests {
     }
 
     #[test]
-    fn test_cosine_similarity() {
-        let a = vec![1.0, 0.0, 0.0];
-        let b = vec![1.0, 0.0, 0.0];
-        assert!((cosine_similarity(&a, &b) - 1.0).abs() < 0.001);
+    fn test_rrf_fusion_ties_break_by_memory_id() {
+        // Regression: equal RRF scores must resolve to a deterministic order
+        // (ascending MemoryId), not the randomized HashMap iteration order.
+        // Use fixed-byte UUIDs so the expected ordering is known, and put the
+        // HIGHER id first in the input to prove the SORT decides, not input
+        // order.
+        let rrf = RRFusion::new(60.0, vec![0.5, 0.5]);
+        let lo = MemoryId(uuid::Uuid::from_bytes([0x00; 16]));
+        let hi = MemoryId(uuid::Uuid::from_bytes([0xff; 16]));
+        assert!(lo < hi, "fixture ordering precondition");
 
-        let c = vec![0.0, 1.0, 0.0];
-        assert!((cosine_similarity(&a, &c) - 0.0).abs() < 0.001);
+        // Two disjoint single-item lists → identical RRF score (rank 0 in each).
+        let fused = rrf.fuse(vec![vec![(hi.clone(), 0.9)], vec![(lo.clone(), 0.1)]]);
 
-        let d = vec![-1.0, 0.0, 0.0];
-        assert!((cosine_similarity(&a, &d) - (-1.0)).abs() < 0.001);
+        assert_eq!(fused.len(), 2);
+        assert!(
+            (fused[0].1 - fused[1].1).abs() < f32::EPSILON,
+            "scores must tie for this to exercise the tie-break"
+        );
+        assert_eq!(
+            fused[0].0, lo,
+            "tie must resolve to the lower MemoryId first"
+        );
+        assert_eq!(fused[1].0, hi);
     }
 
     #[test]
@@ -1063,8 +1063,6 @@ mod tests {
         assert_eq!(config.graph_weight, 0.25); // Graph for associative retrieval (SHO-D4)
         assert_eq!(config.rrf_k, 45.0); // Lower k for top-rank emphasis
         assert_eq!(config.candidate_count, 100); // Increased for better recall
-        assert_eq!(config.rerank_count, 20);
-        assert!(!config.use_reranking); // Disabled: bi-encoder, not cross-encoder
         assert_eq!(config.min_graph_score, 0.01); // Graph score threshold (SHO-D4)
     }
 

@@ -285,17 +285,22 @@ impl VamanaIndex {
 
     /// Initialize random graph
     fn initialize_graph(&mut self, n: usize) -> Result<()> {
-        use rand::seq::SliceRandom;
         let mut rng = rand::thread_rng();
+        let degree = self.config.max_degree.min(n.saturating_sub(1));
 
         let mut graph = Vec::with_capacity(n);
 
         for i in 0..n {
-            // Create random edges
-            let mut neighbors: Vec<u32> = (0..n as u32).filter(|&j| j != i as u32).collect();
-
-            neighbors.shuffle(&mut rng);
-            neighbors.truncate(self.config.max_degree);
+            // Sample `degree` random neighbors (excluding self) in O(degree) time
+            let mut neighbors = Vec::with_capacity(degree);
+            if degree > 0 && n > 1 {
+                let sample = rand::seq::index::sample(&mut rng, n - 1, degree);
+                for idx in sample.into_vec() {
+                    // Map sampled indices to node IDs, skipping self
+                    let j = if idx >= i { idx + 1 } else { idx };
+                    neighbors.push(j as u32);
+                }
+            }
 
             graph.push(VamanaNode {
                 id: i as u32,
@@ -343,7 +348,7 @@ impl VamanaIndex {
             }
 
             // SAFETY CHECK: Verify size is properly aligned for f32 (4-byte alignment)
-            if file_size % std::mem::align_of::<f32>() != 0 {
+            if !file_size.is_multiple_of(std::mem::align_of::<f32>()) {
                 anyhow::bail!(
                     "File size {} is not aligned to f32 alignment ({})",
                     file_size,
@@ -665,9 +670,13 @@ impl VamanaIndex {
         let storage = self.vectors.read(); // Hold lock for entire prune operation
         let node_slice = Self::get_slice_from_storage(&storage, node_id)?;
 
-        // Sort candidates by distance (NaN values sort to end)
+        // Sort candidates by distance (NaN values sort to end), tie-break by id for determinism
         let mut sorted_candidates = candidates.to_vec();
-        sorted_candidates.sort_by(|a, b| a.distance.total_cmp(&b.distance));
+        sorted_candidates.sort_by(|a, b| {
+            a.distance
+                .total_cmp(&b.distance)
+                .then_with(|| a.id.cmp(&b.id))
+        });
 
         // Pre-load all candidate vectors to avoid repeated storage lookups
         // This trades memory for CPU - worth it for the O(n²) inner loop
@@ -691,6 +700,19 @@ impl VamanaIndex {
         // Cache existing vectors for O(1) access in inner loop
         let mut pruned_vectors: Vec<&[f32]> = Vec::with_capacity(self.config.max_degree);
 
+        // The α-RNG rule requires NONNEGATIVE distances. NormalizedDotProduct
+        // returns d = -dot ∈ [-1, 1]: multiplying a NEGATIVE d by α > 1 makes it
+        // "closer", inverting the prune rule — for near-tied similar candidates
+        // `α·dist_ce ≤ dist_nc` then fires for everything after the first kept
+        // neighbor and the built graph degenerates to out-degree ~1 (reproduced by
+        // retrieval::tests::test_force_quality_rebuild_*). Shift to cosine
+        // distance (1 + d ∈ [0, 2]) for the α comparison; Euclidean/Cosine are
+        // already nonnegative (offset 0).
+        let rng_offset = match self.config.distance_metric {
+            DistanceMetric::NormalizedDotProduct => 1.0_f32,
+            DistanceMetric::Euclidean | DistanceMetric::Cosine => 0.0_f32,
+        };
+
         for (candidate_id, candidate_vec, _candidate_dist) in &candidate_vectors {
             let dist_nc = self.distance(node_slice, candidate_vec);
 
@@ -699,8 +721,10 @@ impl VamanaIndex {
                 let dist_ne = pruned_dist_ne[i]; // Cached - no recomputation!
                 let dist_ce = self.distance(candidate_vec, pruned_vectors[i]);
 
-                // α-RNG pruning condition
-                if self.config.alpha * dist_ce <= dist_nc && dist_ce <= dist_ne {
+                // α-RNG pruning condition (on the nonnegative-shifted scale)
+                if self.config.alpha * (dist_ce + rng_offset) <= (dist_nc + rng_offset)
+                    && dist_ce <= dist_ne
+                {
                     should_add = false;
                     break;
                 }
@@ -741,6 +765,15 @@ impl VamanaIndex {
         // Check if index is empty
         if self.num_vectors.load(std::sync::atomic::Ordering::Acquire) == 0 {
             return Ok(Vec::new());
+        }
+
+        // SHODH_VECTOR_EXACT=1 → bypass the Vamana ANN graph and return the TRUE
+        // k nearest neighbours by exact brute-force. Diagnostic: separates *index
+        // recall* (ANN vs exact, the number LanceDB/FAISS publish) from *task recall*
+        // (gold answers). If task recall is unchanged vs ANN, the index is faithful
+        // and the embeddings — not the index — are the ceiling.
+        if std::env::var("SHODH_VECTOR_EXACT").is_ok() {
+            return self.brute_force_search(query, k);
         }
 
         // Check if graph is built
@@ -913,8 +946,9 @@ impl VamanaIndex {
                         })
                         .collect();
 
-                    // Sort by distance (lower = closer for all metrics)
-                    neighbor_distances.sort_by(|a, b| a.1.total_cmp(&b.1));
+                    // Sort by distance (lower = closer for all metrics), tie-break by id
+                    neighbor_distances
+                        .sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
 
                     // Keep only max_degree closest neighbors
                     graph[neighbor_id as usize].neighbors = neighbor_distances
@@ -978,7 +1012,7 @@ impl VamanaIndex {
         let inserts = self
             .incremental_inserts
             .load(std::sync::atomic::Ordering::Relaxed);
-        inserts >= REPAIR_THRESHOLD && inserts < REBUILD_THRESHOLD
+        (REPAIR_THRESHOLD..REBUILD_THRESHOLD).contains(&inserts)
     }
 
     /// Perform incremental repair on recently inserted nodes
@@ -1147,7 +1181,7 @@ impl VamanaIndex {
             distances.push((id, dist));
         }
 
-        distances.sort_by(|a, b| a.1.total_cmp(&b.1));
+        distances.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
         distances.truncate(k);
 
         Ok(distances)
@@ -1500,11 +1534,15 @@ impl VamanaIndex {
             deleted_ids: self.deleted_ids.read().clone(),
         };
 
-        // Save as binary
+        // Save as length-prefixed postcard binary
         let index_file = path.join("vamana_index.bin");
+        let encoded = crate::serialization::encode_raw(&data)?;
         let file = File::create(&index_file)?;
         let mut writer = BufWriter::new(file);
-        bincode::serde::encode_into_std_write(&data, &mut writer, bincode::config::standard())?;
+        use std::io::Write;
+        writer.write_all(&(encoded.len() as u64).to_le_bytes())?;
+        writer.write_all(&encoded)?;
+        writer.flush()?;
 
         info!(
             "Saved Vamana index with {} vectors to {:?}",
@@ -1539,8 +1577,31 @@ impl VamanaIndex {
             deleted_ids: HashSet<u32>,
         }
 
-        let data: VamanaData =
-            bincode::serde::decode_from_std_read(&mut reader, bincode::config::standard())?;
+        // Try new length-prefixed postcard format, fall back to legacy bincode streaming
+        let data: VamanaData = {
+            use std::io::Read;
+            let mut len_buf = [0u8; 8];
+            let postcard_result = reader.read_exact(&mut len_buf).ok().and_then(|()| {
+                let len = u64::from_le_bytes(len_buf) as usize;
+                // Sanity check: reject implausible lengths (> 4 GB)
+                if len > 4 * 1024 * 1024 * 1024 {
+                    return None;
+                }
+                let mut buf = vec![0u8; len];
+                reader.read_exact(&mut buf).ok()?;
+                crate::serialization::decode_raw::<VamanaData>(&buf).ok()
+            });
+            match postcard_result {
+                Some(data) => data,
+                None => {
+                    // Fall back to legacy bincode streaming format
+                    drop(reader);
+                    let file = File::open(path.join("vamana_index.bin"))?;
+                    let mut reader = BufReader::new(file);
+                    bincode::serde::decode_from_std_read(&mut reader, crate::bincode_safe_config())?
+                }
+            }
+        };
 
         // Update internal state
         *self.graph.write() = data.graph;
@@ -1559,12 +1620,16 @@ impl VamanaIndex {
             );
             *self.vectors.write() = VectorStorage::Memory(data.vectors);
         } else {
-            match &mut *self.vectors.write() {
-                VectorStorage::Memory(vecs) => {
-                    *vecs = data.vectors;
-                }
-                VectorStorage::Mmap { .. } => unreachable!(),
+            let is_mmap_variant = matches!(&*self.vectors.read(), VectorStorage::Mmap { .. });
+            if is_mmap_variant {
+                warn!(
+                    "Unexpected mmap storage with use_mmap=false during apply_persisted_data; \
+                     converting {} vectors to in-memory storage",
+                    data.num_vectors
+                );
             }
+            // Both branches set to Memory storage — safe assignment without match borrow
+            *self.vectors.write() = VectorStorage::Memory(data.vectors);
         }
 
         // Restore soft-deleted IDs
@@ -1598,7 +1663,12 @@ impl Eq for SearchCandidate {}
 
 impl Ord for SearchCandidate {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.distance.total_cmp(&other.distance)
+        // Stable tie-break by id ensures deterministic rank order across runs and machines.
+        // Without this, equal-distance candidates can swap positions based on float
+        // accumulation order, causing rank flips on the recall harness between CPUs.
+        self.distance
+            .total_cmp(&other.distance)
+            .then_with(|| self.id.cmp(&other.id))
     }
 }
 

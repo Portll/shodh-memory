@@ -13,6 +13,7 @@ pub mod health;
 pub mod utils;
 
 // Memory core operations
+pub mod anomalies;
 pub mod crud;
 pub mod recall;
 pub mod remember;
@@ -24,6 +25,7 @@ pub mod lineage;
 pub mod search;
 
 // Knowledge graph
+pub mod export;
 pub mod graph;
 pub mod visualization;
 
@@ -55,6 +57,8 @@ pub mod ab_testing;
 pub mod test_helpers;
 
 // Re-export commonly used items
-pub use router::{build_protected_routes, build_public_routes, build_router, AppState};
+pub use router::{
+    build_probe_routes, build_protected_routes, build_public_routes, build_router, AppState,
+};
 pub use state::MultiUserMemoryManager;
 pub use types::*;

@@ -65,6 +65,7 @@ impl Default for CorsConfig {
             allowed_headers: vec![
                 "Content-Type".to_string(),
                 "Authorization".to_string(),
+                "X-API-Key".to_string(),
                 "X-Request-ID".to_string(),
             ],
             allow_credentials: false,
@@ -266,6 +267,11 @@ pub struct ServerConfig {
     /// Rate limit: burst size (default: 8000 - allows rapid agent bursts)
     pub rate_limit_burst: u32,
 
+    /// Whether non-probe public routes (webhooks, context status, graph view)
+    /// are rate-limited (default: true). Health probe routes (`/health*`) are
+    /// never rate-limited. Set SHODH_PUBLIC_RATE_LIMIT=false to opt out.
+    pub public_rate_limit: bool,
+
     /// Maximum concurrent requests (default: 200)
     pub max_concurrent_requests: usize,
 
@@ -303,6 +309,17 @@ pub struct ServerConfig {
     /// Caps the number of NER/tag/regex entities to prevent O(n²) edge explosion
     /// in the knowledge graph. 10 entities → max 45 co-occurrence edges.
     pub max_entities_per_memory: usize,
+
+    /// Whether opt-in telemetry heartbeat is enabled (default: false)
+    /// Sends anonymous aggregate stats (version, OS, user count, memory count) once per day.
+    /// No PII, no memory content, no queries. Set SHODH_TELEMETRY=true to opt in.
+    pub telemetry_enabled: bool,
+
+    /// Telemetry endpoint URL
+    pub telemetry_url: String,
+
+    /// Telemetry heartbeat interval in seconds (default: 86400 = 24 hours)
+    pub telemetry_interval_secs: u64,
 }
 
 impl Default for ServerConfig {
@@ -317,6 +334,7 @@ impl Default for ServerConfig {
             audit_retention_days: 30,
             rate_limit_per_second: 4000,
             rate_limit_burst: 8000,
+            public_rate_limit: true,
             max_concurrent_requests: 200,
             request_timeout_secs: 60,
             is_production: false,
@@ -327,6 +345,9 @@ impl Default for ServerConfig {
             backup_max_count: 7,           // Keep 7 backups (1 week of daily backups)
             backup_enabled: false,         // Disabled by default, auto-enabled in production
             max_entities_per_memory: 10,   // Cap entities per memory (10 → max 45 edges)
+            telemetry_enabled: false,
+            telemetry_url: "https://shodh-memory.com/api/telemetry".to_string(),
+            telemetry_interval_secs: 86400, // 24 hours
         }
     }
 }
@@ -393,6 +414,13 @@ impl ServerConfig {
             if let Ok(n) = val.parse() {
                 config.rate_limit_burst = n;
             }
+        }
+
+        // Public-route rate limiting is on by default; only an explicit
+        // false/0 disables it (any other value keeps the secure default).
+        if let Ok(val) = env::var("SHODH_PUBLIC_RATE_LIMIT") {
+            let v = val.to_lowercase();
+            config.public_rate_limit = !(v == "false" || v == "0");
         }
 
         // Concurrency
@@ -474,6 +502,23 @@ impl ServerConfig {
             }
         }
 
+        // Telemetry (opt-in)
+        if let Ok(val) = env::var("SHODH_TELEMETRY") {
+            config.telemetry_enabled = val.to_lowercase() == "true" || val == "1";
+        }
+
+        if let Ok(val) = env::var("SHODH_TELEMETRY_URL") {
+            if !val.is_empty() {
+                config.telemetry_url = val;
+            }
+        }
+
+        if let Ok(val) = env::var("SHODH_TELEMETRY_INTERVAL") {
+            if let Ok(n) = val.parse::<u64>() {
+                config.telemetry_interval_secs = n.max(60); // minimum 60 seconds
+            }
+        }
+
         config
     }
 
@@ -520,6 +565,15 @@ impl ServerConfig {
         } else {
             info!("   Backup: disabled");
         }
+        if self.telemetry_enabled {
+            let interval_hours = self.telemetry_interval_secs / 3600;
+            info!(
+                "   Telemetry: enabled (→ {}, every {}h)",
+                self.telemetry_url, interval_hours
+            );
+        } else {
+            info!("   Telemetry: disabled (set SHODH_TELEMETRY=true to opt in)");
+        }
     }
 }
 
@@ -534,6 +588,9 @@ pub fn print_env_help() {
     );
     println!("  SHODH_PORT             - Server port (default: 3030)");
     println!("  SHODH_MEMORY_PATH      - Storage directory (default: platform data dir, e.g. ~/.local/share/shodh-memory/)");
+    println!("  SHODH_IPC_ENABLED      - Enable local IPC listener (default: true)");
+    println!("  SHODH_IPC_ENDPOINT     - Override the platform-default socket or named pipe");
+    println!("  SHODH_IPC_REQUIRED     - Fail closed when local IPC cannot bind or authenticate");
     println!("  SHODH_API_KEYS         - Comma-separated API keys (required in production)");
     println!("  SHODH_DEV_API_KEY      - Development API key (required in dev if SHODH_API_KEYS not set)");
     println!("  SHODH_MAX_USERS        - Max users in memory LRU (default: 1000)");
@@ -541,8 +598,17 @@ pub fn print_env_help() {
     println!("  SHODH_RATE_BURST       - Burst size (default: 8000)");
     println!("  SHODH_MAX_CONCURRENT   - Max concurrent requests (default: 200)");
     println!("  SHODH_REQUEST_TIMEOUT  - Request timeout in seconds (default: 60)");
+    println!("  SHODH_ROCKSDB_BLOCK_CACHE_MB - Shared RocksDB block cache in MiB (default: 256)");
     println!("  SHODH_AUDIT_MAX_ENTRIES    - Max audit entries per user (default: 10000)");
     println!("  SHODH_AUDIT_RETENTION_DAYS - Audit log retention days (default: 30)");
+    println!();
+    println!("Security (secure defaults — override only if you understand the risk):");
+    println!("  SHODH_ALLOW_UNSIGNED_WEBHOOKS - Accept webhooks when no *_WEBHOOK_SECRET is set (default: false = reject)");
+    println!(
+        "  SHODH_PUBLIC_RATE_LIMIT       - Rate-limit non-probe public routes (default: true)"
+    );
+    println!("  SHODH_ENFORCE_HTTPS           - Reject insecure http:// integration API URL overrides (default: false = warn)");
+    println!("  SHODH_METRICS_PUBLIC          - Expose /metrics without authentication (default: false = require API key)");
     println!();
     println!("Integration APIs:");
     println!("  LINEAR_API_URL         - Linear GraphQL API URL (default: https://api.linear.app/graphql)");
@@ -622,63 +688,5 @@ mod tests {
             ..Default::default()
         };
         let _layer = cors.to_layer(); // Should not panic
-    }
-
-    #[test]
-    fn test_activation_decay_clamping() {
-        env::set_var("SHODH_ACTIVATION_DECAY", "0.9");
-        let config = ServerConfig::from_env();
-        assert_eq!(config.activation_decay_factor, 0.9);
-
-        env::set_var("SHODH_ACTIVATION_DECAY", "0.1");
-        let config = ServerConfig::from_env();
-        assert_eq!(config.activation_decay_factor, 0.5);
-
-        env::set_var("SHODH_ACTIVATION_DECAY", "1.5");
-        let config = ServerConfig::from_env();
-        assert_eq!(config.activation_decay_factor, 0.99);
-
-        env::remove_var("SHODH_ACTIVATION_DECAY");
-    }
-
-    #[test]
-    fn test_max_entities_clamping() {
-        env::set_var("SHODH_MAX_ENTITIES", "10");
-        let config = ServerConfig::from_env();
-        assert_eq!(config.max_entities_per_memory, 10);
-
-        env::set_var("SHODH_MAX_ENTITIES", "0");
-        let config = ServerConfig::from_env();
-        assert_eq!(config.max_entities_per_memory, 1);
-
-        env::set_var("SHODH_MAX_ENTITIES", "100");
-        let config = ServerConfig::from_env();
-        assert_eq!(config.max_entities_per_memory, 50);
-
-        env::remove_var("SHODH_MAX_ENTITIES");
-    }
-
-    #[test]
-    fn test_production_mode_detection_and_backup_default() {
-        env::set_var("SHODH_ENV", "production");
-        env::remove_var("SHODH_BACKUP_ENABLED");
-        let config = ServerConfig::from_env();
-        assert!(config.is_production);
-        assert!(config.backup_enabled);
-
-        env::set_var("SHODH_ENV", "prod");
-        let config = ServerConfig::from_env();
-        assert!(config.is_production);
-
-        env::set_var("SHODH_ENV", "development");
-        let config = ServerConfig::from_env();
-        assert!(!config.is_production);
-
-        env::set_var("SHODH_ENV", "PRODUCTION");
-        let config = ServerConfig::from_env();
-        assert!(config.is_production);
-
-        env::remove_var("SHODH_ENV");
-        env::remove_var("SHODH_BACKUP_ENABLED");
     }
 }

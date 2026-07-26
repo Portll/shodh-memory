@@ -109,10 +109,26 @@ pub fn validate_memory_id_or_prefix(memory_id: &str) -> Result<Option<uuid::Uuid
     Ok(None)
 }
 
+/// Minimum content length for a meaningful memory.
+/// Anything shorter (e.g. "TT", "OK", "WTesti") is noise from truncated tool output
+/// or partial hook captures and should be rejected.
+pub const MIN_MEANINGFUL_CONTENT_LENGTH: usize = 10;
+
 /// Validate content
 pub fn validate_content(content: &str, allow_empty: bool) -> Result<()> {
-    if !allow_empty && content.trim().is_empty() {
+    let trimmed = content.trim();
+
+    if !allow_empty && trimmed.is_empty() {
         return Err(anyhow!("content cannot be empty"));
+    }
+
+    // Reject very short content that can't possibly be a meaningful memory
+    if !allow_empty && !trimmed.is_empty() && trimmed.len() < MIN_MEANINGFUL_CONTENT_LENGTH {
+        return Err(anyhow!(
+            "content too short: {} chars (min: {})",
+            trimmed.len(),
+            MIN_MEANINGFUL_CONTENT_LENGTH
+        ));
     }
 
     if content.len() > MAX_CONTENT_LENGTH {
@@ -274,6 +290,134 @@ pub fn validate_weight(name: &str, value: f32) -> Result<()> {
     Ok(())
 }
 
+/// Validate geo_location coordinates [lat, lon, alt]
+pub fn validate_geo_location(geo: &[f64; 3]) -> Result<()> {
+    if !geo[0].is_finite() || !(-90.0..=90.0).contains(&geo[0]) {
+        return Err(anyhow!(
+            "latitude must be between -90.0 and 90.0, got: {}",
+            geo[0]
+        ));
+    }
+    if !geo[1].is_finite() || !(-180.0..=180.0).contains(&geo[1]) {
+        return Err(anyhow!(
+            "longitude must be between -180.0 and 180.0, got: {}",
+            geo[1]
+        ));
+    }
+    if !geo[2].is_finite() {
+        return Err(anyhow!("altitude must be a finite number, got: {}", geo[2]));
+    }
+    Ok(())
+}
+
+/// Validate a GeoFilter for spatial recall queries
+pub fn validate_geo_filter(lat: f64, lon: f64, radius_meters: f64) -> Result<()> {
+    if !lat.is_finite() || !(-90.0..=90.0).contains(&lat) {
+        return Err(anyhow!(
+            "geo_filter latitude must be between -90.0 and 90.0, got: {lat}"
+        ));
+    }
+    if !lon.is_finite() || !(-180.0..=180.0).contains(&lon) {
+        return Err(anyhow!(
+            "geo_filter longitude must be between -180.0 and 180.0, got: {lon}"
+        ));
+    }
+    if !radius_meters.is_finite() || radius_meters <= 0.0 {
+        return Err(anyhow!(
+            "geo_filter radius_meters must be > 0, got: {radius_meters}"
+        ));
+    }
+    // Earth's circumference is ~40,075 km
+    if radius_meters > 40_075_000.0 {
+        return Err(anyhow!(
+            "geo_filter radius_meters exceeds Earth's circumference: {radius_meters}"
+        ));
+    }
+    Ok(())
+}
+
+/// Maximum number of keys in sensor_data
+pub const MAX_SENSOR_DATA_KEYS: usize = 1000;
+
+/// Known outcome_type values for robotics experiences
+const KNOWN_OUTCOME_TYPES: &[&str] = &[
+    "success", "failure", "failed", "error", "partial", "aborted", "timeout",
+];
+
+/// Known severity levels for robotics experiences
+const KNOWN_SEVERITIES: &[&str] = &["info", "warning", "error", "critical"];
+
+/// Validate reward signal is finite and within [-1.0, 1.0]
+pub fn validate_reward(reward: f32) -> Result<()> {
+    if !reward.is_finite() {
+        return Err(anyhow!("reward must be a finite number, got: {reward}"));
+    }
+    if !(-1.0..=1.0).contains(&reward) {
+        return Err(anyhow!(
+            "reward must be between -1.0 and 1.0, got: {reward}"
+        ));
+    }
+    Ok(())
+}
+
+/// Validate heading is finite and within [0.0, 360.0]
+pub fn validate_heading(heading: f32) -> Result<()> {
+    if !heading.is_finite() {
+        return Err(anyhow!("heading must be a finite number, got: {heading}"));
+    }
+    if !(0.0..=360.0).contains(&heading) {
+        return Err(anyhow!(
+            "heading must be between 0.0 and 360.0 degrees, got: {heading}"
+        ));
+    }
+    Ok(())
+}
+
+/// Warn on unknown outcome_type values (returns warning message, does not reject)
+pub fn warn_outcome_type(outcome_type: &str) -> Option<String> {
+    if !KNOWN_OUTCOME_TYPES.contains(&outcome_type) {
+        Some(format!(
+            "unknown outcome_type '{}', known values: {:?}",
+            outcome_type, KNOWN_OUTCOME_TYPES
+        ))
+    } else {
+        None
+    }
+}
+
+/// Warn on unknown severity values (returns warning message, does not reject)
+pub fn warn_severity(severity: &str) -> Option<String> {
+    if !KNOWN_SEVERITIES.contains(&severity) {
+        Some(format!(
+            "unknown severity '{}', known values: {:?}",
+            severity, KNOWN_SEVERITIES
+        ))
+    } else {
+        None
+    }
+}
+
+/// Validate sensor_data: max key count, all values must be finite
+pub fn validate_sensor_data(sensor_data: &std::collections::HashMap<String, f64>) -> Result<()> {
+    if sensor_data.len() > MAX_SENSOR_DATA_KEYS {
+        return Err(anyhow!(
+            "sensor_data has too many keys: {} (max: {})",
+            sensor_data.len(),
+            MAX_SENSOR_DATA_KEYS
+        ));
+    }
+    for (key, value) in sensor_data {
+        if !value.is_finite() {
+            return Err(anyhow!(
+                "sensor_data value for key '{}' is not finite: {}",
+                key,
+                value
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Validate a reminder timestamp is not unreasonably far in the past or future
 pub fn validate_reminder_timestamp(at: &chrono::DateTime<chrono::Utc>) -> Result<()> {
     let now = chrono::Utc::now();
@@ -290,6 +434,121 @@ pub fn validate_reminder_timestamp(at: &chrono::DateTime<chrono::Utc>) -> Result
         ));
     }
 
+    Ok(())
+}
+
+// =============================================================================
+// GENERIC GUARDRAIL VALIDATORS
+// =============================================================================
+
+/// Maximum limit for list/search operations to prevent resource exhaustion.
+pub const MAX_LIMIT: usize = 10_000;
+
+/// Maximum query text length (50KB, same as content).
+pub const MAX_QUERY_LENGTH: usize = 50_000;
+
+/// Maximum string length for short fields (action_type, terrain_type, etc.).
+pub const MAX_SHORT_STRING_LENGTH: usize = 256;
+
+/// Maximum tags per memory/todo.
+pub const MAX_TAGS: usize = 50;
+
+/// Validate a limit/max_results field: must be > 0 and <= MAX_LIMIT.
+pub fn validate_limit(limit: usize, field: &str) -> Result<()> {
+    if limit == 0 {
+        return Err(anyhow!("{field} must be greater than 0"));
+    }
+    if limit > MAX_LIMIT {
+        return Err(anyhow!("{field} too large: {limit} (max: {MAX_LIMIT})"));
+    }
+    Ok(())
+}
+
+/// Validate a float that must be in [0.0, 1.0] and finite.
+pub fn validate_unit_float(value: f32, field: &str) -> Result<()> {
+    if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+        return Err(anyhow!("{field} must be between 0.0 and 1.0, got: {value}"));
+    }
+    Ok(())
+}
+
+/// Validate a float that must be in [-1.0, 1.0] and finite (for bipolar values like valence).
+pub fn validate_bipolar_float(value: f32, field: &str) -> Result<()> {
+    if !value.is_finite() || !(-1.0..=1.0).contains(&value) {
+        return Err(anyhow!(
+            "{field} must be between -1.0 and 1.0, got: {value}"
+        ));
+    }
+    Ok(())
+}
+
+/// Validate query text: not empty, not too long.
+pub fn validate_query_text(query: &str) -> Result<()> {
+    if query.trim().is_empty() {
+        return Err(anyhow!("query cannot be empty"));
+    }
+    if query.len() > MAX_QUERY_LENGTH {
+        return Err(anyhow!(
+            "query too long: {} bytes (max: {MAX_QUERY_LENGTH})",
+            query.len()
+        ));
+    }
+    Ok(())
+}
+
+/// Validate a short string field (action_type, terrain_type, etc.).
+pub fn validate_short_string(value: &str, field: &str) -> Result<()> {
+    if value.is_empty() {
+        return Err(anyhow!("{field} cannot be empty"));
+    }
+    if value.len() > MAX_SHORT_STRING_LENGTH {
+        return Err(anyhow!(
+            "{field} too long: {} chars (max: {MAX_SHORT_STRING_LENGTH})",
+            value.len()
+        ));
+    }
+    if value.chars().any(|c| c.is_control()) {
+        return Err(anyhow!("{field} contains invalid control characters"));
+    }
+    Ok(())
+}
+
+/// Validate tags list: count cap + per-tag length.
+pub fn validate_tags(tags: &[String]) -> Result<()> {
+    if tags.len() > MAX_TAGS {
+        return Err(anyhow!("too many tags: {} (max: {MAX_TAGS})", tags.len()));
+    }
+    for tag in tags {
+        if tag.len() > MAX_SHORT_STRING_LENGTH {
+            return Err(anyhow!(
+                "tag too long: {} chars (max: {MAX_SHORT_STRING_LENGTH})",
+                tag.len()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Validate a range pair: min must be <= max, both must be finite.
+pub fn validate_range(min: f64, max: f64, field: &str) -> Result<()> {
+    if !min.is_finite() || !max.is_finite() {
+        return Err(anyhow!("{field} range values must be finite"));
+    }
+    if min > max {
+        return Err(anyhow!("{field} min ({min}) must be <= max ({max})"));
+    }
+    Ok(())
+}
+
+/// Validate local_position [x, y, z]: all values must be finite.
+pub fn validate_local_position(pos: &[f64; 3]) -> Result<()> {
+    for (i, v) in pos.iter().enumerate() {
+        if !v.is_finite() {
+            return Err(anyhow!(
+                "local_position[{i}] must be a finite number, got: {v}"
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -334,6 +593,24 @@ mod tests {
     fn test_invalid_content() {
         assert!(validate_content("", false).is_err()); // empty not allowed
         assert!(validate_content(&"x".repeat(100_000), false).is_err()); // too long
+    }
+
+    #[test]
+    fn test_content_min_length_gate() {
+        // Junk that should be rejected
+        assert!(validate_content("TT", false).is_err());
+        assert!(validate_content("OK", false).is_err());
+        assert!(validate_content("WTesti", false).is_err());
+        assert!(validate_content("A", false).is_err());
+        assert!(validate_content("   TT   ", false).is_err()); // trimmed still too short
+
+        // Legitimate short content that should pass
+        assert!(validate_content("short note", false).is_ok()); // exactly 10 chars
+        assert!(validate_content("real memory content here", false).is_ok());
+
+        // allow_empty bypasses both empty and min-length checks (used for optional updates)
+        assert!(validate_content("", true).is_ok());
+        assert!(validate_content("TT", true).is_ok());
     }
 
     #[test]
@@ -474,6 +751,113 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_geo_location() {
+        // Valid coordinates
+        assert!(validate_geo_location(&[37.7749, -122.4194, 10.0]).is_ok());
+        assert!(validate_geo_location(&[0.0, 0.0, 0.0]).is_ok());
+        assert!(validate_geo_location(&[-90.0, -180.0, -100.0]).is_ok());
+        assert!(validate_geo_location(&[90.0, 180.0, 8848.0]).is_ok());
+
+        // Invalid latitude
+        assert!(validate_geo_location(&[91.0, 0.0, 0.0]).is_err());
+        assert!(validate_geo_location(&[-91.0, 0.0, 0.0]).is_err());
+
+        // Invalid longitude
+        assert!(validate_geo_location(&[0.0, 181.0, 0.0]).is_err());
+        assert!(validate_geo_location(&[0.0, -181.0, 0.0]).is_err());
+
+        // NaN/Inf
+        assert!(validate_geo_location(&[f64::NAN, 0.0, 0.0]).is_err());
+        assert!(validate_geo_location(&[0.0, 0.0, f64::INFINITY]).is_err());
+    }
+
+    #[test]
+    fn test_validate_geo_filter() {
+        // Valid filters
+        assert!(validate_geo_filter(37.7749, -122.4194, 1000.0).is_ok());
+        assert!(validate_geo_filter(0.0, 0.0, 1.0).is_ok());
+
+        // Invalid latitude
+        assert!(validate_geo_filter(91.0, 0.0, 100.0).is_err());
+
+        // Invalid longitude
+        assert!(validate_geo_filter(0.0, 181.0, 100.0).is_err());
+
+        // Invalid radius
+        assert!(validate_geo_filter(0.0, 0.0, 0.0).is_err());
+        assert!(validate_geo_filter(0.0, 0.0, -1.0).is_err());
+        assert!(validate_geo_filter(0.0, 0.0, 50_000_000.0).is_err()); // > Earth circumference
+    }
+
+    #[test]
+    fn test_validate_reward() {
+        assert!(validate_reward(0.0).is_ok());
+        assert!(validate_reward(-1.0).is_ok());
+        assert!(validate_reward(1.0).is_ok());
+        assert!(validate_reward(0.5).is_ok());
+        assert!(validate_reward(-0.5).is_ok());
+        assert!(validate_reward(-1.1).is_err());
+        assert!(validate_reward(1.1).is_err());
+        assert!(validate_reward(f32::NAN).is_err());
+        assert!(validate_reward(f32::INFINITY).is_err());
+        assert!(validate_reward(f32::NEG_INFINITY).is_err());
+    }
+
+    #[test]
+    fn test_validate_heading() {
+        assert!(validate_heading(0.0).is_ok());
+        assert!(validate_heading(180.0).is_ok());
+        assert!(validate_heading(360.0).is_ok());
+        assert!(validate_heading(-1.0).is_err());
+        assert!(validate_heading(361.0).is_err());
+        assert!(validate_heading(f32::NAN).is_err());
+        assert!(validate_heading(f32::INFINITY).is_err());
+    }
+
+    #[test]
+    fn test_warn_outcome_type() {
+        assert!(warn_outcome_type("success").is_none());
+        assert!(warn_outcome_type("failure").is_none());
+        assert!(warn_outcome_type("timeout").is_none());
+        assert!(warn_outcome_type("unknown_value").is_some());
+        assert!(warn_outcome_type("").is_some());
+    }
+
+    #[test]
+    fn test_warn_severity() {
+        assert!(warn_severity("info").is_none());
+        assert!(warn_severity("critical").is_none());
+        assert!(warn_severity("unknown").is_some());
+    }
+
+    #[test]
+    fn test_validate_sensor_data() {
+        use std::collections::HashMap;
+
+        // Valid
+        let mut data = HashMap::new();
+        data.insert("battery".to_string(), 72.5);
+        data.insert("temperature".to_string(), 23.1);
+        assert!(validate_sensor_data(&data).is_ok());
+
+        // Empty is valid
+        assert!(validate_sensor_data(&HashMap::new()).is_ok());
+
+        // Non-finite value
+        let mut bad = HashMap::new();
+        bad.insert("broken".to_string(), f64::NAN);
+        assert!(validate_sensor_data(&bad).is_err());
+
+        let mut inf = HashMap::new();
+        inf.insert("overflow".to_string(), f64::INFINITY);
+        assert!(validate_sensor_data(&inf).is_err());
+
+        // Too many keys
+        let too_many: HashMap<String, f64> = (0..1001).map(|i| (format!("k{i}"), 0.0)).collect();
+        assert!(validate_sensor_data(&too_many).is_err());
+    }
+
+    #[test]
     fn test_validate_reminder_timestamp() {
         let now = chrono::Utc::now();
 
@@ -488,5 +872,86 @@ mod tests {
 
         // Invalid: 10 years from now
         assert!(validate_reminder_timestamp(&(now + chrono::Duration::days(365 * 10))).is_err());
+    }
+
+    // =========================================================================
+    // GUARDRAIL VALIDATOR TESTS
+    // =========================================================================
+
+    #[test]
+    fn test_validate_limit() {
+        assert!(validate_limit(1, "limit").is_ok());
+        assert!(validate_limit(100, "limit").is_ok());
+        assert!(validate_limit(10_000, "limit").is_ok());
+        assert!(validate_limit(0, "limit").is_err());
+        assert!(validate_limit(10_001, "limit").is_err());
+        assert!(validate_limit(usize::MAX, "limit").is_err());
+    }
+
+    #[test]
+    fn test_validate_unit_float() {
+        assert!(validate_unit_float(0.0, "x").is_ok());
+        assert!(validate_unit_float(0.5, "x").is_ok());
+        assert!(validate_unit_float(1.0, "x").is_ok());
+        assert!(validate_unit_float(-0.1, "x").is_err());
+        assert!(validate_unit_float(1.1, "x").is_err());
+        assert!(validate_unit_float(f32::NAN, "x").is_err());
+        assert!(validate_unit_float(f32::INFINITY, "x").is_err());
+    }
+
+    #[test]
+    fn test_validate_bipolar_float() {
+        assert!(validate_bipolar_float(0.0, "x").is_ok());
+        assert!(validate_bipolar_float(-1.0, "x").is_ok());
+        assert!(validate_bipolar_float(1.0, "x").is_ok());
+        assert!(validate_bipolar_float(-1.1, "x").is_err());
+        assert!(validate_bipolar_float(1.1, "x").is_err());
+        assert!(validate_bipolar_float(f32::NAN, "x").is_err());
+    }
+
+    #[test]
+    fn test_validate_query_text() {
+        assert!(validate_query_text("hello world").is_ok());
+        assert!(validate_query_text("").is_err());
+        assert!(validate_query_text("   ").is_err());
+        assert!(validate_query_text(&"a".repeat(50_001)).is_err());
+    }
+
+    #[test]
+    fn test_validate_short_string() {
+        assert!(validate_short_string("navigate", "action_type").is_ok());
+        assert!(validate_short_string("", "action_type").is_err());
+        assert!(validate_short_string(&"a".repeat(257), "action_type").is_err());
+        assert!(validate_short_string("bad\x00string", "action_type").is_err());
+    }
+
+    #[test]
+    fn test_validate_tags() {
+        let tags: Vec<String> = vec!["a".into(), "b".into()];
+        assert!(validate_tags(&tags).is_ok());
+
+        let too_many: Vec<String> = (0..51).map(|i| format!("tag{i}")).collect();
+        assert!(validate_tags(&too_many).is_err());
+
+        let long_tag: Vec<String> = vec!["a".repeat(257)];
+        assert!(validate_tags(&long_tag).is_err());
+    }
+
+    #[test]
+    fn test_validate_range() {
+        assert!(validate_range(0.0, 1.0, "x").is_ok());
+        assert!(validate_range(-1.0, 1.0, "x").is_ok());
+        assert!(validate_range(0.5, 0.5, "x").is_ok()); // equal is valid
+        assert!(validate_range(1.0, 0.0, "x").is_err()); // min > max
+        assert!(validate_range(f64::NAN, 1.0, "x").is_err());
+        assert!(validate_range(0.0, f64::INFINITY, "x").is_err());
+    }
+
+    #[test]
+    fn test_validate_local_position() {
+        assert!(validate_local_position(&[0.0, 0.0, 0.0]).is_ok());
+        assert!(validate_local_position(&[12.5, -3.2, 100.0]).is_ok());
+        assert!(validate_local_position(&[f64::NAN, 0.0, 0.0]).is_err());
+        assert!(validate_local_position(&[0.0, f64::INFINITY, 0.0]).is_err());
     }
 }

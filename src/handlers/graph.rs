@@ -13,7 +13,9 @@ use tracing::info;
 use super::state::MultiUserMemoryManager;
 use super::types::MemoryEvent;
 use crate::errors::{AppError, ValidationErrorExt};
-use crate::graph_memory::{EntityNode, EpisodicNode, GraphStats, GraphTraversal, MemoryUniverse};
+use crate::graph_memory::{
+    CurvatureStats, EntityNode, EpisodicNode, GraphStats, GraphTraversal, MemoryUniverse,
+};
 use crate::memory::{Experience, MemoryId};
 use crate::validation;
 use std::sync::Arc;
@@ -30,6 +32,31 @@ pub async fn get_graph_stats(
     let stats = state
         .get_user_graph_stats(&user_id)
         .map_err(AppError::Internal)?;
+
+    Ok(Json(stats))
+}
+
+/// POST /api/graph/{user_id}/curvature - Compute Forman-Ricci curvature
+///
+/// Triggers on-demand Forman-Ricci curvature computation for all edges
+/// in the user's knowledge graph. Returns distribution statistics.
+///
+/// This is also computed automatically during heavy maintenance cycles.
+pub async fn compute_curvature(
+    State(state): State<AppState>,
+    Path(user_id): Path<String>,
+) -> Result<Json<CurvatureStats>, AppError> {
+    validation::validate_user_id(&user_id).map_validation_err("user_id")?;
+
+    let graph = state.get_user_graph(&user_id).map_err(AppError::Internal)?;
+
+    let stats = tokio::task::spawn_blocking(move || {
+        let graph_guard = graph.read();
+        graph_guard.compute_forman_ricci_curvature()
+    })
+    .await
+    .map_err(|e| AppError::Internal(anyhow::anyhow!("Task join error: {}", e)))?
+    .map_err(AppError::Internal)?;
 
     Ok(Json(stats))
 }
@@ -52,10 +79,14 @@ pub async fn find_entity(
         .get_user_graph(&req.user_id)
         .map_err(AppError::Internal)?;
 
-    let graph_guard = graph.read();
-    let entity = graph_guard
-        .find_entity_by_name(&req.entity_name)
-        .map_err(|e| AppError::Internal(anyhow::anyhow!(e)))?;
+    let entity_name = req.entity_name;
+    let entity = tokio::task::spawn_blocking(move || {
+        let graph_guard = graph.read();
+        graph_guard.find_entity_by_name(&entity_name)
+    })
+    .await
+    .map_err(|e| AppError::Internal(anyhow::anyhow!("Task join error: {e}")))?
+    .map_err(|e| AppError::Internal(anyhow::anyhow!(e)))?;
 
     Ok(Json(entity))
 }
@@ -79,19 +110,28 @@ pub async fn traverse_graph(
         .get_user_graph(&req.user_id)
         .map_err(AppError::Internal)?;
 
-    let graph_guard = graph.read();
-
-    let entity = graph_guard
-        .find_entity_by_name(&req.entity_name)
-        .map_err(|e| AppError::Internal(anyhow::anyhow!(e)))?
-        .ok_or_else(|| {
-            AppError::MemoryNotFound(format!("Entity not found: {}", req.entity_name))
-        })?;
-
+    let entity_name = req.entity_name.clone();
+    let missing_entity_name = req.entity_name;
     let max_depth = req.max_depth.unwrap_or(2);
-    let traversal = graph_guard
-        .traverse_from_entity(&entity.uuid, max_depth)
-        .map_err(|e| AppError::Internal(anyhow::anyhow!(e)))?;
+    let traversal = tokio::task::spawn_blocking(move || {
+        let graph_guard = graph.read();
+
+        let Some(entity) = graph_guard
+            .find_entity_by_name(&entity_name)
+            .map_err(|e| anyhow::anyhow!(e))?
+        else {
+            return Ok(None);
+        };
+
+        let traversal = graph_guard
+            .traverse_from_entity(&entity.uuid, max_depth)
+            .map_err(|e| anyhow::anyhow!(e))?;
+        Ok(Some(traversal))
+    })
+    .await
+    .map_err(|e| AppError::Internal(anyhow::anyhow!("Task join error: {e}")))?
+    .map_err(AppError::Internal)?
+    .ok_or_else(|| AppError::EntityNotFound(missing_entity_name))?;
 
     Ok(Json(traversal))
 }
@@ -110,21 +150,23 @@ pub async fn get_episode(
 ) -> Result<Json<Option<EpisodicNode>>, AppError> {
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
 
-    let graph = state
-        .get_user_graph(&req.user_id)
-        .map_err(AppError::Internal)?;
-
-    let graph_guard = graph.read();
-
     let episode_uuid =
         uuid::Uuid::parse_str(&req.episode_uuid).map_err(|_| AppError::InvalidInput {
             field: "episode_uuid".to_string(),
             reason: "Invalid UUID format".to_string(),
         })?;
 
-    let episode = graph_guard
-        .get_episode(&episode_uuid)
-        .map_err(|e| AppError::Internal(anyhow::anyhow!(e)))?;
+    let graph = state
+        .get_user_graph(&req.user_id)
+        .map_err(AppError::Internal)?;
+
+    let episode = tokio::task::spawn_blocking(move || {
+        let graph_guard = graph.read();
+        graph_guard.get_episode(&episode_uuid)
+    })
+    .await
+    .map_err(|e| AppError::Internal(anyhow::anyhow!("Task join error: {e}")))?
+    .map_err(|e| AppError::Internal(anyhow::anyhow!(e)))?;
 
     Ok(Json(episode))
 }
@@ -146,13 +188,16 @@ pub async fn get_all_entities(
     let graph = state
         .get_user_graph(&req.user_id)
         .map_err(AppError::Internal)?;
-    let graph_guard = graph.read();
-
-    let entities = graph_guard
-        .get_all_entities()
-        .map_err(|e| AppError::Internal(anyhow::anyhow!(e)))?;
 
     let limit = req.limit.unwrap_or(100);
+    let entities = tokio::task::spawn_blocking(move || {
+        let graph_guard = graph.read();
+        graph_guard.get_all_entities()
+    })
+    .await
+    .map_err(|e| AppError::Internal(anyhow::anyhow!("Task join error: {e}")))?
+    .map_err(|e| AppError::Internal(anyhow::anyhow!(e)))?;
+
     let entities: Vec<_> = entities.into_iter().take(limit).collect();
     let count = entities.len();
 
@@ -171,10 +216,13 @@ pub async fn get_memory_universe(
 
     let graph = state.get_user_graph(&user_id).map_err(AppError::Internal)?;
 
-    let graph_guard = graph.read();
-    let universe = graph_guard
-        .get_universe()
-        .map_err(|e| AppError::Internal(anyhow::anyhow!(e)))?;
+    let universe = tokio::task::spawn_blocking(move || {
+        let graph_guard = graph.read();
+        graph_guard.get_universe()
+    })
+    .await
+    .map_err(|e| AppError::Internal(anyhow::anyhow!("Task join error: {e}")))?
+    .map_err(|e| AppError::Internal(anyhow::anyhow!(e)))?;
 
     Ok(Json(universe))
 }
@@ -187,11 +235,14 @@ pub async fn clear_user_graph(
     validation::validate_user_id(&user_id).map_validation_err("user_id")?;
 
     let graph = state.get_user_graph(&user_id).map_err(AppError::Internal)?;
-    let graph_guard = graph.write();
 
-    let (entities, relationships, episodes) = graph_guard
-        .clear_all()
-        .map_err(|e| AppError::Internal(anyhow::anyhow!(e)))?;
+    let (entities, relationships, episodes) = tokio::task::spawn_blocking(move || {
+        let graph_guard = graph.write();
+        graph_guard.clear_all()
+    })
+    .await
+    .map_err(|e| AppError::Internal(anyhow::anyhow!("Task join error: {e}")))?
+    .map_err(|e| AppError::Internal(anyhow::anyhow!(e)))?;
 
     info!(
         "Cleared graph for user {}: {} entities, {} relationships, {} episodes",
@@ -210,6 +261,7 @@ pub async fn clear_user_graph(
         memory_type: Some("graph".to_string()),
         importance: None,
         count: Some(entities + relationships + episodes),
+        entities: None,
         results: None,
     });
 
@@ -218,6 +270,58 @@ pub async fn clear_user_graph(
             "entities": entities,
             "relationships": relationships,
             "episodes": episodes
+        }
+    })))
+}
+
+/// POST /api/graph/{user_id}/canonicalize - Collapse duplicate mention-nodes
+///
+/// Runs entity-linking over the live graph: the spaCy-rusty parser detects each
+/// mention's syntactic head and routes out verb-fragment junk, then the
+/// Fellegi-Sunter (Splink) matcher clusters the surviving mentions type-blocked
+/// at a precision-first threshold. Each cluster's members are merged into the
+/// most-proper / most-mentioned node, re-pointing edges and deleting the
+/// duplicates. Returns how many nodes were merged and how many edges re-pointed.
+pub async fn canonicalize_user_graph(
+    State(state): State<AppState>,
+    Path(user_id): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    validation::validate_user_id(&user_id).map_validation_err("user_id")?;
+
+    let graph = state.get_user_graph(&user_id).map_err(AppError::Internal)?;
+
+    let (merged, repointed) = tokio::task::spawn_blocking(move || {
+        let graph_guard = graph.write();
+        graph_guard.canonicalize_entities()
+    })
+    .await
+    .map_err(|e| AppError::Internal(anyhow::anyhow!("Task join error: {e}")))?
+    .map_err(AppError::Internal)?;
+
+    info!(
+        "Canonicalized graph for user {}: merged {} mention-nodes, re-pointed {} edges",
+        user_id, merged, repointed
+    );
+
+    state.emit_event(MemoryEvent {
+        event_type: "GRAPH_CANONICALIZE".to_string(),
+        timestamp: chrono::Utc::now(),
+        user_id: user_id.clone(),
+        memory_id: Some(format!("{merged}/{repointed}")),
+        content_preview: Some(format!(
+            "Merged {merged} duplicate mention-nodes, re-pointed {repointed} edges"
+        )),
+        memory_type: Some("graph".to_string()),
+        importance: None,
+        count: Some(merged),
+        entities: None,
+        results: None,
+    });
+
+    Ok(Json(serde_json::json!({
+        "canonicalized": {
+            "merged_nodes": merged,
+            "repointed_edges": repointed
         }
     })))
 }
@@ -232,8 +336,12 @@ pub async fn rebuild_user_graph(
     // First, clear existing graph data
     let graph = state.get_user_graph(&user_id).map_err(AppError::Internal)?;
     {
-        let graph_guard = graph.write();
-        let _ = graph_guard.clear_all();
+        let graph_clone = graph.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            let graph_guard = graph_clone.write();
+            graph_guard.clear_all()
+        })
+        .await;
     }
 
     // Get all memories for this user
@@ -255,7 +363,8 @@ pub async fn rebuild_user_graph(
 
     // Re-process each memory through entity extraction
     for (memory_id, experience) in memories {
-        if let Err(e) = state.process_experience_into_graph(&user_id, &experience, &memory_id) {
+        if let Err(e) = state.process_experience_into_graph(&user_id, &experience, &memory_id, None)
+        {
             tracing::debug!("Failed to process memory {}: {}", memory_id.0, e);
         } else {
             processed += 1;
@@ -286,6 +395,7 @@ pub async fn rebuild_user_graph(
         memory_type: Some("graph".to_string()),
         importance: None,
         count: Some(entities_created + relationships_created),
+        entities: None,
         results: None,
     });
 
@@ -337,6 +447,7 @@ pub async fn invalidate_relationship(
         memory_type: Some("graph".to_string()),
         importance: None,
         count: None,
+        entities: None,
         results: None,
     });
 

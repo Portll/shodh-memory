@@ -30,6 +30,7 @@ use chrono::{DateTime, Datelike, NaiveDate, Utc};
 use rust_stemmers::{Algorithm, Stemmer};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+use std::sync::LazyLock;
 
 // ============================================================================
 // SHALLOW PARSING / CHUNKING MODULE
@@ -192,9 +193,13 @@ pub enum TemporalRefType {
     Relative,
     /// Day of week (on Monday, last Tuesday)
     DayOfWeek,
+    /// Week reference (last week, this week) — expands to a Mon–Sun window
+    Week,
     /// Month reference (in May, last March)
     Month,
-    /// Year reference (in 2023, last year)
+    /// Quarter reference (Q1 2023) — expands to a 3-month window
+    Quarter,
+    /// Year reference (in 2023, since 2023, last year)
     Year,
 }
 
@@ -239,51 +244,58 @@ pub fn extract_temporal_refs(text: &str) -> TemporalExtraction {
     let mut refs = Vec::new();
     let mut earliest: Option<NaiveDate> = None;
     let mut latest: Option<NaiveDate> = None;
+    let explicit_dates = extract_explicit_dates(text);
+    let has_explicit_dates = !explicit_dates.is_empty();
 
     // Helper to validate date is in reasonable range (1900-2100)
     let is_valid_date = |date: &NaiveDate| -> bool {
         let year = date.year();
-        year >= 1900 && year <= 2100
+        (1900..=2100).contains(&year)
     };
 
-    // Try dateparser on the full text (returns Result, never panics)
-    if let Ok(parsed) = dateparser::parse(text) {
-        let date = parsed.date_naive();
-        if is_valid_date(&date) {
-            refs.push(TemporalRef {
-                date,
-                original_text: text.to_string(),
-                confidence: 0.8,
-                position: 0,
-                ref_type: classify_temporal_ref(text, &date, &now),
-            });
-            update_bounds(&mut earliest, &mut latest, date);
+    // Try dateparser on the full text (returns Result, never panics). Exact
+    // regex dates win because dateparser may timezone-shift an embedded ISO
+    // date at local midnight into the previous UTC day.
+    if !has_explicit_dates {
+        if let Ok(parsed) = dateparser::parse(text) {
+            let date = parsed.date_naive();
+            if is_valid_date(&date) {
+                refs.push(TemporalRef {
+                    date,
+                    original_text: text.to_string(),
+                    confidence: 0.8,
+                    position: 0,
+                    ref_type: classify_temporal_ref(text, &date, &now),
+                });
+                update_bounds(&mut earliest, &mut latest, date);
+            }
         }
     }
 
     // Try parsing individual sentences/phrases
-    for (pos, sentence) in split_temporal_phrases(text).iter().enumerate() {
-        if let Ok(parsed) = dateparser::parse(sentence) {
-            let date = parsed.date_naive();
-            if !is_valid_date(&date) {
-                continue;
+    if !has_explicit_dates {
+        for (pos, sentence) in split_temporal_phrases(text).iter().enumerate() {
+            if let Ok(parsed) = dateparser::parse(sentence) {
+                let date = parsed.date_naive();
+                if !is_valid_date(&date) {
+                    continue;
+                }
+                if refs.iter().any(|r| r.date == date) {
+                    continue;
+                }
+                refs.push(TemporalRef {
+                    date,
+                    original_text: sentence.to_string(),
+                    confidence: 0.7,
+                    position: pos,
+                    ref_type: classify_temporal_ref(sentence, &date, &now),
+                });
+                update_bounds(&mut earliest, &mut latest, date);
             }
-            if refs.iter().any(|r| r.date == date) {
-                continue;
-            }
-            refs.push(TemporalRef {
-                date,
-                original_text: sentence.to_string(),
-                confidence: 0.7,
-                position: pos,
-                ref_type: classify_temporal_ref(sentence, &date, &now),
-            });
-            update_bounds(&mut earliest, &mut latest, date);
         }
     }
 
     // Also use regex-based extraction for explicit date patterns
-    let explicit_dates = extract_explicit_dates(text);
     for (date, original, pos) in explicit_dates {
         if !is_valid_date(&date) {
             continue;
@@ -297,6 +309,64 @@ pub fn extract_temporal_refs(text: &str) -> TemporalExtraction {
             confidence: 0.9,
             position: pos,
             ref_type: TemporalRefType::Absolute,
+        });
+        update_bounds(&mut earliest, &mut latest, date);
+    }
+
+    // Extract relative temporal keywords ("yesterday", "last week", "3 days ago")
+    let relative_dates = extract_relative_dates(text, &now);
+    for (date, original, pos, ref_type) in relative_dates {
+        if !is_valid_date(&date) {
+            continue;
+        }
+        if refs.iter().any(|r| r.date == date) {
+            continue;
+        }
+        refs.push(TemporalRef {
+            date,
+            original_text: original,
+            confidence: 0.85,
+            position: pos,
+            ref_type,
+        });
+        update_bounds(&mut earliest, &mut latest, date);
+    }
+
+    // Extract "Month Year" patterns without day (e.g., "March 2026", "in May 2023")
+    let month_year_dates = extract_month_year_dates(text);
+    for (date, original, pos) in month_year_dates {
+        if !is_valid_date(&date) {
+            continue;
+        }
+        if refs.iter().any(|r| r.date == date) {
+            continue;
+        }
+        refs.push(TemporalRef {
+            date,
+            original_text: original,
+            confidence: 0.85,
+            position: pos,
+            ref_type: TemporalRefType::Month,
+        });
+        update_bounds(&mut earliest, &mut latest, date);
+    }
+
+    // Extract bare/qualified year and quarter patterns
+    // ("in 2023", "since 2023", "Q1 2023", standalone "2023").
+    let year_refs = extract_year_refs(text);
+    for (date, original, pos, ref_type) in year_refs {
+        if !is_valid_date(&date) {
+            continue;
+        }
+        if refs.iter().any(|r| r.date == date) {
+            continue;
+        }
+        refs.push(TemporalRef {
+            date,
+            original_text: original,
+            confidence: 0.8,
+            position: pos,
+            ref_type,
         });
         update_bounds(&mut earliest, &mut latest, date);
     }
@@ -416,16 +486,10 @@ fn split_temporal_phrases(text: &str) -> Vec<String> {
 
 /// Extract explicit date patterns that date_time_parser might miss
 fn extract_explicit_dates(text: &str) -> Vec<(NaiveDate, String, usize)> {
-    use regex::Regex;
-
     let mut results = Vec::new();
 
     // Pattern: "Month Day, Year" (e.g., "May 7, 2023")
-    let month_day_year =
-        Regex::new(r"(?i)(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{1,2}),?\s+(\d{4})")
-            .unwrap();
-
-    for cap in month_day_year.captures_iter(text) {
+    for cap in MONTH_DAY_YEAR_RE.captures_iter(text) {
         let month_str = &cap[1];
         let day: u32 = cap[2].parse().unwrap_or(1);
         let year: i32 = cap[3].parse().unwrap_or(2000);
@@ -438,8 +502,7 @@ fn extract_explicit_dates(text: &str) -> Vec<(NaiveDate, String, usize)> {
     }
 
     // Pattern: "YYYY-MM-DD"
-    let iso_date = Regex::new(r"(\d{4})-(\d{2})-(\d{2})").unwrap();
-    for cap in iso_date.captures_iter(text) {
+    for cap in ISO_DATE_RE.captures_iter(text) {
         let year: i32 = cap[1].parse().unwrap_or(2000);
         let month: u32 = cap[2].parse().unwrap_or(1);
         let day: u32 = cap[3].parse().unwrap_or(1);
@@ -451,8 +514,7 @@ fn extract_explicit_dates(text: &str) -> Vec<(NaiveDate, String, usize)> {
     }
 
     // Pattern: "MM/DD/YYYY" or "DD/MM/YYYY" (assume US format MM/DD)
-    let slash_date = Regex::new(r"(\d{1,2})/(\d{1,2})/(\d{4})").unwrap();
-    for cap in slash_date.captures_iter(text) {
+    for cap in SLASH_DATE_RE.captures_iter(text) {
         let month: u32 = cap[1].parse().unwrap_or(1);
         let day: u32 = cap[2].parse().unwrap_or(1);
         let year: i32 = cap[3].parse().unwrap_or(2000);
@@ -460,6 +522,252 @@ fn extract_explicit_dates(text: &str) -> Vec<(NaiveDate, String, usize)> {
         if let Some(date) = NaiveDate::from_ymd_opt(year, month, day) {
             let pos = cap.get(0).map(|m| m.start()).unwrap_or(0);
             results.push((date, cap[0].to_string(), pos));
+        }
+    }
+
+    results
+}
+
+// Pre-compiled regex patterns for temporal extraction (avoid per-call allocation)
+static MONTH_DAY_YEAR_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(
+        r"(?i)(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{1,2}),?\s+(\d{4})",
+    )
+    .unwrap()
+});
+static ISO_DATE_RE: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"(\d{4})-(\d{2})-(\d{2})").unwrap());
+static SLASH_DATE_RE: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"(\d{1,2})/(\d{1,2})/(\d{4})").unwrap());
+static AGO_RE: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"(?i)(\d+)\s+(day|week|month|year)s?\s+ago").unwrap());
+static LAST_RE: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"(?i)last\s+(week|month|year)").unwrap());
+static THIS_RE: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"(?i)this\s+(week|month|year)").unwrap());
+static MONTH_YEAR_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(
+        r"(?i)(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{4})",
+    )
+    .unwrap()
+});
+// "Q1 2023" / "Q4 1999" — a calendar quarter qualified by a year.
+static QUARTER_YEAR_RE: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"(?i)\bQ([1-4])\s+((?:19|20)\d{2})\b").unwrap());
+// Year preceded by a temporal preposition: "in 2023", "since 2023", "of 2023".
+static YEAR_QUALIFIER_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(
+        r"(?i)\b(?:in|since|during|for|of|from|by|after|before|until|the\s+year)\s+((?:19|20)\d{2})\b",
+    )
+    .unwrap()
+});
+// Standalone four-digit year (1900–2099 range guarded by the 19/20 prefix).
+static BARE_YEAR_RE: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"\b((?:19|20)\d{2})\b").unwrap());
+
+/// Extract relative temporal keywords from text.
+///
+/// Handles patterns that dateparser misses when embedded in longer text:
+/// "yesterday", "today", "last week/month/year", "N days/weeks/months ago",
+/// "this week/month", day-of-week references.
+fn extract_relative_dates(
+    text: &str,
+    now: &DateTime<Utc>,
+) -> Vec<(NaiveDate, String, usize, TemporalRefType)> {
+    let text_lower = text.to_lowercase();
+    let today = now.date_naive();
+    let mut results = Vec::new();
+
+    // "yesterday"
+    if let Some(pos) = text_lower.find("yesterday") {
+        let date = today - chrono::Duration::days(1);
+        results.push((
+            date,
+            "yesterday".to_string(),
+            pos,
+            TemporalRefType::Relative,
+        ));
+    }
+
+    // "today"
+    if let Some(pos) = text_lower.find("today") {
+        results.push((today, "today".to_string(), pos, TemporalRefType::Relative));
+    }
+
+    // "N days/weeks/months ago"
+    for cap in AGO_RE.captures_iter(text) {
+        // AGO_RE captures `(\d+)`. A digit string too long for i64 fails to parse
+        // and harmlessly falls back to 1. The real hazard is a value that DOES
+        // parse but is large enough to overflow the day/Duration arithmetic:
+        // `n * 365` overflows i64, and `chrono::Duration::days(..)` / date
+        // subtraction PANIC on out-of-range values. A crafted query such as
+        // "90000000000 years ago" would therefore crash the retrieval thread.
+        // Convert to a day offset with checked arithmetic and skip anything
+        // absurd or out of range instead of panicking.
+        let n: i64 = cap[1].parse().unwrap_or(1);
+        let unit = cap[2].to_lowercase();
+        let days_offset: i64 = match unit.as_str() {
+            "day" => n,
+            "week" => n.checked_mul(7).unwrap_or(i64::MAX),
+            "month" => n.checked_mul(30).unwrap_or(i64::MAX), // ~30 days/month
+            "year" => n.checked_mul(365).unwrap_or(i64::MAX),
+            _ => continue,
+        };
+        // ~10,000 years. Beyond this a relative date is noise, not a real query,
+        // and the value would overflow chrono's Duration/date range.
+        const MAX_RELATIVE_DAYS: i64 = 3_650_000;
+        if !(0..=MAX_RELATIVE_DAYS).contains(&days_offset) {
+            continue;
+        }
+        let date = match today.checked_sub_signed(chrono::Duration::days(days_offset)) {
+            Some(d) => d,
+            None => continue, // resulting date is out of the representable range
+        };
+        let pos = cap.get(0).map(|m| m.start()).unwrap_or(0);
+        results.push((date, cap[0].to_string(), pos, TemporalRefType::Relative));
+    }
+
+    // "last week/month/year" — anchor to the prior period and tag with the
+    // matching period type so the range expands to a full calendar window
+    // (a ±1-day point window around "7/30/365 days ago" was the old bug).
+    for cap in LAST_RE.captures_iter(text) {
+        let unit = cap[1].to_lowercase();
+        let (date, ref_type) = match unit.as_str() {
+            // Any day inside the prior week; compute_padded_date_range snaps to Mon–Sun.
+            "week" => (today - chrono::Duration::weeks(1), TemporalRefType::Week),
+            // First day of the previous calendar month; expands to the whole month.
+            "month" => {
+                let (y, m) = if today.month() == 1 {
+                    (today.year() - 1, 12)
+                } else {
+                    (today.year(), today.month() - 1)
+                };
+                (
+                    NaiveDate::from_ymd_opt(y, m, 1).unwrap_or(today),
+                    TemporalRefType::Month,
+                )
+            }
+            // First day of the previous year; expands to the whole year.
+            "year" => (
+                NaiveDate::from_ymd_opt(today.year() - 1, 1, 1).unwrap_or(today),
+                TemporalRefType::Year,
+            ),
+            _ => continue,
+        };
+        let pos = cap.get(0).map(|m| m.start()).unwrap_or(0);
+        // Skip if we already have a date from "N weeks ago" at similar position
+        if results.iter().any(|r| r.0 == date) {
+            continue;
+        }
+        results.push((date, cap[0].to_string(), pos, ref_type));
+    }
+
+    // "this week/month/year" — anchor to today and tag with the period type so
+    // the range expands to the current calendar week/month/year.
+    for cap in THIS_RE.captures_iter(text) {
+        let unit = cap[1].to_lowercase();
+        let ref_type = match unit.as_str() {
+            "week" => TemporalRefType::Week,
+            "month" => TemporalRefType::Month,
+            "year" => TemporalRefType::Year,
+            _ => continue,
+        };
+        let pos = cap.get(0).map(|m| m.start()).unwrap_or(0);
+        if results.iter().any(|r| r.0 == today) {
+            continue;
+        }
+        results.push((today, cap[0].to_string(), pos, ref_type));
+    }
+
+    results
+}
+
+/// Extract "Month Year" patterns without a day number.
+///
+/// Handles: "March 2026", "in May 2023", "last March"
+/// Returns the first day of the month as the date.
+fn extract_month_year_dates(text: &str) -> Vec<(NaiveDate, String, usize)> {
+    let mut results = Vec::new();
+
+    // "Month Year" (e.g., "March 2026", "in September 2025")
+    for cap in MONTH_YEAR_RE.captures_iter(text) {
+        let month = month_to_num(&cap[1]);
+        let year: i32 = cap[2].parse().unwrap_or(2000);
+        if let Some(date) = NaiveDate::from_ymd_opt(year, month, 1) {
+            let pos = cap.get(0).map(|m| m.start()).unwrap_or(0);
+            results.push((date, cap[0].to_string(), pos));
+        }
+    }
+
+    results
+}
+
+/// Extract year and quarter references from text (issue #275).
+///
+/// Handles: standalone "2023", qualified "in/since/during 2023", and
+/// "Q1 2023". Returns the anchoring date (first day of the year or quarter)
+/// plus the matching ref type so the range expands to the full window.
+///
+/// A year that is already part of a more specific pattern — "March 2023",
+/// "2023-05-07", "05/07/2023", "Q1 2023" — is NOT re-emitted as a bare year,
+/// because that would split one intent into two refs (a March-1 Month ref and
+/// a Jan-1 Year ref) and defeat the single-ref calendar expansion.
+fn extract_year_refs(text: &str) -> Vec<(NaiveDate, String, usize, TemporalRefType)> {
+    let mut results = Vec::new();
+
+    // Spans already claimed by more specific date patterns. A bare-year match
+    // overlapping any of these is suppressed.
+    let mut consumed: Vec<(usize, usize)> = Vec::new();
+    for re in [
+        &*MONTH_DAY_YEAR_RE,
+        &*ISO_DATE_RE,
+        &*SLASH_DATE_RE,
+        &*MONTH_YEAR_RE,
+    ] {
+        for m in re.find_iter(text) {
+            consumed.push((m.start(), m.end()));
+        }
+    }
+
+    // "Q1 2023" → first day of that quarter.
+    for cap in QUARTER_YEAR_RE.captures_iter(text) {
+        let quarter: u32 = cap[1].parse().unwrap_or(1);
+        let year: i32 = cap[2].parse().unwrap_or(2000);
+        let start_month = (quarter - 1) * 3 + 1;
+        if let Some(date) = NaiveDate::from_ymd_opt(year, start_month, 1) {
+            if let Some(m) = cap.get(0) {
+                consumed.push((m.start(), m.end()));
+                results.push((
+                    date,
+                    m.as_str().to_string(),
+                    m.start(),
+                    TemporalRefType::Quarter,
+                ));
+            }
+        }
+    }
+
+    // "in 2023", "since 2023", … → first day of that year.
+    for cap in YEAR_QUALIFIER_RE.captures_iter(text) {
+        let year: i32 = cap[1].parse().unwrap_or(2000);
+        if let Some(date) = NaiveDate::from_ymd_opt(year, 1, 1) {
+            if let Some(g) = cap.get(1) {
+                consumed.push((g.start(), g.end()));
+            }
+            let pos = cap.get(0).map(|m| m.start()).unwrap_or(0);
+            results.push((date, cap[0].to_string(), pos, TemporalRefType::Year));
+        }
+    }
+
+    // Standalone "2023", only when not already part of a more specific pattern.
+    for m in BARE_YEAR_RE.find_iter(text) {
+        let (start, end) = (m.start(), m.end());
+        if consumed.iter().any(|(cs, ce)| start < *ce && *cs < end) {
+            continue;
+        }
+        let year: i32 = m.as_str().parse().unwrap_or(2000);
+        if let Some(date) = NaiveDate::from_ymd_opt(year, 1, 1) {
+            results.push((date, m.as_str().to_string(), start, TemporalRefType::Year));
         }
     }
 
@@ -606,6 +914,106 @@ pub fn detect_temporal_intent(query: &str) -> TemporalIntent {
     TemporalIntent::None
 }
 
+// ============================================================================
+// MULTI-HOP QUERY DETECTION
+// ============================================================================
+// Detect when a query bridges two entities through an intermediate relation
+// (e.g. "who does the colleague that X works with manage?"). Such queries have
+// multiple gold turns spread across episodes; the answer turn is reachable only
+// by following a relation from an anchor the query does NOT name directly.
+//
+// Prior finding (companion-coverage thread): a single-conversation / single-
+// session signal is a BAD multi-hop proxy. This classifier instead keys on the
+// query's own structure — two or more grounded entities AND a relational bridge
+// (a connective relation OR a bridge verb OR a "who/how does X … Y" frame) — so
+// it does not rely on corpus partitioning.
+
+/// Bridge verbs that signal a relation linking two entities through an
+/// intermediate party (the hop). Lower-cased, matched as whole-ish tokens.
+const MULTIHOP_BRIDGE_VERBS: &[&str] = &[
+    "work",
+    "works",
+    "worked",
+    "working",
+    "manage",
+    "manages",
+    "managed",
+    "managing",
+    "collaborate",
+    "collaborates",
+    "collaborated",
+    "report",
+    "reports",
+    "reported",
+    "reporting",
+    "depend",
+    "depends",
+    "depended",
+    "lead",
+    "leads",
+    "led",
+    "leading",
+    "supervise",
+    "supervises",
+    "oversee",
+    "oversees",
+    "partner",
+    "partners",
+    "partnered",
+];
+
+/// Connective phrases that chain one relation into another (the linguistic
+/// signature of a 2-hop question).
+const MULTIHOP_CONNECTIVES: &[&str] = &[
+    "that ",
+    " who ",
+    " whom ",
+    " which ",
+    "the colleague",
+    "the person who",
+    "the one who",
+    "together with",
+    "along with",
+    " and also ",
+];
+
+/// Detect whether a query is asking a multi-hop (bridge) question.
+///
+/// Returns `true` when there are at least two grounded entities AND the query
+/// carries a relational bridge: a connective phrase, a bridge verb, or a
+/// "who/how does … " frame. `entity_count` is the number of entities the query
+/// NER resolved; `relations` are any relation cues already parsed from the
+/// query (e.g. ontological relation surface forms). Either source of relational
+/// signal qualifies, so the classifier degrades gracefully when NER under-counts
+/// entities but the surface structure is unambiguous.
+pub fn detect_multihop_intent(query: &str, entity_count: usize, relations: &[String]) -> bool {
+    let q = query.to_lowercase();
+
+    // A relational bridge present in the parsed relations is the strongest
+    // signal and does not require the entity-count floor (the parser already
+    // grounded the relation).
+    let has_parsed_relation = !relations.is_empty();
+
+    let has_connective = MULTIHOP_CONNECTIVES.iter().any(|c| q.contains(c));
+
+    // Bridge verb: split on non-alphanumeric so "works." / "works," match.
+    let tokens: Vec<&str> = q
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .collect();
+    let has_bridge_verb = tokens.iter().any(|t| MULTIHOP_BRIDGE_VERBS.contains(t));
+
+    // "who/how does X … Y" interrogative frame.
+    let has_bridge_frame = (q.starts_with("who ") || q.starts_with("how "))
+        && (q.contains(" does ") || q.contains(" do ") || q.contains(" did "));
+
+    let bridge = has_connective || has_bridge_verb || has_bridge_frame;
+
+    // Two grounded entities + a bridge, OR an already-parsed relation with at
+    // least one grounded entity, is a multi-hop question.
+    (entity_count >= 2 && bridge) || (has_parsed_relation && entity_count >= 1 && bridge)
+}
+
 /// Check if a query requires temporal filtering for accurate retrieval
 ///
 /// Returns true if the query has a temporal component that should be used
@@ -632,6 +1040,157 @@ pub fn requires_temporal_filtering(query: &str) -> bool {
 /// the date from the retrieved content.
 pub fn asks_for_temporal_answer(query: &str) -> bool {
     matches!(detect_temporal_intent(query), TemporalIntent::WhenQuestion)
+}
+
+// ============================================================================
+// UNIFIED TEMPORAL ANALYSIS
+// ============================================================================
+// Combines intent detection with parsed date extraction into a single context
+// object. Fixes the gap where `detect_temporal_intent()` uses keyword matching
+// independently of `extract_temporal_refs()` which does real date parsing.
+
+/// Unified temporal query context combining intent, parsed dates, and date range.
+///
+/// Replaces the pattern of calling `extract_temporal_refs()` and
+/// `detect_temporal_intent()` independently. The parsed dates now inform
+/// intent detection, and the date range is computed with appropriate padding
+/// based on the temporal ref type.
+#[derive(Debug, Clone)]
+pub struct TemporalQueryContext {
+    /// The detected temporal intent
+    pub intent: TemporalIntent,
+    /// Parsed temporal references from the query text
+    pub extraction: TemporalExtraction,
+    /// Computed date range for filtering (with padding based on ref type)
+    pub date_range: Option<(NaiveDate, NaiveDate)>,
+    /// True when query has parsed dates to filter BY (SpecificTime, TimeRange)
+    pub is_filtering_query: bool,
+    /// True when query asks FOR a date (WhenQuestion, Ordering, Duration)
+    pub is_seeking_query: bool,
+}
+
+/// Analyze a query for temporal signals, unifying parsing and intent detection.
+///
+/// Strategy:
+/// 1. Parse dates first via `extract_temporal_refs()` (dateparser + regex)
+/// 2. If dates found → derive intent from ref types (no keyword matching needed)
+/// 3. If no dates → fall back to `detect_temporal_intent()` for intent-only
+///    queries like "when did X happen"
+/// 4. Compute padded date range based on ref types
+pub fn analyze_temporal(query: &str) -> TemporalQueryContext {
+    let extraction = extract_temporal_refs(query);
+    let query_lower = query.to_lowercase();
+
+    // Detect "when" prefix — this is asking FOR a date, not filtering BY one
+    let is_when_question = query_lower.starts_with("when")
+        || query_lower.contains(" when ")
+        || query_lower.contains("what date")
+        || query_lower.contains("what day")
+        || query_lower.contains("what time");
+
+    let intent = if extraction.has_temporal_refs() {
+        // Parsed dates found — derive intent from structure
+        if is_when_question {
+            // "When in March did X happen?" — has dates but asking for specifics
+            TemporalIntent::WhenQuestion
+        } else {
+            TemporalIntent::SpecificTime
+        }
+    } else {
+        // No parsed dates — fall back to keyword-based intent detection
+        detect_temporal_intent(query)
+    };
+
+    // Compute date range with padding based on ref types
+    let date_range = compute_padded_date_range(&extraction);
+
+    let is_filtering_query = matches!(
+        intent,
+        TemporalIntent::SpecificTime | TemporalIntent::Ordering
+    ) && date_range.is_some();
+
+    let is_seeking_query = matches!(
+        intent,
+        TemporalIntent::WhenQuestion | TemporalIntent::Duration
+    );
+
+    TemporalQueryContext {
+        intent,
+        extraction,
+        date_range,
+        is_filtering_query,
+        is_seeking_query,
+    }
+}
+
+/// Compute a padded date range from temporal extraction results.
+///
+/// Padding strategy based on the most specific ref type:
+/// - Absolute/DayOfWeek: ±1 day (3-day window)
+/// - Relative: ±1 day
+/// - Month: full calendar month
+/// - Year: full calendar year
+/// - Mixed refs: use extraction bounds directly (already encompass the range)
+fn compute_padded_date_range(extraction: &TemporalExtraction) -> Option<(NaiveDate, NaiveDate)> {
+    let (earliest, latest) = extraction.date_range()?;
+
+    if extraction.refs.len() == 1 {
+        // Single ref — pad based on type
+        let ref_type = extraction.refs[0].ref_type;
+        match ref_type {
+            TemporalRefType::Week => {
+                // Snap to the Monday–Sunday week containing the anchor date.
+                let from_monday = earliest.weekday().num_days_from_monday() as i64;
+                let start = earliest - chrono::Duration::days(from_monday);
+                let end = start + chrono::Duration::days(6);
+                Some((start, end))
+            }
+            TemporalRefType::Quarter => {
+                // Expand to the full calendar quarter containing the anchor date.
+                let start_month = ((earliest.month() - 1) / 3) * 3 + 1;
+                let start = NaiveDate::from_ymd_opt(earliest.year(), start_month, 1)?;
+                let end_month = start_month + 2;
+                let end = if end_month >= 12 {
+                    NaiveDate::from_ymd_opt(earliest.year(), 12, 31)?
+                } else {
+                    NaiveDate::from_ymd_opt(earliest.year(), end_month + 1, 1)?
+                        .pred_opt()
+                        .unwrap_or(start)
+                };
+                Some((start, end))
+            }
+            TemporalRefType::Month => {
+                // Expand to full calendar month
+                let start = NaiveDate::from_ymd_opt(earliest.year(), earliest.month(), 1)?;
+                let end = if earliest.month() == 12 {
+                    NaiveDate::from_ymd_opt(earliest.year() + 1, 1, 1)?
+                        .pred_opt()
+                        .unwrap_or(start)
+                } else {
+                    NaiveDate::from_ymd_opt(earliest.year(), earliest.month() + 1, 1)?
+                        .pred_opt()
+                        .unwrap_or(start)
+                };
+                Some((start, end))
+            }
+            TemporalRefType::Year => {
+                let start = NaiveDate::from_ymd_opt(earliest.year(), 1, 1)?;
+                let end = NaiveDate::from_ymd_opt(earliest.year(), 12, 31)?;
+                Some((start, end))
+            }
+            TemporalRefType::Absolute | TemporalRefType::DayOfWeek | TemporalRefType::Relative => {
+                // ±1 day padding
+                let start = earliest - chrono::Duration::days(1);
+                let end = latest + chrono::Duration::days(1);
+                Some((start, end))
+            }
+        }
+    } else {
+        // Multiple refs — use bounds directly with ±1 day padding
+        let start = earliest - chrono::Duration::days(1);
+        let end = latest + chrono::Duration::days(1);
+        Some((start, end))
+    }
 }
 
 // ============================================================================
@@ -763,7 +1322,7 @@ pub fn detect_attribute_query(query: &str) -> Option<AttributeQuery> {
                 if let Some(pos) = after_is.find(status) {
                     let entity = after_is[..pos].trim().to_string();
                     if !entity.is_empty()
-                        && entity.chars().next().map_or(false, |c| c.is_alphabetic())
+                        && entity.chars().next().is_some_and(|c| c.is_alphabetic())
                     {
                         return Some(AttributeQuery {
                             entity: capitalize_first(&entity),
@@ -875,10 +1434,7 @@ fn extract_entity_after_verb(query: &str) -> Option<String> {
 
 /// Normalize an attribute name (e.g., "relationship status" → "relationship_status")
 fn normalize_attribute(attr: &str) -> String {
-    attr.trim()
-        .to_lowercase()
-        .replace(' ', "_")
-        .replace('-', "_")
+    attr.trim().to_lowercase().replace([' ', '-'], "_")
 }
 
 /// Get synonyms for common attributes
@@ -1836,7 +2392,7 @@ pub struct Relation {
 /// - Needle: Looking for specific facts → favor BM25/Vector (high precision)
 /// - Exploratory: Seeking related concepts → favor Graph (high recall)
 /// - Hybrid: Balanced query → use all retrieval methods equally
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum QueryIntent {
     /// Needle query: Seeking specific information
     /// Examples: "What is John's email?", "When did we deploy v2.0?"
@@ -1851,13 +2407,8 @@ pub enum QueryIntent {
     /// Hybrid query: Balanced between specific and exploratory
     /// Examples: "How does authentication work?", "What are the deployment options?"
     /// Strategy: Balanced weights for all retrieval methods
+    #[default]
     Hybrid,
-}
-
-impl Default for QueryIntent {
-    fn default() -> Self {
-        QueryIntent::Hybrid
-    }
 }
 
 /// Complete linguistic analysis of a query
@@ -1880,6 +2431,12 @@ pub struct QueryAnalysis {
 
     /// True if query contains negation
     pub has_negation: bool,
+
+    /// True if query is a polar (yes/no) question — leads with an English
+    /// auxiliary verb like "Are/Is/Do/Did/Have/Can/...". Polar questions are
+    /// negation-blind for bi-encoders even when they contain no overt negation
+    /// token (RH-14, see `constants::POLAR_QUESTION_LEADERS`).
+    pub is_polar: bool,
 
     /// Detected query intent for retrieval strategy selection (SHO-D6)
     pub intent: QueryIntent,
@@ -2165,6 +2722,7 @@ pub fn analyze_query(query_text: &str) -> QueryAnalysis {
             compound_nouns: Vec::new(),
             original_query: query_text.to_string(),
             has_negation: false,
+            is_polar: is_polar_question(query_text),
             intent: QueryIntent::Hybrid,
         };
     }
@@ -2251,7 +2809,122 @@ pub fn analyze_query(query_text: &str) -> QueryAnalysis {
         compound_nouns,
         original_query: query_text.to_string(),
         has_negation,
+        is_polar: is_polar_question(query_text),
         intent,
+    }
+}
+
+/// Detect a polar (yes/no) question by leading auxiliary verb.
+///
+/// Examples that return `true`:
+///   - "Are we using HNSW for vector search?"
+///   - "Is GitHub auto-merge enabled?"
+///   - "Did learning history records also move to postcard?"
+///   - "Do we call OpenAI's embedding API?"
+///
+/// Examples that return `false`:
+///   - "What is the latest commit?" (interrogative, not polar)
+///   - "How does the cache work?"
+///   - bare statements
+///
+/// Polar questions are flagged because bi-encoder retrievers (MiniLM, DPR) are
+/// negation-blind: the embedding for "Are we using HNSW?" lands semantically
+/// near passages about HNSW regardless of polarity, while the actual answer
+/// passage may say "We use Vamana, *not* HNSW" — and never enter the top-K.
+/// See `constants::POLAR_QUESTION_LEADERS` and RH-14.
+pub fn is_polar_question(query_text: &str) -> bool {
+    let trimmed = query_text.trim_start();
+    let first_word: String = trimmed
+        .chars()
+        .take_while(|c| c.is_alphabetic())
+        .flat_map(char::to_lowercase)
+        .collect();
+    if first_word.is_empty() {
+        return false;
+    }
+    crate::constants::POLAR_QUESTION_LEADERS
+        .iter()
+        .any(|leader| *leader == first_word.as_str())
+}
+
+/// Template-based decontextualization of a polar question into its negated
+/// declarative form, suitable for re-embedding via the same encoder.
+///
+/// Transform: "Are X Y?" → "X are not Y"
+///   - "Are we using HNSW?" → "we are not using HNSW"
+///   - "Do we call OpenAI's embedding API?" → "we do not call OpenAI's embedding API"
+///   - "Did learning history records also move to postcard?"
+///        → "learning history records did not also move to postcard"
+///   - "Is GitHub auto-merge enabled?" → "GitHub auto-merge is not enabled"
+///
+/// Returns `None` when:
+///   - The query is not polar (no leader detected)
+///   - The query is too short (< subject + verb after the leader)
+///   - The query already contains an explicit "not" / "no" negation token
+///     (no transform needed; downstream will treat the original as negation-
+///     bearing already)
+///
+/// This is the dense-retrieval analogue of NegEx-driven query rewriting from
+/// Chapman et al. 2001 (clinical NLP) and the Amazon polar-question rewrite
+/// paper (COLING 2025).
+pub fn polar_to_negated_form(query_text: &str) -> Option<String> {
+    let trimmed = query_text.trim().trim_end_matches(['?', '.', '!']);
+    let words: Vec<&str> = trimmed.split_whitespace().collect();
+    if words.len() < 3 {
+        return None;
+    }
+    let leader_lc = words[0].to_lowercase();
+    if !crate::constants::POLAR_QUESTION_LEADERS
+        .iter()
+        .any(|l| *l == leader_lc.as_str())
+    {
+        return None;
+    }
+    // Skip if the original already contains an overt negation token — the
+    // pipeline will boost via `has_negation` directly.
+    let has_overt = words[1..]
+        .iter()
+        .any(|w| is_negation(&w.to_lowercase()) || w.to_lowercase().ends_with("n't"));
+    if has_overt {
+        return None;
+    }
+
+    // Subject NP boundary detection: scan words[1..] for the first content
+    // verb. Tokens before it form the subject NP, tokens from the verb onward
+    // form the predicate. Falls back to a single-word subject when no verb
+    // indicator is found (e.g., copular questions like "Is GitHub auto-merge
+    // enabled?" where "enabled" is a past-participle adjective, not in
+    // VERB_INDICATORS). The output is intended for re-embedding via MiniLM,
+    // which is robust to minor word-order imperfections — exact grammar is
+    // not required for the HyDE-style pseudo-document anchor to work.
+    let verb_idx = words[1..].iter().position(|w| is_verb(&w.to_lowercase()));
+    let (subject, predicate) = match verb_idx {
+        Some(0) => {
+            // Verb immediately follows the leader (e.g., "Did move?") — too
+            // short to template meaningfully.
+            return None;
+        }
+        Some(k) => {
+            let subj = words[1..1 + k].join(" ");
+            let pred = words[1 + k..].join(" ");
+            (subj, pred)
+        }
+        None => {
+            // No content verb found — single-word subject fallback.
+            (words[1].to_string(), words[2..].join(" "))
+        }
+    };
+
+    Some(format!("{subject} {leader_lc} not {predicate}"))
+}
+
+impl QueryAnalysis {
+    /// Returns `true` when this query is sensitive to candidate-passage polarity:
+    /// either it contains explicit negation (`has_negation`) or it is a polar
+    /// (yes/no) question (`is_polar`). Used to gate the deeper-pool +
+    /// negated-form-embedding retrieval path (RH-14).
+    pub fn polarity_sensitive(&self) -> bool {
+        self.has_negation || self.is_polar
     }
 }
 
@@ -3392,9 +4065,633 @@ fn is_stop_word(word: &str) -> bool {
     STOP_WORDS.contains(&word)
 }
 
+// =============================================================================
+// ONTOLOGICAL INTENT INFERENCE
+// =============================================================================
+// Infers expected entity types and relation types from query structure.
+// Zero-config: types come from existing EntityLabel and RelationType enums
+// already stored on every graph node/edge.
+//
+// Reference: Collins & Quillian (1969), Anderson (1983) selective spreading
+
+use crate::graph_memory::{EntityLabel, RelationType};
+
+/// Ontological intent inferred from query structure.
+///
+/// Determines expected entity types and relation types based on question words
+/// and verb stems. Used by Layer 2 (Graph Expansion) to apply soft type penalties
+/// during spreading activation and Layer 4.9 for post-RRF re-ranking.
+///
+/// Zero-config: no user-defined ontology needed. Types come from the existing
+/// EntityLabel and RelationType enums already stored in the knowledge graph.
+#[derive(Debug, Clone)]
+pub struct OntologicalIntent {
+    /// Expected entity types in the answer (e.g., Person for "who" queries).
+    /// Empty = no type constraint.
+    pub expected_labels: Vec<EntityLabel>,
+    /// Preferred relation types for graph traversal (e.g., WorksWith for "work" verbs).
+    /// Empty = no relation constraint.
+    pub relation_types: Vec<RelationType>,
+    /// Confidence in the inferred intent (0.0-1.0).
+    /// Below ONTOLOGICAL_MIN_CONFIDENCE, intent is ignored.
+    pub confidence: f32,
+}
+
+/// Map verb stems to relation types.
+///
+/// Uses Porter2-stemmed forms for matching against `Relation.stem` from query analysis.
+/// Returns empty vec for unrecognized verbs (no penalty applied).
+fn verb_stem_to_relation_types(stem: &str) -> Vec<RelationType> {
+    match stem {
+        // Work relationships
+        "work" | "collabor" => vec![
+            RelationType::WorksWith,
+            RelationType::WorksAt,
+            RelationType::EmployedBy,
+        ],
+        "employ" | "hire" => vec![RelationType::EmployedBy, RelationType::WorksAt],
+
+        // Location relationships
+        "locat" | "live" | "base" | "resid" | "situat" => {
+            vec![RelationType::LocatedIn, RelationType::LocatedAt]
+        }
+
+        // Learning relationships
+        "learn" | "studi" | "discover" => vec![RelationType::Learned, RelationType::Knows],
+        "teach" | "mentor" | "instruct" => vec![RelationType::Teaches],
+        "know" | "familiar" => vec![RelationType::Knows],
+
+        // Usage relationships
+        "use" | "util" | "adopt" | "leverag" => vec![RelationType::Uses],
+        "read" | "consult" | "refer" => vec![RelationType::Uses],
+
+        // Creation relationships
+        "creat" | "build" | "develop" | "design" => {
+            vec![RelationType::CreatedBy, RelationType::DevelopedBy]
+        }
+
+        // Causal relationships
+        // Triggers is the type the cue extractor assigns to the most common causal
+        // phrasings ("caused", "led to", "because of", "due to") — it MUST be in the
+        // causal intent set or the ontology penalty (0.4x) suppresses exactly those
+        // edges on causal queries.
+        "caus" | "result" | "lead" => {
+            vec![
+                RelationType::Causes,
+                RelationType::ResultsIn,
+                RelationType::Triggers,
+            ]
+        }
+
+        // Ownership / structural
+        "own" | "belong" | "possess" => vec![RelationType::OwnedBy, RelationType::PartOf],
+        "contain" | "includ" | "consist" => vec![RelationType::Contains, RelationType::PartOf],
+
+        // Management / governance
+        "manag" | "supervis" | "oversee" | "direct" | "coordin" => vec![RelationType::Manages],
+        "assign" | "deleg" | "allocat" => vec![RelationType::AssignedTo],
+        "approv" | "reject" | "review" | "sign" => vec![RelationType::Approves],
+
+        // Dependency / requirement
+        "depend" | "requir" | "need" | "reliant" => {
+            vec![RelationType::DependsOn, RelationType::Requires]
+        }
+
+        // Preference / recommendation
+        "prefer" | "like" | "favor" | "favour" | "chose" | "choos" | "select" => {
+            vec![RelationType::Prefers]
+        }
+        "recommend" | "suggest" | "advis" | "propos" => vec![RelationType::Recommends],
+
+        // Documentation / knowledge
+        "write" | "document" | "author" | "draft" | "compil" => {
+            vec![RelationType::Documents, RelationType::CreatedBy]
+        }
+        "implement" | "realiz" | "fulfill" => vec![RelationType::Implements],
+
+        // Operational / execution
+        "run" | "execut" | "launch" | "start" | "invok" => {
+            vec![RelationType::Uses, RelationType::Triggers]
+        }
+        "deploy" | "releas" | "ship" | "promot" => vec![RelationType::DeploysTo],
+        "monitor" | "track" | "observ" | "watch" | "alert" => vec![RelationType::Monitors],
+        "trigger" | "fire" | "emit" => vec![RelationType::Triggers],
+        "schedul" | "plan" | "arrang" | "organiz" => vec![RelationType::Manages],
+        "configur" | "tune" | "adjust" => vec![RelationType::Configures],
+
+        // Evolution / comparison
+        "migrat" | "upgrad" | "patch" | "updat" => vec![RelationType::SupersededBy],
+        "replac" | "supersed" | "obsolet" | "deprec" => vec![RelationType::SupersededBy],
+        "compar" | "differ" | "contrast" | "benchmark" => vec![RelationType::AlternativeTo],
+
+        // Problem solving
+        "fix" | "solv" | "resolv" | "debug" | "repair" => vec![RelationType::ResultsIn],
+
+        // Integration / connection
+        "connect" | "integr" | "link" | "bridg" | "coupl" => {
+            vec![RelationType::DependsOn, RelationType::Uses]
+        }
+
+        _ => vec![],
+    }
+}
+
+/// Map question word patterns to expected entity labels.
+///
+/// Checks the first few tokens of the query for WH-words and maps them
+/// to the entity types most likely to appear in the answer.
+fn question_word_to_labels(query_text: &str) -> Vec<EntityLabel> {
+    let lower = query_text.to_lowercase();
+    let trimmed = lower.trim_start();
+
+    // "who" / "whom" queries → people and organizational entities
+    if trimmed.starts_with("who ") || trimmed.starts_with("whom ") {
+        vec![
+            EntityLabel::Person,
+            EntityLabel::Organization,
+            EntityLabel::Team,
+        ]
+    }
+    // "where" queries → location and environment
+    else if trimmed.starts_with("where ") {
+        vec![EntityLabel::Location, EntityLabel::Environment]
+    }
+    // "when" queries → temporal entities
+    else if trimmed.starts_with("when ") {
+        vec![EntityLabel::Date, EntityLabel::Event]
+    }
+    // "how" queries → methodology, technology, operational
+    else if trimmed.starts_with("how ") {
+        if trimmed.contains(" deploy")
+            || trimmed.contains(" ci")
+            || trimmed.contains(" cd")
+            || trimmed.contains(" pipeline")
+            || trimmed.contains(" build")
+            || trimmed.contains(" releas")
+        {
+            vec![
+                EntityLabel::Pipeline,
+                EntityLabel::Technology,
+                EntityLabel::Configuration,
+            ]
+        } else if trimmed.contains(" monitor")
+            || trimmed.contains(" metric")
+            || trimmed.contains(" alert")
+            || trimmed.contains(" observ")
+        {
+            vec![EntityLabel::Metric, EntityLabel::Service]
+        } else if trimmed.contains(" configur")
+            || trimmed.contains(" set up")
+            || trimmed.contains(" setup")
+        {
+            vec![EntityLabel::Configuration, EntityLabel::Technology]
+        } else {
+            vec![EntityLabel::Concept, EntityLabel::Technology]
+        }
+    }
+    // "why" queries → causal reasoning, events, decisions
+    else if trimmed.starts_with("why ") {
+        vec![EntityLabel::Event, EntityLabel::Concept]
+    }
+    // "what/which" + technology context
+    else if (trimmed.starts_with("what ") || trimmed.starts_with("which "))
+        && (trimmed.contains(" tool")
+            || trimmed.contains(" tech")
+            || trimmed.contains(" framework")
+            || trimmed.contains(" language")
+            || trimmed.contains(" library")
+            || trimmed.contains(" stack"))
+    {
+        vec![
+            EntityLabel::Technology,
+            EntityLabel::Product,
+            EntityLabel::Module,
+        ]
+    }
+    // "what/which" + service/api context
+    else if (trimmed.starts_with("what ") || trimmed.starts_with("which "))
+        && (trimmed.contains(" service")
+            || trimmed.contains(" api")
+            || trimmed.contains(" endpoint")
+            || trimmed.contains(" microservice"))
+    {
+        vec![EntityLabel::Service, EntityLabel::Technology]
+    }
+    // "what/which" + project/repo context
+    else if (trimmed.starts_with("what ") || trimmed.starts_with("which "))
+        && (trimmed.contains(" project")
+            || trimmed.contains(" repo")
+            || trimmed.contains(" repositor")
+            || trimmed.contains(" codebase"))
+    {
+        vec![EntityLabel::Project, EntityLabel::Repository]
+    }
+    // "what/which" + database context
+    else if (trimmed.starts_with("what ") || trimmed.starts_with("which "))
+        && (trimmed.contains(" databas")
+            || trimmed.contains(" db")
+            || trimmed.contains(" store")
+            || trimmed.contains(" cache"))
+    {
+        vec![EntityLabel::Database, EntityLabel::Technology]
+    }
+    // "what/which" + environment context
+    else if (trimmed.starts_with("what ") || trimmed.starts_with("which "))
+        && (trimmed.contains(" environ")
+            || trimmed.contains(" stage")
+            || trimmed.contains(" prod")
+            || trimmed.contains(" cluster"))
+    {
+        vec![EntityLabel::Environment]
+    }
+    // "what/which" + task/ticket context
+    else if (trimmed.starts_with("what ") || trimmed.starts_with("which "))
+        && (trimmed.contains(" task")
+            || trimmed.contains(" ticket")
+            || trimmed.contains(" issue")
+            || trimmed.contains(" bug"))
+    {
+        vec![EntityLabel::Task]
+    }
+    // "what/which" + metric/SLO context
+    else if (trimmed.starts_with("what ") || trimmed.starts_with("which "))
+        && (trimmed.contains(" metric")
+            || trimmed.contains(" slo")
+            || trimmed.contains(" latenc")
+            || trimmed.contains(" error rate"))
+    {
+        vec![EntityLabel::Metric]
+    }
+    // "what/which" + config context
+    else if (trimmed.starts_with("what ") || trimmed.starts_with("which "))
+        && (trimmed.contains(" config")
+            || trimmed.contains(" flag")
+            || trimmed.contains(" setting")
+            || trimmed.contains(" param"))
+    {
+        vec![EntityLabel::Configuration]
+    }
+    // "what/which" + document context
+    else if (trimmed.starts_with("what ") || trimmed.starts_with("which "))
+        && (trimmed.contains(" doc")
+            || trimmed.contains(" rfc")
+            || trimmed.contains(" spec")
+            || trimmed.contains(" readme")
+            || trimmed.contains(" runbook"))
+    {
+        vec![EntityLabel::Document]
+    }
+    // "what/which" + skill context
+    else if (trimmed.starts_with("what ") || trimmed.starts_with("which "))
+        && (trimmed.contains(" skill")
+            || trimmed.contains(" abilit")
+            || trimmed.contains(" competenc"))
+    {
+        vec![EntityLabel::Skill]
+    }
+    // "what/which" + organization/team context
+    else if (trimmed.starts_with("what ") || trimmed.starts_with("which "))
+        && (trimmed.contains(" compan")
+            || trimmed.contains(" organiz")
+            || trimmed.contains(" team")
+            || trimmed.contains(" squad"))
+    {
+        vec![EntityLabel::Organization, EntityLabel::Team]
+    }
+    // "what/which" + pipeline context
+    else if (trimmed.starts_with("what ") || trimmed.starts_with("which "))
+        && (trimmed.contains(" pipeline")
+            || trimmed.contains(" workflow")
+            || trimmed.contains(" ci")
+            || trimmed.contains(" cd"))
+    {
+        vec![EntityLabel::Pipeline]
+    }
+    // Imperative patterns: "list all...", "show me...", "find..."
+    else if trimmed.starts_with("list ")
+        || trimmed.starts_with("show ")
+        || trimmed.starts_with("find ")
+        || trimmed.starts_with("get ")
+        || trimmed.starts_with("fetch ")
+        || trimmed.starts_with("search ")
+    {
+        imperative_object_to_labels(trimmed)
+    }
+    // Comparative patterns
+    else if trimmed.starts_with("compar")
+        || trimmed.contains(" vs ")
+        || trimmed.contains(" versus ")
+        || trimmed.contains(" better than ")
+        || trimmed.contains(" differ")
+        || trimmed.contains(" alternative")
+    {
+        vec![EntityLabel::Technology, EntityLabel::Product]
+    } else {
+        vec![]
+    }
+}
+
+/// Extract entity labels from the object of an imperative query.
+///
+/// Parses the noun object in commands like "list all services" or
+/// "find the database config" to infer expected entity types.
+fn imperative_object_to_labels(query: &str) -> Vec<EntityLabel> {
+    if query.contains("service") || query.contains("api") || query.contains("endpoint") {
+        vec![EntityLabel::Service]
+    } else if query.contains("project") || query.contains("repo") {
+        vec![EntityLabel::Project, EntityLabel::Repository]
+    } else if query.contains("team") || query.contains("squad") || query.contains("group") {
+        vec![EntityLabel::Team, EntityLabel::Organization]
+    } else if query.contains("person") || query.contains("people") || query.contains("member") {
+        vec![EntityLabel::Person]
+    } else if query.contains("task") || query.contains("ticket") || query.contains("issue") {
+        vec![EntityLabel::Task]
+    } else if query.contains("config") || query.contains("flag") || query.contains("setting") {
+        vec![EntityLabel::Configuration]
+    } else if query.contains("doc") || query.contains("spec") || query.contains("rfc") {
+        vec![EntityLabel::Document]
+    } else if query.contains("pipeline") || query.contains("workflow") || query.contains("ci") {
+        vec![EntityLabel::Pipeline]
+    } else if query.contains("metric") || query.contains("slo") || query.contains("alert") {
+        vec![EntityLabel::Metric]
+    } else if query.contains("environ") || query.contains("cluster") || query.contains("stage") {
+        vec![EntityLabel::Environment]
+    } else if query.contains("databas") || query.contains("db") || query.contains("store") {
+        vec![EntityLabel::Database]
+    } else if query.contains("skill") || query.contains("competenc") {
+        vec![EntityLabel::Skill]
+    } else if query.contains("technolog") || query.contains("tool") || query.contains("framework") {
+        vec![EntityLabel::Technology]
+    } else if query.contains("module") || query.contains("package") || query.contains("crate") {
+        vec![EntityLabel::Module]
+    } else {
+        vec![]
+    }
+}
+
+/// Infer ontological intent from query analysis.
+///
+/// Combines question word patterns (for expected entity types) and verb stems
+/// (for preferred relation types) to produce a type-aware intent signal.
+///
+/// Called once per query in `semantic_retrieve()`. Zero cost for queries
+/// with no type signal (returns confidence=0.0, empty vecs).
+pub fn infer_ontological_intent(query_text: &str, analysis: &QueryAnalysis) -> OntologicalIntent {
+    let mut confidence = 0.0_f32;
+
+    // 1. Question word → expected entity labels
+    let expected_labels = question_word_to_labels(query_text);
+    if !expected_labels.is_empty() {
+        confidence += 0.4;
+    }
+
+    // 2. Verb stems → preferred relation types
+    let mut relation_types = Vec::new();
+    let mut seen_relations = std::collections::HashSet::new();
+    for relation in &analysis.relational_context {
+        for rt in verb_stem_to_relation_types(&relation.stem) {
+            let key = rt.as_str().to_string();
+            if seen_relations.insert(key) {
+                relation_types.push(rt);
+            }
+        }
+    }
+    if !relation_types.is_empty() {
+        confidence += 0.4;
+    }
+
+    // 3. Multiple signals bonus (both question word AND verb match)
+    if !expected_labels.is_empty() && !relation_types.is_empty() {
+        confidence += 0.2;
+    }
+
+    OntologicalIntent {
+        expected_labels,
+        relation_types,
+        confidence: confidence.min(1.0),
+    }
+}
+
+#[cfg(test)]
+mod polar_negation_tests {
+    use super::*;
+
+    #[test]
+    fn polar_question_detected_for_auxiliary_leaders() {
+        // Real smoke-suite negation queries, all of which are polar yes/no
+        // questions WITHOUT overt negation tokens.
+        assert!(is_polar_question(
+            "Are we using HNSW for vector search anywhere?"
+        ));
+        assert!(is_polar_question(
+            "Is GitHub auto-merge enabled on this repository?"
+        ));
+        assert!(is_polar_question(
+            "Did learning history records also move to postcard?"
+        ));
+        assert!(is_polar_question("Do we call OpenAI's embedding API?"));
+        assert!(is_polar_question(
+            "Are we using Tokio's mutex for the per-user init guards?"
+        ));
+
+        // Modal leaders should also be detected.
+        assert!(is_polar_question("Can we cache the embedding?"));
+        assert!(is_polar_question("Should I commit this change?"));
+        assert!(is_polar_question("Will the migration delete old data?"));
+    }
+
+    #[test]
+    fn non_polar_queries_are_not_flagged() {
+        // Information-seeking / wh-questions are not polar.
+        assert!(!is_polar_question("What is the latest commit on main?"));
+        assert!(!is_polar_question("How does the embedding cache work?"));
+        assert!(!is_polar_question("Why did consolidation fire twice?"));
+        // Plain statements / commands.
+        assert!(!is_polar_question("commit the changes"));
+        assert!(!is_polar_question("show retrieval diagnostics"));
+        // Empty / whitespace.
+        assert!(!is_polar_question(""));
+        assert!(!is_polar_question("   "));
+    }
+
+    #[test]
+    fn polar_to_negated_form_inserts_not_after_subject() {
+        // Single-word subject + verb immediately after — clean template.
+        assert_eq!(
+            polar_to_negated_form("Are we using HNSW for vector search anywhere?").as_deref(),
+            Some("we are not using HNSW for vector search anywhere")
+        );
+        assert_eq!(
+            polar_to_negated_form("Do we call OpenAI's embedding API?").as_deref(),
+            Some("we do not call OpenAI's embedding API")
+        );
+        // Multi-word subject NP detected via is_verb scan ("move" triggers
+        // the boundary; tokens before it form the subject including "also").
+        assert_eq!(
+            polar_to_negated_form("Did learning history records also move to postcard?").as_deref(),
+            Some("learning history records also did not move to postcard")
+        );
+        // No content verb in the rest → single-word subject fallback. The
+        // resulting form is mildly ungrammatical ("auto-merge enabled" is a
+        // past-participle adjective phrase) but still anchors the embedding
+        // toward negating passages — sufficient for HyDE-style retrieval.
+        assert_eq!(
+            polar_to_negated_form("Is GitHub auto-merge enabled?").as_deref(),
+            Some("GitHub is not auto-merge enabled")
+        );
+        // Verb scan picks up "using" — multi-word subject works.
+        assert_eq!(
+            polar_to_negated_form("Are we using Tokio's mutex for the per-user init guards?")
+                .as_deref(),
+            Some("we are not using Tokio's mutex for the per-user init guards")
+        );
+    }
+
+    #[test]
+    fn polar_to_negated_form_skips_already_negated_or_non_polar() {
+        // Already negated — no transform.
+        assert_eq!(
+            polar_to_negated_form("Are we not using HNSW anywhere?"),
+            None
+        );
+        assert_eq!(polar_to_negated_form("Don't we call OpenAI?"), None);
+        // Non-polar — no transform.
+        assert_eq!(polar_to_negated_form("What is the latest commit?"), None);
+        // Too short to template — no transform.
+        assert_eq!(polar_to_negated_form("Are we?"), None);
+        assert_eq!(polar_to_negated_form(""), None);
+    }
+
+    #[test]
+    fn polarity_sensitive_combines_negation_and_polar_signals() {
+        // Polar question, no overt negation token.
+        let a = analyze_query("Are we using HNSW for vector search anywhere?");
+        assert!(a.is_polar);
+        assert!(!a.has_negation);
+        assert!(a.polarity_sensitive());
+
+        // Overt negation, not polar.
+        let b = analyze_query("memory not stored in cache after restart");
+        assert!(!b.is_polar);
+        assert!(b.has_negation);
+        assert!(b.polarity_sensitive());
+
+        // Neither — wh-question.
+        let c = analyze_query("what is the latest commit on main");
+        assert!(!c.is_polar);
+        assert!(!c.has_negation);
+        assert!(!c.polarity_sensitive());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn multihop_intent_fires_on_bridge_question_with_two_entities() {
+        // The canonical planted 2-hop query: two grounded entities + connective
+        // "that" + bridge verbs "works"/"manage".
+        assert!(detect_multihop_intent(
+            "Who does the colleague that Vorland works closely with manage?",
+            2,
+            &[],
+        ));
+    }
+
+    #[test]
+    fn multihop_intent_fires_on_parsed_relation_with_single_entity() {
+        // A parsed relation grounds the bridge even when NER counted one entity.
+        assert!(detect_multihop_intent(
+            "who manages the team Vorland leads?",
+            1,
+            &["WorksWith".to_string()],
+        ));
+    }
+
+    #[test]
+    fn multihop_intent_false_on_simple_lookup() {
+        // Single entity, no bridge structure — a 1-hop lookup, not multi-hop.
+        assert!(!detect_multihop_intent("What is Vorland's email?", 1, &[]));
+        // Two entities but no relational bridge.
+        assert!(!detect_multihop_intent("Vorland and Meslin", 2, &[]));
+    }
+
+    #[test]
+    fn multihop_intent_false_without_entity_floor() {
+        // Bridge verb present but no grounded entities and no parsed relation:
+        // not enough to assert a multi-hop question.
+        assert!(!detect_multihop_intent("who works here", 0, &[]));
+    }
+
+    #[test]
+    fn multihop_intent_fires_on_planted_harness_query() {
+        // The exact 2-hop query generated by the multi-hop harness. Verifies the
+        // gate fires end-to-end (analyze_query → ontological intent → gate) so the
+        // companion A/B actually exercises the feature on the planted corpus.
+        let q = "Who does the colleague that Vorland works closely with manage?";
+        let analysis = analyze_query(q);
+        let onto = infer_ontological_intent(q, &analysis);
+        let relations: Vec<String> = onto
+            .relation_types
+            .iter()
+            .map(|r| format!("{r:?}"))
+            .collect();
+        let entity_count = analysis.focal_entities.len();
+        assert!(
+            detect_multihop_intent(q, entity_count, &relations),
+            "planted 2-hop query must classify as multi-hop (focal_entities={entity_count}, relations={relations:?})"
+        );
+    }
+
+    #[test]
+    fn multihop_intent_handles_punctuated_bridge_verbs() {
+        // Bridge verb adjacent to punctuation must still tokenize/match.
+        assert!(detect_multihop_intent(
+            "Who is the person who Vorland works, then Meslin manages?",
+            2,
+            &[],
+        ));
+    }
+
+    #[test]
+    fn extract_relative_dates_does_not_overflow_on_absurd_values() {
+        // Regression: a crafted "N years/months ago" with a huge N used to
+        // overflow `n * 365` and panic chrono's Duration/date math, crashing the
+        // retrieval thread. These must be skipped, never panic.
+        let now = Utc::now();
+        for q in [
+            "90000000000 years ago",         // n*365 is large but fits i64
+            "9999999999 months ago",         // n*30 large
+            "99999999999999999999 days ago", // 20 digits: parse fails → falls back to 1
+            "0 days ago",                    // boundary
+        ] {
+            // The assertion is simply that this returns without panicking.
+            let _ = extract_relative_dates(q, &now);
+        }
+
+        // A realistic relative date is still extracted correctly.
+        let refs = extract_relative_dates("3 days ago", &now);
+        assert!(
+            refs.iter()
+                .any(|(_, label, _, _)| label.contains("3 days ago")),
+            "a normal '3 days ago' must still be extracted, got {refs:?}"
+        );
+        assert_eq!(
+            refs.iter()
+                .find(|(_, l, _, _)| l.contains("3 days ago"))
+                .map(|(d, _, _, _)| *d),
+            Some(now.date_naive() - chrono::Duration::days(3)),
+            "the extracted date must be exactly 3 days before today"
+        );
+
+        // The absurd "90000000000 years ago" is out of the sane range and skipped.
+        let absurd = extract_relative_dates("90000000000 years ago", &now);
+        assert!(
+            absurd.iter().all(|(_, l, _, _)| !l.contains("90000000000")),
+            "an absurd relative date should be skipped, got {absurd:?}"
+        );
+    }
 
     #[test]
     fn test_noun_detection() {
@@ -3655,5 +4952,198 @@ mod tests {
             "Should detect 'support group' as phrase. Found: {:?}",
             phrases
         );
+    }
+
+    // ========================================================================
+    // TemporalQueryContext / analyze_temporal tests
+    // ========================================================================
+
+    #[test]
+    fn test_analyze_temporal_specific_month() {
+        let ctx = analyze_temporal("what happened in March 2026");
+        assert_eq!(ctx.intent, TemporalIntent::SpecificTime);
+        assert!(ctx.is_filtering_query, "should be filtering query");
+        assert!(!ctx.is_seeking_query);
+        assert!(ctx.date_range.is_some());
+        let (start, end) = ctx.date_range.unwrap();
+        assert_eq!(start.month(), 3);
+        assert_eq!(start.day(), 1);
+        assert_eq!(end.month(), 3);
+        assert_eq!(end.day(), 31);
+    }
+
+    #[test]
+    fn test_analyze_temporal_when_question() {
+        let ctx = analyze_temporal("when did the deployment happen");
+        assert_eq!(ctx.intent, TemporalIntent::WhenQuestion);
+        assert!(ctx.is_seeking_query, "WhenQuestion should be seeking");
+        assert!(!ctx.is_filtering_query);
+    }
+
+    #[test]
+    fn test_analyze_temporal_yesterday() {
+        let ctx = analyze_temporal("what did we discuss yesterday");
+        assert_eq!(ctx.intent, TemporalIntent::SpecificTime);
+        assert!(ctx.is_filtering_query);
+        assert!(ctx.date_range.is_some());
+    }
+
+    #[test]
+    fn test_analyze_temporal_no_temporal() {
+        let ctx = analyze_temporal("tell me about the robot architecture");
+        assert_eq!(ctx.intent, TemporalIntent::None);
+        assert!(!ctx.is_filtering_query);
+        assert!(!ctx.is_seeking_query);
+        assert!(ctx.date_range.is_none());
+    }
+
+    #[test]
+    fn test_analyze_temporal_iso_date() {
+        let ctx = analyze_temporal("what happened on 2026-03-15");
+        assert_eq!(ctx.intent, TemporalIntent::SpecificTime);
+        assert!(ctx.is_filtering_query);
+        let (start, end) = ctx.date_range.unwrap();
+        // Single absolute date → ±1 day padding
+        assert_eq!(start, NaiveDate::from_ymd_opt(2026, 3, 14).unwrap());
+        assert_eq!(end, NaiveDate::from_ymd_opt(2026, 3, 16).unwrap());
+    }
+
+    #[test]
+    fn test_analyze_temporal_when_with_date() {
+        // "When in March 2026 did X happen" — has dates but asking for specifics
+        let ctx = analyze_temporal("when in March 2026 did the incident happen");
+        assert_eq!(ctx.intent, TemporalIntent::WhenQuestion);
+        assert!(ctx.is_seeking_query);
+        // Has parsed dates but intent is WhenQuestion, so not a filtering query
+        assert!(!ctx.is_filtering_query);
+    }
+
+    #[test]
+    fn test_analyze_temporal_duration() {
+        let ctx = analyze_temporal("how long ago did we fix the bug");
+        assert_eq!(ctx.intent, TemporalIntent::Duration);
+        assert!(ctx.is_seeking_query);
+        assert!(!ctx.is_filtering_query);
+    }
+
+    #[test]
+    fn test_compute_padded_date_range_empty() {
+        let extraction = TemporalExtraction::default();
+        assert!(compute_padded_date_range(&extraction).is_none());
+    }
+
+    // ---- Year / quarter qualifiers (issue #275) ----
+
+    #[test]
+    fn test_year_qualifier_in_expands_to_full_year() {
+        let ex = extract_temporal_refs("what did I ship in 2023");
+        assert!(
+            ex.refs
+                .iter()
+                .any(|r| r.ref_type == TemporalRefType::Year && r.date.year() == 2023),
+            "expected a Year ref for 2023, got {:?}",
+            ex.refs
+        );
+        let (start, end) = compute_padded_date_range(&ex).expect("range");
+        assert_eq!(start, NaiveDate::from_ymd_opt(2023, 1, 1).unwrap());
+        assert_eq!(end, NaiveDate::from_ymd_opt(2023, 12, 31).unwrap());
+    }
+
+    #[test]
+    fn test_bare_year_expands_to_full_year() {
+        let ex = extract_temporal_refs("did the 2021 migration finish");
+        let (start, end) = compute_padded_date_range(&ex).expect("range");
+        assert_eq!(start, NaiveDate::from_ymd_opt(2021, 1, 1).unwrap());
+        assert_eq!(end, NaiveDate::from_ymd_opt(2021, 12, 31).unwrap());
+    }
+
+    #[test]
+    fn test_since_year_qualifier() {
+        let ex = extract_temporal_refs("everything since 2020");
+        assert!(ex
+            .refs
+            .iter()
+            .any(|r| r.ref_type == TemporalRefType::Year && r.date.year() == 2020));
+    }
+
+    #[test]
+    fn test_quarter_expands_to_three_months() {
+        let ex = extract_temporal_refs("the Q1 2023 roadmap");
+        assert!(
+            ex.refs
+                .iter()
+                .any(|r| r.ref_type == TemporalRefType::Quarter),
+            "expected a Quarter ref, got {:?}",
+            ex.refs
+        );
+        let (start, end) = compute_padded_date_range(&ex).expect("range");
+        assert_eq!(start, NaiveDate::from_ymd_opt(2023, 1, 1).unwrap());
+        assert_eq!(end, NaiveDate::from_ymd_opt(2023, 3, 31).unwrap());
+    }
+
+    #[test]
+    fn test_quarter_q4_year_boundary() {
+        let ex = extract_temporal_refs("the Q4 2023 results");
+        let (start, end) = compute_padded_date_range(&ex).expect("range");
+        assert_eq!(start, NaiveDate::from_ymd_opt(2023, 10, 1).unwrap());
+        assert_eq!(end, NaiveDate::from_ymd_opt(2023, 12, 31).unwrap());
+    }
+
+    #[test]
+    fn test_month_year_not_double_counted_as_bare_year() {
+        // "March 2023" must stay a single Month ref expanding to all of March,
+        // not split into a March-1 Month ref + a Jan-1 Year ref.
+        let ex = extract_temporal_refs("what happened in March 2023");
+        assert_eq!(ex.refs.len(), 1, "got {:?}", ex.refs);
+        let (start, end) = compute_padded_date_range(&ex).expect("range");
+        assert_eq!(start, NaiveDate::from_ymd_opt(2023, 3, 1).unwrap());
+        assert_eq!(end, NaiveDate::from_ymd_opt(2023, 3, 31).unwrap());
+    }
+
+    // ---- "last/this week|month|year" calendar windows (formerly ±1 day) ----
+
+    #[test]
+    fn test_last_year_is_previous_calendar_year() {
+        let now = Utc::now();
+        let prev = now.year() - 1;
+        let ex = extract_temporal_refs("what did we decide last year");
+        let (start, end) = compute_padded_date_range(&ex).expect("range");
+        assert_eq!(start, NaiveDate::from_ymd_opt(prev, 1, 1).unwrap());
+        assert_eq!(end, NaiveDate::from_ymd_opt(prev, 12, 31).unwrap());
+    }
+
+    #[test]
+    fn test_last_month_is_full_previous_month() {
+        let now = Utc::now();
+        let (y, m) = if now.month() == 1 {
+            (now.year() - 1, 12)
+        } else {
+            (now.year(), now.month() - 1)
+        };
+        let ex = extract_temporal_refs("the bug we hit last month");
+        let (start, end) = compute_padded_date_range(&ex).expect("range");
+        assert_eq!(start, NaiveDate::from_ymd_opt(y, m, 1).unwrap());
+        // End is the last day of that month (≥ 28).
+        assert_eq!(end.month(), m);
+        assert!(end.day() >= 28);
+    }
+
+    #[test]
+    fn test_last_week_is_seven_day_window() {
+        let ex = extract_temporal_refs("the demo we ran last week");
+        let (start, end) = compute_padded_date_range(&ex).expect("range");
+        // Mon–Sun calendar week, not the old ±1-day (3-day) point window.
+        assert_eq!((end - start).num_days(), 6);
+        assert_eq!(start.weekday(), chrono::Weekday::Mon);
+        assert_eq!(end.weekday(), chrono::Weekday::Sun);
+    }
+
+    #[test]
+    fn test_this_year_is_current_calendar_year() {
+        let now = Utc::now();
+        let ex = extract_temporal_refs("everything this year");
+        let (start, end) = compute_padded_date_range(&ex).expect("range");
+        assert_eq!(start, NaiveDate::from_ymd_opt(now.year(), 1, 1).unwrap());
+        assert_eq!(end, NaiveDate::from_ymd_opt(now.year(), 12, 31).unwrap());
     }
 }

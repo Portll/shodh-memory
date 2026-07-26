@@ -50,9 +50,7 @@ describe("shouldWarnInsecureApiUrl", () => {
   });
 
   it("does not warn when allowHttpEnv is 'true'", () => {
-    expect(shouldWarnInsecureApiUrl("http://example.com/api", "true")).toBe(
-      false,
-    );
+    expect(shouldWarnInsecureApiUrl("http://example.com/api", "true")).toBe(false);
   });
 
   it("does not warn for localhost over http", () => {
@@ -72,9 +70,7 @@ describe("shouldWarnInsecureApiUrl", () => {
   });
 
   it("warns when allowHttpEnv is 'false' (not 'true')", () => {
-    expect(shouldWarnInsecureApiUrl("http://remote.server.com", "false")).toBe(
-      true,
-    );
+    expect(shouldWarnInsecureApiUrl("http://remote.server.com", "false")).toBe(true);
   });
 });
 

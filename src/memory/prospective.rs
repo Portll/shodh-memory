@@ -159,12 +159,15 @@ impl ProspectiveStore {
                     let mut batch = WriteBatch::default();
                     let mut count = 0usize;
                     for item in old_db.iterator(rocksdb::IteratorMode::Start) {
-                        if let Ok((key, value)) = item {
-                            batch.put_cf(cf, &key, &value);
-                            count += 1;
-                            if count % 10_000 == 0 {
-                                db.write(std::mem::take(&mut batch))?;
-                            }
+                        let (key, value) = item.map_err(|e| {
+                            anyhow::anyhow!(
+                                "RocksDB iterator error during prospective migration: {e}"
+                            )
+                        })?;
+                        batch.put_cf(cf, &key, &value);
+                        count += 1;
+                        if count.is_multiple_of(10_000) {
+                            db.write(std::mem::take(&mut batch))?;
                         }
                     }
                     if !batch.is_empty() {
@@ -176,6 +179,9 @@ impl ProspectiveStore {
                     );
 
                     let backup = prospective_path.join(format!("{old_name}.pre_cf_migration"));
+                    if backup.exists() {
+                        let _ = std::fs::remove_dir_all(&backup);
+                    }
                     if let Err(e) = std::fs::rename(&old_dir, &backup) {
                         tracing::warn!("Could not rename old {old_name} dir: {e}");
                     }
@@ -659,7 +665,7 @@ impl ProspectiveStore {
                 let task_emb = task
                     .embedding
                     .as_deref()
-                    .map(|e| std::borrow::Cow::Borrowed(e))
+                    .map(std::borrow::Cow::Borrowed)
                     .or_else(|| embed_fn(&task.content).map(std::borrow::Cow::Owned));
 
                 if let Some(task_embedding) = task_emb {

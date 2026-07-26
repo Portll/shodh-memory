@@ -111,7 +111,7 @@ pub async fn lineage_trace(
     let user_id = req.user_id.clone();
     let memory_id_str = req.memory_id.clone();
     let direction = req.direction.clone();
-    let max_depth = req.max_depth;
+    let max_depth = req.max_depth.min(100);
 
     let trace = tokio::task::spawn_blocking(move || {
         let memory_guard = memory.read();
@@ -167,6 +167,10 @@ pub async fn lineage_list_edges(
 }
 
 /// POST /api/lineage/confirm - Confirm an inferred lineage edge
+///
+/// Confirms the edge in the lineage graph and strengthens the corresponding
+/// knowledge graph edges between the two memories' entities, coupling causal
+/// chains with spreading activation.
 #[tracing::instrument(skip(state), fields(user_id = %req.user_id, edge_id = %req.edge_id))]
 pub async fn lineage_confirm_edge(
     State(state): State<AppState>,
@@ -178,20 +182,47 @@ pub async fn lineage_confirm_edge(
         .get_user_memory(&req.user_id)
         .map_err(AppError::Internal)?;
 
+    let graph = state.get_user_graph(&req.user_id).ok();
+
     let user_id = req.user_id.clone();
     let edge_id = req.edge_id.clone();
 
-    let confirmed = tokio::task::spawn_blocking(move || {
+    let (confirmed, graph_strengthened) = tokio::task::spawn_blocking(move || {
         let memory_guard = memory.read();
-        memory_guard
+
+        // Get the edge before confirming so we can read from/to memory IDs
+        let edge_before = memory_guard.lineage_graph().get_edge(&user_id, &edge_id)?;
+
+        let confirmed = memory_guard
             .lineage_graph()
-            .confirm_edge(&user_id, &edge_id)
+            .confirm_edge(&user_id, &edge_id)?;
+
+        // Strengthen graph edges between the two causally-linked memories
+        let mut graph_strengthened = 0usize;
+        if confirmed {
+            if let (Some(edge), Some(graph_arc)) = (edge_before, graph.as_ref()) {
+                let graph_guard = graph_arc.read();
+                let boost = crate::constants::LINEAGE_CONFIRM_GRAPH_BOOST;
+                match graph_guard.strengthen_lineage_connection(&edge.from.0, &edge.to.0, boost) {
+                    Ok(n) => graph_strengthened = n,
+                    Err(e) => tracing::debug!(
+                        "Lineage confirm→graph strengthening failed (non-fatal): {}",
+                        e
+                    ),
+                }
+            }
+        }
+
+        Ok::<_, anyhow::Error>((confirmed, graph_strengthened))
     })
     .await
     .map_err(|e| AppError::Internal(anyhow::anyhow!("Blocking task panicked: {e}")))?
     .map_err(AppError::Internal)?;
 
-    Ok(Json(serde_json::json!({ "confirmed": confirmed })))
+    Ok(Json(serde_json::json!({
+        "confirmed": confirmed,
+        "graph_edges_strengthened": graph_strengthened
+    })))
 }
 
 /// POST /api/lineage/reject - Reject (delete) an inferred lineage edge
@@ -254,7 +285,13 @@ pub async fn lineage_add_edge(
             "SupersededBy" => CausalRelation::SupersededBy,
             "TriggeredBy" => CausalRelation::TriggeredBy,
             "BranchedFrom" => CausalRelation::BranchedFrom,
-            _ => CausalRelation::RelatedTo,
+            "RelatedTo" => CausalRelation::RelatedTo,
+            other => {
+                return Err(anyhow::anyhow!(
+                    "Unknown relation type: '{}'. Valid: Caused, ResolvedBy, InformedBy, SupersededBy, TriggeredBy, BranchedFrom, RelatedTo",
+                    other
+                ));
+            }
         };
         memory_guard
             .lineage_graph()
@@ -355,4 +392,51 @@ pub async fn lineage_create_branch(
     .map_err(AppError::Internal)?;
 
     Ok(Json(branch))
+}
+
+/// Request to find the root cause of a decision chain
+#[derive(Debug, Deserialize)]
+pub struct LineageRootCauseRequest {
+    pub user_id: String,
+    pub memory_id: String,
+}
+
+/// Response for root cause lookup
+#[derive(Debug, Serialize)]
+pub struct LineageRootCauseResponse {
+    pub memory_id: String,
+    pub root_cause_id: Option<String>,
+}
+
+/// POST /api/lineage/root-cause - Find the oldest ancestor in a causal chain
+#[tracing::instrument(skip(state), fields(user_id = %req.user_id, memory_id = %req.memory_id))]
+pub async fn lineage_root_cause(
+    State(state): State<AppState>,
+    Json(req): Json<LineageRootCauseRequest>,
+) -> Result<Json<LineageRootCauseResponse>, AppError> {
+    validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
+
+    let memory = state
+        .get_user_memory(&req.user_id)
+        .map_err(AppError::Internal)?;
+
+    let user_id = req.user_id.clone();
+    let memory_id_str = req.memory_id.clone();
+
+    let root_cause_id = tokio::task::spawn_blocking(move || {
+        let memory_guard = memory.read();
+        let memory_id = MemoryId(
+            uuid::Uuid::parse_str(&memory_id_str)
+                .map_err(|e| anyhow::anyhow!("Invalid memory_id: {e}"))?,
+        );
+        memory_guard.find_root_cause(&user_id, &memory_id)
+    })
+    .await
+    .map_err(|e| AppError::Internal(anyhow::anyhow!("Blocking task panicked: {e}")))?
+    .map_err(AppError::Internal)?;
+
+    Ok(Json(LineageRootCauseResponse {
+        memory_id: req.memory_id,
+        root_cause_id: root_cause_id.map(|id| id.0.to_string()),
+    }))
 }

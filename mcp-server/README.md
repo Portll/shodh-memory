@@ -5,7 +5,7 @@
 <h1 align="center">Shodh-Memory MCP Server</h1>
 
 <p align="center">
-  <strong>v0.1.70</strong> | Persistent cognitive memory for AI agents
+  Persistent cognitive memory for AI agents
 </p>
 
 <p align="center">
@@ -29,9 +29,11 @@
 - **Semantic Search**: Find memories by meaning using MiniLM-L6 embeddings
 - **Knowledge Graph**: Entity extraction and relationship tracking
 - **Memory Consolidation**: Automatic decay, replay, and strengthening
+- **Idempotent**: Content-hash dedup — identical memories are never stored twice
 - **1-Click Install**: Auto-downloads native server binary for your platform
 - **Offline-First**: All models auto-downloaded on first run (~38MB total), no internet required after
-- **Fast**: Sub-millisecond graph lookup, 30-50ms semantic search
+- **Fast**: <200ms API response, sub-millisecond graph lookup, 30-50ms semantic search
+- **GTD Task Management**: Full todo system with projects, subtasks, comments, and reminders
 
 ## Installation
 
@@ -66,6 +68,16 @@ args = ["-y", "@shodh/memory-mcp"]
 env = { SHODH_API_KEY = "your-api-key-here" }
 ```
 
+By default the MCP server talks to the backend over HTTP, which works on every
+platform. To route ordinary requests over authenticated local IPC instead, add
+`SHODH_IPC_ENDPOINT` with a **platform-appropriate** value. On Windows, use the
+per-user named pipe printed by the server (normally
+`\\.\pipe\shodh-memory-<current-user-SID>`); on macOS/Linux, use its absolute Unix
+socket path (under the platform data directory at `shodh/shodh-memory.sock` by
+default). A `\\.\pipe\...` value on macOS/Linux is rejected rather than silently
+forwarded to the spawned backend. The auto-spawn path passes an explicitly
+configured endpoint to the backend so both processes use the same value.
+
 > **Note**: First run downloads the server binary (~15MB) plus embedding model (~23MB). The `startup_timeout_sec = 60` ensures enough time for initial setup.
 
 **For Cursor/other MCP clients**: Similar configuration with the npx command.
@@ -75,31 +87,115 @@ env = { SHODH_API_KEY = "your-api-key-here" }
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `SHODH_API_KEY` | **Required**. API key for authentication | - |
+| `SHODH_IPC_ENABLED` | Server listener toggle. The auto-spawned backend honors this value. | `true` |
+| `SHODH_IPC_ENDPOINT` | Local endpoint for MCP requests: a Unix socket path (macOS/Linux) or `\\.\pipe\name` (Windows). When set, ordinary MCP requests use local IPC instead of HTTP. A Windows pipe value on macOS/Linux is rejected. | - |
+| `SHODH_IPC_REQUIRED` | Fail closed when IPC cannot bind or authenticate. The TypeScript client also requires `SHODH_IPC_ENDPOINT` when enabled. | `false` |
 | `SHODH_API_URL` | Backend server URL | `http://127.0.0.1:3030` |
-| `SHODH_USER_ID` | User ID for memory isolation | `claude-code` |
+| `SHODH_USER_ID` | Logical memory namespace; not an authorization tenant | `claude-code` |
 | `SHODH_NO_AUTO_SPAWN` | Set to `true` to disable auto-starting the backend | `false` |
 | `SHODH_STREAM` | Enable/disable streaming ingestion | `true` |
+| `SHODH_STREAM_WEBSOCKET` | In IPC mode only, explicitly opt into WebSocket streaming through `SHODH_API_URL` | `false` |
 | `SHODH_PROACTIVE` | Enable/disable proactive memory surfacing | `true` |
 
-## MCP Tools (15 total)
+### Local IPC
+
+When `SHODH_IPC_ENDPOINT` is set, tool calls, proactive surfacing, health checks,
+resources, and prompts use local IPC. Each call opens one local connection and
+exchanges one versioned, newline-delimited JSON request and response. Frames are
+limited to eight MiB. An empty-auth health challenge first proves the endpoint
+knows the configured key. Ordinary requests then use HMAC proofs bound to that
+server instance and request body; the reusable API key is never sent over IPC or
+written to MCP stdout.
+
+Streaming ingestion remains a WebSocket feature. It is disabled by default in
+IPC mode because the local protocol is finite request/response. To enable it
+explicitly, set `SHODH_STREAM_WEBSOCKET=true` and configure `SHODH_API_URL` for
+the server's HTTP WebSocket endpoint. Ordinary operations continue to use IPC.
+
+If `SHODH_IPC_ENDPOINT` is absent, the MCP server preserves its existing HTTP
+and WebSocket behavior. When the variable is present, it is an explicit transport
+selection: an unavailable IPC endpoint is reported rather than silently retried
+over HTTP.
+
+`SHODH_USER_ID` remains a logical namespace, as it is over REST. A configured API
+key has authority across namespaces. Use separate server/key instances when
+mutually untrusted tenants require an authorization boundary.
+
+## MCP Tools (51 total)
+
+<details>
+<summary><b>Memory</b> — Store, search, and manage memories</summary>
 
 | Tool | Description |
 |------|-------------|
-| `remember` | Store a memory with optional type and tags |
-| `recall` | Semantic search to find relevant memories |
-| `proactive_context` | Auto-surface relevant memories for current context |
+| `remember` | Store a memory with optional type, tags, and metadata |
+| `recall` | Semantic search to find relevant memories. Pass `full_content: true` for complete bodies inline |
+| `proactive_context` | Auto-surface relevant memories for current context. Pass `full_content: true` for complete bodies inline |
 | `context_summary` | Get categorized context for session bootstrap |
 | `list_memories` | List all stored memories |
+| `read_memory` | Read full content of a specific memory by ID |
 | `forget` | Delete a specific memory by ID |
-| `forget_by_tags` | Delete memories matching any of the specified tags |
-| `forget_by_date` | Delete memories within a date range |
+
+> **Memory previews and truncation.** `recall`, `recall_by_tags`, and `proactive_context` return **previews** of each memory body (default cap: 500 characters). When a body is longer than the cap, the output is truncated with an **explicit, honest marker** that reports the real lengths and the follow-up call, e.g. `…[truncated 500/2340 chars — read_memory("<id>") for full]`. A preview is never silently cut off — the absence of a marker means you are seeing the complete body. To get complete bodies inline (no markers), pass `full_content: true` on any of those three tools; this increases token usage, so prefer it for small result sets. `read_memory` always returns the full, untruncated content.
+</details>
+
+<details>
+<summary><b>Todos (GTD)</b> — Task management with projects and subtasks</summary>
+
+| Tool | Description |
+|------|-------------|
+| `add_todo` | Create a task with priority, due date, project, contexts |
+| `list_todos` | List/search todos with semantic or GTD-style filtering |
+| `update_todo` | Update task properties (status, priority, notes) |
+| `complete_todo` | Mark a task as done (auto-creates next for recurring) |
+| `delete_todo` | Permanently delete a task |
+| `reorder_todo` | Move a task up or down within its status group |
+| `list_subtasks` | List subtasks of a parent todo |
+| `add_todo_comment` | Add a comment to a task (progress, resolution) |
+| `list_todo_comments` | List all comments on a task |
+| `update_todo_comment` | Edit an existing comment |
+| `delete_todo_comment` | Delete a comment |
+| `todo_stats` | Get todo statistics by status, overdue items |
+</details>
+
+<details>
+<summary><b>Projects</b> — Organize todos into groups</summary>
+
+| Tool | Description |
+|------|-------------|
+| `add_project` | Create a project with optional parent (sub-projects) |
+| `list_projects` | List all projects with todo counts |
+| `archive_project` | Archive a project (hidden but restorable) |
+| `delete_project` | Permanently delete a project |
+</details>
+
+<details>
+<summary><b>Reminders</b> — Time, duration, and context-triggered reminders</summary>
+
+| Tool | Description |
+|------|-------------|
+| `set_reminder` | Set a reminder (time, duration, or keyword trigger) |
+| `list_reminders` | List pending/triggered/dismissed reminders |
+| `dismiss_reminder` | Acknowledge a triggered reminder |
+</details>
+
+<details>
+<summary><b>System</b> — Health, backups, and diagnostics</summary>
+
+| Tool | Description |
+|------|-------------|
 | `memory_stats` | Get statistics about stored memories |
-| `recall_by_tags` | Find memories by tag |
-| `recall_by_date` | Find memories within a date range |
-| `verify_index` | Check vector index health |
-| `repair_index` | Repair orphaned memories |
+| `verify_index` | Check vector index integrity |
+| `repair_index` | Re-index orphaned memories |
+| `token_status` | Get current session token usage |
+| `reset_token_session` | Reset token counter for new session |
 | `consolidation_report` | View memory consolidation activity |
-| `streaming_status` | Check WebSocket streaming connection status |
+| `backup_create` | Create a backup of all memories |
+| `backup_list` | List available backups |
+| `backup_verify` | Verify backup integrity (SHA-256) |
+| `backup_restore` | Restore from a backup |
+| `backup_purge` | Purge old backups, keep most recent N |
+</details>
 
 ## REST API (for Developers)
 
@@ -181,8 +277,14 @@ Based on Cowan's working memory model:
 
 1. **Install**: `npx -y @shodh/memory-mcp` downloads the package
 2. **Auto-spawn**: On first run, downloads the native server binary (~15MB) and embedding model (~23MB)
-3. **Connect**: MCP client connects to the server via stdio
+3. **Connect**: MCP client connects to this MCP server via stdio; backend requests
+   use local IPC when `SHODH_IPC_ENDPOINT` is set, otherwise HTTP
 4. **Ready**: Start using `remember` and `recall` tools
+5. **Session end**: when the host closes stdin (e.g. a Claude Desktop thread
+   switch), the shim finishes any in-flight tool call and writes its response to
+   the still-open stdout before exiting, so a mid-flight request is never
+   silently dropped. Draining is bounded by a grace window; if it elapses the
+   caller receives an explicit error instead of waiting out the host timeout.
 
 The backend server runs locally and stores all data on your machine. No cloud dependency.
 

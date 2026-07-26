@@ -124,7 +124,7 @@ impl TemporalFactStore {
     pub fn store(&self, user_id: &str, fact: &TemporalFact) -> Result<()> {
         // Primary storage
         let key = format!("temporal_facts:{}:{}", user_id, fact.id);
-        let value = bincode::serde::encode_to_vec(fact, bincode::config::standard())?;
+        let value = crate::serialization::encode(fact)?;
         self.db.put(key.as_bytes(), &value)?;
 
         // Entity index
@@ -161,8 +161,7 @@ impl TemporalFactStore {
         let key = format!("temporal_facts:{}:{}", user_id, fact_id);
         match self.db.get(key.as_bytes())? {
             Some(data) => {
-                let (fact, _): (TemporalFact, _) =
-                    bincode::serde::decode_from_slice(&data, bincode::config::standard())?;
+                let (fact, _) = crate::serialization::try_decode::<TemporalFact>(&data)?;
                 Ok(Some(fact))
             }
             None => Ok(None),
@@ -217,7 +216,7 @@ impl TemporalFactStore {
                 // Check if any event stem matches
                 let has_event_match = f.event_stems.iter().any(|s| event_stems.contains(s));
                 // Check event type if specified
-                let type_matches = event_type.map_or(true, |t| f.event_type == t);
+                let type_matches = event_type.is_none_or(|t| f.event_type == t);
                 has_event_match && type_matches
             })
             .collect();
@@ -282,10 +281,7 @@ impl TemporalFactStore {
                 break;
             }
 
-            if let Ok((fact, _)) = bincode::serde::decode_from_slice::<TemporalFact, _>(
-                &value,
-                bincode::config::standard(),
-            ) {
+            if let Ok((fact, _)) = crate::serialization::try_decode::<TemporalFact>(&value) {
                 facts.push(fact);
                 if facts.len() >= limit {
                     break;
@@ -313,7 +309,7 @@ pub fn extract_temporal_facts(
 
     // Split into sentences
     let sentences: Vec<&str> = content
-        .split(|c| c == '.' || c == '!' || c == '?')
+        .split(['.', '!', '?'])
         .filter(|s| !s.trim().is_empty())
         .collect();
 
@@ -546,7 +542,7 @@ fn extract_event_and_time(sentence: &str, patterns: &[&str]) -> (String, String)
     let _matched_pattern = patterns
         .iter()
         .find(|p| sentence_lower.contains(*p))
-        .map(|s| *s)
+        .copied()
         .unwrap_or("");
 
     // Extract time expression

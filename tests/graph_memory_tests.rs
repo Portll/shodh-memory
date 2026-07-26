@@ -51,6 +51,8 @@ fn create_entity_from_ner(ner: &NeuralNer, text: &str) -> Vec<EntityNode> {
             name_embedding: None,
             salience: entity.confidence,
             is_proper_noun: true,
+            selectivity: None,
+            fine_type: None,
         })
         .collect()
 }
@@ -81,6 +83,8 @@ fn create_entity(
         name_embedding: None,
         salience,
         is_proper_noun: is_proper,
+        selectivity: None,
+        fine_type: None,
     }
 }
 
@@ -109,6 +113,9 @@ fn create_relationship(
         tier: EdgeTier::L1Working,
         activation_timestamps: None,
         entity_confidence: None,
+        endpoint_selectivity: None,
+        forman_curvature: None,
+        provenance: Vec::new(),
     }
 }
 
@@ -143,6 +150,9 @@ fn create_relationship_with_plasticity(
         tier: EdgeTier::L2Episodic,
         activation_timestamps: None,
         entity_confidence: None,
+        endpoint_selectivity: None,
+        forman_curvature: None,
+        provenance: Vec::new(),
     }
 }
 

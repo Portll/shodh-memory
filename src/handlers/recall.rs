@@ -17,13 +17,19 @@ use super::types::{
     RecallResponse, RecallTodo, ReinforceFeedbackRequest, RetrieveResponse, TrackedRetrieveRequest,
     TrackedRetrieveResponse,
 };
-use super::utils::{is_bare_question, is_boilerplate_response, strip_system_noise};
+use super::utils::{
+    has_sufficient_alpha_ratio, is_bare_question, is_boilerplate_response,
+    is_formatted_recall_output, is_tool_output_noise, strip_system_noise,
+};
 use crate::errors::{AppError, ValidationErrorExt};
 use crate::memory::feedback;
+use crate::similarity::cosine_similarity;
+use dashmap::DashMap;
 // Note: compute_relevance removed - using unified 5-layer pipeline scoring instead
 use crate::memory::segmentation::{InputSource, SegmentationEngine};
 use crate::memory::sessions::SessionEvent;
 use crate::memory::storage::SearchCriteria;
+use crate::memory::types::GeoFilter;
 use crate::memory::types::MemoryId;
 use crate::memory::{
     Experience, ExperienceType, Query as MemoryQuery, RetrievalMode, SharedMemory,
@@ -44,7 +50,31 @@ fn parse_retrieval_mode(mode: &str) -> RetrievalMode {
         "associative" => RetrievalMode::Associative,
         "temporal" => RetrievalMode::Temporal,
         "causal" => RetrievalMode::Causal,
+        "spatial" => RetrievalMode::Spatial,
+        "mission" => RetrievalMode::Mission,
+        "action_outcome" | "action-outcome" => RetrievalMode::ActionOutcome,
         _ => RetrievalMode::Hybrid,
+    }
+}
+
+/// Map API `layers` string to `LayerMode` enum (RH-8 cumulative ladder).
+///
+/// Returns `None` when the caller did not supply the field; the recall
+/// pipeline then keeps the production default (`LayerMode::Full`). An
+/// unrecognised non-empty value is rejected by the handler so silent
+/// fall-through doesn't make per-layer eval data lie about which stages
+/// actually ran. Accepted values match the strings emitted by
+/// `LayerMode::as_key()` and the `--layer` flag of `recall-eval`.
+fn parse_layer_mode(s: &str) -> Option<crate::memory::types::LayerMode> {
+    use crate::memory::types::LayerMode;
+    match s {
+        "vamana_only" | "vamana-only" => Some(LayerMode::VamanaOnly),
+        "+spreading" | "plus_spreading" | "plus-spreading" => Some(LayerMode::PlusSpreading),
+        "+bm25" | "plus_bm25" | "plus-bm25" => Some(LayerMode::PlusBm25),
+        "+rerank" | "plus_rerank" | "plus-rerank" => Some(LayerMode::PlusRerank),
+        "+facts" | "plus_facts" | "plus-facts" => Some(LayerMode::PlusFacts),
+        "full" => Some(LayerMode::Full),
+        _ => None,
     }
 }
 
@@ -126,6 +156,13 @@ pub struct ProactiveContextRequest {
     /// User's followup message after agent response (for delayed signals)
     #[serde(default)]
     pub user_followup: Option<String>,
+    /// Tool/actuator actions performed since last proactive_context call.
+    /// Used for tool-aware feedback attribution: matches actions against
+    /// previously surfaced memories to detect concrete usage.
+    /// Claude Code: collected by hooks (Read, Edit, Bash calls).
+    /// Robotics: constructed from action-outcome Experience fields.
+    #[serde(default)]
+    pub tool_actions: Vec<crate::memory::feedback::ToolAction>,
 }
 
 fn default_proactive_max_results() -> usize {
@@ -254,6 +291,9 @@ pub struct ProactiveContextResponse {
     /// Entities detected in the query context
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub detected_entities: Vec<DetectedEntityInfo>,
+    /// Number of temporal credits applied from multi-turn feedback window
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temporal_credits_applied: Option<u32>,
 }
 
 // =============================================================================
@@ -313,6 +353,64 @@ pub async fn recall(
     let op_start = std::time::Instant::now();
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
     validation::validate_max_results(req.limit).map_validation_err("limit")?;
+    validation::validate_query_text(&req.query).map_validation_err("query")?;
+
+    // Validate robotics string fields
+    if let Some(ref robot_id) = req.robot_id {
+        validation::validate_short_string(robot_id, "robot_id").map_validation_err("robot_id")?;
+    }
+    if let Some(ref mission_id) = req.mission_id {
+        validation::validate_short_string(mission_id, "mission_id")
+            .map_validation_err("mission_id")?;
+    }
+    if let Some(ref action_type) = req.action_type {
+        validation::validate_short_string(action_type, "action_type")
+            .map_validation_err("action_type")?;
+    }
+    if let Some(ref outcome_type) = req.outcome_type {
+        validation::validate_short_string(outcome_type, "outcome_type")
+            .map_validation_err("outcome_type")?;
+    }
+    if let Some(ref terrain_type) = req.terrain_type {
+        validation::validate_short_string(terrain_type, "terrain_type")
+            .map_validation_err("terrain_type")?;
+    }
+
+    // Validate reward range
+    if let (Some(min), Some(max)) = (req.reward_min, req.reward_max) {
+        validation::validate_range(min as f64, max as f64, "reward_range")
+            .map_validation_err("reward_range")?;
+    }
+    if let Some(min) = req.reward_min {
+        validation::validate_reward(min).map_validation_err("reward_min")?;
+    }
+    if let Some(max) = req.reward_max {
+        validation::validate_reward(max).map_validation_err("reward_max")?;
+    }
+
+    // Validate and build geo_filter from lat/lon/radius triple
+    let geo_filter = match (req.geo_lat, req.geo_lon, req.geo_radius_meters) {
+        (Some(lat), Some(lon), Some(radius)) => {
+            validation::validate_geo_filter(lat, lon, radius).map_validation_err("geo_filter")?;
+            Some(GeoFilter::new(lat, lon, radius))
+        }
+        (None, None, None) => None,
+        _ => {
+            return Err(AppError::InvalidInput {
+                field: "geo_filter".to_string(),
+                reason: "geo_lat, geo_lon, and geo_radius_meters must all be provided together"
+                    .to_string(),
+            });
+        }
+    };
+
+    // Build reward range from min/max pair
+    let reward_range = match (req.reward_min, req.reward_max) {
+        (Some(min), Some(max)) => Some((min, max)),
+        (Some(min), None) => Some((min, 1.0)),
+        (None, Some(max)) => Some((-1.0, max)),
+        (None, None) => None,
+    };
 
     let memory = state
         .get_user_memory(&req.user_id)
@@ -326,6 +424,71 @@ pub async fn recall(
     let mode = req.mode.clone();
     let retrieval_mode_for_recall = parse_retrieval_mode(&mode);
 
+    // RH-8 per-layer attribution: parse the optional `layers` field. Unknown
+    // values are rejected (400) rather than silently falling back to Full —
+    // per-layer eval data must not lie about which stages actually ran.
+    let layer_mode_for_recall = match req.layers.as_deref() {
+        None | Some("") => crate::memory::types::LayerMode::Full,
+        Some(s) => parse_layer_mode(s).ok_or_else(|| AppError::InvalidInput {
+            field: "layers".to_string(),
+            reason: format!(
+                "unknown layer mode '{}'; expected one of: vamana_only, +spreading, +bm25, +rerank, +facts, full",
+                s
+            ),
+        })?,
+    };
+
+    // Pre-flight validation for robotics retrieval modes.
+    // Catch missing required parameters here (400) instead of deep in the retrieval
+    // engine where errors get wrapped as INTERNAL_ERROR (500).
+    match retrieval_mode_for_recall {
+        RetrievalMode::Spatial if geo_filter.is_none() => {
+            return Err(AppError::InvalidInput {
+                field: "geo_filter".to_string(),
+                reason: "spatial mode requires geo_lat, geo_lon, and geo_radius_meters".to_string(),
+            });
+        }
+        RetrievalMode::Mission if req.mission_id.is_none() => {
+            return Err(AppError::InvalidInput {
+                field: "mission_id".to_string(),
+                reason: "mission mode requires mission_id parameter".to_string(),
+            });
+        }
+        _ => {}
+    }
+
+    // SESSION-SCOPED RETRIEVAL: resolve session_id → time_range before spawn_blocking.
+    // When session_id is provided, look up the session's time window and set
+    // retrieval_mode to Temporal so temporal_search() uses the date range.
+    let session_time_range = if let Some(sid) = req.session_id.as_ref() {
+        use crate::memory::sessions::SessionId;
+        let parsed_uuid = uuid::Uuid::parse_str(sid).map_err(|_| AppError::InvalidInput {
+            field: "session_id".to_string(),
+            reason: format!("invalid UUID format: '{}'", sid),
+        })?;
+        let session_id = SessionId(parsed_uuid);
+        state.session_store().get_session_time_range(&session_id)
+    } else {
+        None
+    };
+    let session_id_for_recall = req.session_id.clone();
+
+    // If session_id resolved to a time range, force Temporal mode
+    let retrieval_mode_for_recall = if session_time_range.is_some() {
+        RetrievalMode::Temporal
+    } else {
+        retrieval_mode_for_recall
+    };
+
+    // Clone robotics filter fields for the spawn_blocking move boundary
+    let robot_id_for_recall = req.robot_id.clone();
+    let mission_id_for_recall = req.mission_id.clone();
+    let action_type_for_recall = req.action_type.clone();
+    let outcome_type_for_recall = req.outcome_type.clone();
+    let terrain_type_for_recall = req.terrain_type.clone();
+    let tags_for_recall = req.tags.clone();
+    let failures_only_for_recall = req.failures_only.unwrap_or(false);
+
     // PROSPECTIVE MEMORY + RECALL: Run inside a single spawn_blocking to share
     // the computed query embedding between prospective semantic matching and recall.
     // This fixes C5 (keyword-only → semantic) and sets up prospective_signals for boosting.
@@ -333,8 +496,10 @@ pub async fn recall(
     let memory_for_recall = memory.clone();
     let user_id_for_recall = req.user_id.clone();
     let query_for_recall = req.query.clone();
+    let debug_mode = req.debug;
+    let neural_ner_for_recall = state.get_neural_ner();
 
-    let (memories, triggered_reminders, _prospective_signals) =
+    let (mut memories, triggered_reminders, _prospective_signals, retrieval_stats) =
         tokio::task::spawn_blocking(move || {
             let memory_guard = memory_for_recall.read();
 
@@ -401,22 +566,46 @@ pub async fn recall(
                 Some(signals)
             };
 
-            // 4. Execute recall with prospective signals for future-informed retrieval
-            let query = MemoryQuery {
+            // 4. Execute recall with prospective signals + robotics filters
+            let mut query = MemoryQuery {
                 user_id: Some(user_id_for_recall),
                 query_text: Some(query_for_recall),
                 max_results: limit,
                 retrieval_mode: retrieval_mode_for_recall,
                 prospective_signals: prospective_signals.clone(),
+                session_id: session_id_for_recall,
+                time_range: session_time_range,
+                robot_id: robot_id_for_recall,
+                mission_id: mission_id_for_recall,
+                geo_filter,
+                action_type: action_type_for_recall,
+                reward_range,
+                outcome_type: outcome_type_for_recall,
+                failures_only: failures_only_for_recall,
+                terrain_type: terrain_type_for_recall,
+                tags: tags_for_recall,
+                layers: layer_mode_for_recall,
                 ..Default::default()
             };
+            super::state::annotate_query_ner_with(&neural_ner_for_recall, &mut query);
 
-            let memories = memory_guard.recall(&query).unwrap_or_default();
+            let (memories, retrieval_stats) = if debug_mode {
+                let result = memory_guard
+                    .recall_with_diagnostics(&query)
+                    .map_err(|e| anyhow::anyhow!("Recall failed: {e}"))?;
+                (result.memories, result.stats)
+            } else {
+                let memories = memory_guard
+                    .recall(&query)
+                    .map_err(|e| anyhow::anyhow!("Recall failed: {e}"))?;
+                (memories, None)
+            };
 
-            (memories, reminders, prospective_signals)
+            Ok::<_, anyhow::Error>((memories, reminders, prospective_signals, retrieval_stats))
         })
         .await
-        .map_err(|e| AppError::Internal(anyhow::anyhow!("Blocking task panicked: {e}")))?;
+        .map_err(|e| AppError::Internal(anyhow::anyhow!("Blocking task panicked: {e}")))?
+        .map_err(AppError::Internal)?;
 
     let triggered_reminder_count = triggered_reminders.len();
     if triggered_reminder_count > 0 {
@@ -427,18 +616,198 @@ pub async fn recall(
         );
     }
 
-    // Convert to response format
-    let total = memories.len();
+    // Convert to response format with normalized scores.
+    // Raw pipeline scores (RRF fusion × hebbian × recency × feedback) cluster in
+    // 0.01-0.10 range, making percentage display useless (everything shows 1-5%).
+    // Normalize relative to top score so results span 0-95% for meaningful display.
+    let mut raw_scores: Vec<f32> = memories
+        .iter()
+        .map(|m| m.score.unwrap_or_else(|| m.salience_score_with_access()))
+        .collect();
+
+    // Lineage-aware retrieval boost: memories connected by causal chains to
+    // other recalled memories receive a score boost proportional to edge confidence.
+    // This makes causally related memories cluster together in results.
+    if memories.len() >= 2 {
+        let memory_for_lineage = memory.clone();
+        let user_id_for_lineage = req.user_id.clone();
+        let memory_ids: Vec<String> = memories.iter().map(|m| m.id.0.to_string()).collect();
+
+        if let Ok(boosts) = tokio::task::spawn_blocking({
+            let memory_ids = memory_ids.clone();
+            move || -> Vec<f32> {
+                let memory_guard = memory_for_lineage.read();
+                let lineage = memory_guard.lineage_graph();
+                let mut boosts = vec![0.0_f32; memory_ids.len()];
+                let id_to_idx: std::collections::HashMap<&str, usize> = memory_ids
+                    .iter()
+                    .enumerate()
+                    .map(|(i, id)| (id.as_str(), i))
+                    .collect();
+
+                for (idx, id_str) in memory_ids.iter().enumerate() {
+                    let Ok(uuid) = uuid::Uuid::parse_str(id_str) else {
+                        continue;
+                    };
+                    let mid = crate::memory::MemoryId(uuid);
+
+                    // Check outgoing edges to other recalled memories
+                    if let Ok(edges) = lineage.get_edges_from(&user_id_for_lineage, &mid) {
+                        for edge in &edges {
+                            if edge.confidence < crate::constants::LINEAGE_RETRIEVAL_MIN_CONFIDENCE
+                            {
+                                continue;
+                            }
+                            let to_str = edge.to.0.to_string();
+                            if let Some(&target_idx) = id_to_idx.get(to_str.as_str()) {
+                                if target_idx != idx {
+                                    let boost = edge.confidence
+                                        * crate::constants::LINEAGE_RETRIEVAL_BOOST_SCALE;
+                                    boosts[target_idx] = (boosts[target_idx] + boost)
+                                        .min(crate::constants::LINEAGE_RETRIEVAL_MAX_BOOST);
+                                }
+                            }
+                        }
+                    }
+
+                    // Check incoming edges from other recalled memories
+                    if let Ok(edges) = lineage.get_edges_to(&user_id_for_lineage, &mid) {
+                        for edge in &edges {
+                            if edge.confidence < crate::constants::LINEAGE_RETRIEVAL_MIN_CONFIDENCE
+                            {
+                                continue;
+                            }
+                            let from_str = edge.from.0.to_string();
+                            if let Some(&source_idx) = id_to_idx.get(from_str.as_str()) {
+                                if source_idx != idx {
+                                    let boost = edge.confidence
+                                        * crate::constants::LINEAGE_RETRIEVAL_BOOST_SCALE;
+                                    boosts[source_idx] = (boosts[source_idx] + boost)
+                                        .min(crate::constants::LINEAGE_RETRIEVAL_MAX_BOOST);
+                                }
+                            }
+                        }
+                    }
+                }
+                boosts
+            }
+        })
+        .await
+        {
+            for (score, boost) in raw_scores.iter_mut().zip(boosts.iter()) {
+                *score += boost;
+            }
+        }
+    }
+
+    // Lineage candidate expansion: inject causally-connected memories not in results.
+    // Higher confidence bar (0.7) than boost (0.5) since we're adding new results.
+    if !memories.is_empty() {
+        let existing_ids: std::collections::HashSet<String> =
+            memories.iter().map(|m| m.id.0.to_string()).collect();
+        let memory_for_expansion = memory.clone();
+        let user_id_for_expansion = req.user_id.clone();
+        let existing_ids_clone = existing_ids.clone();
+        let memory_ids_for_expansion: Vec<(String, f32)> = memories
+            .iter()
+            .zip(raw_scores.iter())
+            .map(|(m, &s)| (m.id.0.to_string(), s))
+            .collect();
+
+        if let Ok(expanded) = tokio::task::spawn_blocking(move || {
+            let memory_guard = memory_for_expansion.read();
+            let lineage = memory_guard.lineage_graph();
+            // Collect (memory, derived_score) pairs for connected memories not in results
+            let mut candidates: Vec<(crate::memory::Memory, f32)> = Vec::new();
+
+            for (id_str, source_score) in &memory_ids_for_expansion {
+                let Ok(uuid) = uuid::Uuid::parse_str(id_str) else {
+                    continue;
+                };
+                let mid = crate::memory::MemoryId(uuid);
+
+                // Check both directions
+                let mut edges = Vec::new();
+                if let Ok(out) = lineage.get_edges_from(&user_id_for_expansion, &mid) {
+                    edges.extend(out);
+                }
+                if let Ok(inc) = lineage.get_edges_to(&user_id_for_expansion, &mid) {
+                    edges.extend(inc);
+                }
+
+                for edge in &edges {
+                    if edge.confidence < crate::constants::LINEAGE_EXPANSION_MIN_CONFIDENCE {
+                        continue;
+                    }
+                    // Get the other end of the edge
+                    let other_id = if edge.from.0.to_string() == *id_str {
+                        &edge.to
+                    } else {
+                        &edge.from
+                    };
+                    let other_str = other_id.0.to_string();
+                    if existing_ids_clone.contains(&other_str) {
+                        continue; // already in results
+                    }
+                    // Check we haven't already added this candidate
+                    if candidates.iter().any(|(m, _)| m.id == *other_id) {
+                        continue;
+                    }
+                    // Fetch from storage
+                    if let Ok(mem) = memory_guard.get_memory(other_id) {
+                        // Injected memories get 50% of source score scaled by edge confidence.
+                        // A perfect edge (1.0) from the top result gives 50% of top score,
+                        // ensuring injected memories sort below their source.
+                        let derived_score = source_score * edge.confidence * 0.5;
+                        candidates.push((mem, derived_score));
+                        if candidates.len() >= crate::constants::LINEAGE_EXPANSION_MAX {
+                            return candidates;
+                        }
+                    }
+                }
+                if candidates.len() >= crate::constants::LINEAGE_EXPANSION_MAX {
+                    break;
+                }
+            }
+            candidates
+        })
+        .await
+        {
+            for (mem, score) in expanded {
+                raw_scores.push(score);
+                memories.push(std::sync::Arc::new(mem));
+            }
+        }
+    }
+
+    let top_score = raw_scores.iter().cloned().fold(0.0_f32, f32::max);
+
+    // Build attribution lookup from retrieval stats (only populated when debug=true)
+    let attribution_map: std::collections::HashMap<String, crate::memory::types::ScoreAttribution> =
+        retrieval_stats
+            .as_ref()
+            .and_then(|s| s.score_attributions.as_ref())
+            .map(|attrs| {
+                attrs
+                    .iter()
+                    .map(|a| (a.memory_id.clone(), a.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+
     let recall_memories: Vec<RecallMemory> = memories
         .iter()
-        .enumerate()
-        .map(|(rank, m)| {
-            // Score based on rank position and salience
-            let rank_score = 1.0 - (rank as f32 / total.max(1) as f32);
-            let salience = m.salience_score_with_access();
-            let score = rank_score * 0.7 + salience * 0.3;
+        .zip(raw_scores.iter())
+        .map(|(m, &raw)| {
+            let score = if top_score > 0.0 {
+                (raw / top_score) * 0.95
+            } else {
+                0.0
+            };
+            let id_str = m.id.0.to_string();
+            let attribution = attribution_map.get(&id_str).cloned();
             RecallMemory {
-                id: m.id.0.to_string(),
+                id: id_str,
                 experience: RecallExperience {
                     content: m.experience.content.clone(),
                     memory_type: Some(format!("{:?}", m.experience.experience_type)),
@@ -448,6 +817,7 @@ pub async fn recall(
                 created_at: m.created_at.to_rfc3339(),
                 score,
                 tier: format!("{:?}", m.tier),
+                score_attribution: attribution,
             }
         })
         .collect();
@@ -555,7 +925,10 @@ pub async fn recall(
                 facts
             })
             .await
-            .unwrap_or_default()
+            .unwrap_or_else(|e| {
+                tracing::warn!("Fact fetch task panicked: {e} — facts excluded from recall");
+                Vec::new()
+            })
         };
 
         // Deduplicate by fact ID and take top 5 by confidence
@@ -589,8 +962,10 @@ pub async fn recall(
                 let mut edges = Vec::new();
                 let mut seen = std::collections::HashSet::new();
                 for id in &ids {
-                    let mid =
-                        crate::memory::MemoryId(uuid::Uuid::parse_str(id).unwrap_or_default());
+                    let Ok(uuid) = uuid::Uuid::parse_str(id) else {
+                        continue;
+                    };
+                    let mid = crate::memory::MemoryId(uuid);
                     if let Ok(from_edges) = lineage_graph.get_edges_from(&user_id, &mid) {
                         for edge in from_edges {
                             let to_str = edge.to.0.to_string();
@@ -621,7 +996,12 @@ pub async fn recall(
                 edges
             })
             .await
-            .unwrap_or_default()
+            .unwrap_or_else(|e| {
+                tracing::warn!(
+                    "Lineage edge fetch task panicked: {e} — lineage excluded from recall"
+                );
+                Vec::new()
+            })
         } else {
             Vec::new()
         }
@@ -702,6 +1082,7 @@ pub async fn recall(
         memory_type: Some(mode),
         importance: None,
         count: Some(count),
+        entities: None,
         results: Some(results_json),
     });
 
@@ -736,7 +1117,7 @@ pub async fn recall(
     Ok(Json(RecallResponse {
         memories: recall_memories,
         count,
-        retrieval_stats: None, // Retrieval stats not exposed in new API
+        retrieval_stats,
         todos,
         todo_count,
         facts,
@@ -896,6 +1277,7 @@ pub async fn proactive_context(
             relevant_facts: Vec::new(),
             latency_ms: 0.0,
             detected_entities: Vec::new(),
+            temporal_credits_applied: None,
         }));
     }
 
@@ -917,30 +1299,63 @@ pub async fn proactive_context(
     );
 
     // 0. Process pending feedback if previous_response is provided
+    let mut temporal_credits_total: u32 = 0;
     let feedback_processed = if let Some(ref prev_response) = req.previous_response {
         let feedback_store = state.feedback_store.clone();
         let user_id_for_feedback = req.user_id.clone();
         let response_text = super::utils::strip_mcp_response_noise(prev_response);
         let followup = req.user_followup.clone();
         let memory_for_embed = memory_system.clone();
+        let tool_actions_for_feedback = std::mem::take(&mut req.tool_actions);
 
         // Process feedback and collect memory IDs for reinforcement.
         // Split into 3 phases to minimize write-lock hold time on the shared FeedbackStore:
         //   Phase 1: Take pending + detect context pattern (write lock, <1ms)
         //   Phase 2: Compute embedding + signals (NO lock, 10-30ms)
         //   Phase 3: Apply momentum updates + flush (write lock, <5ms)
-        let (result, helpful_ids, misleading_ids) = tokio::task::spawn_blocking(move || {
-            // Phase 1: Extract pending data under brief write lock
-            let (pending, context_pattern) = {
+        let (result, helpful_ids, misleading_ids, temporal_credits_count) = tokio::task::spawn_blocking(move || {
+            // Phase 1: Extract pending data under brief write lock.
+            // Also push the taken pending into the FeedbackWindow as a historical
+            // entry for multi-turn temporal credit assignment (Issue #125).
+            let (pending, context_pattern, window_entries, current_turn) = {
                 let mut store = feedback_store.write();
-                let pending = store.take_pending(&user_id_for_feedback);
+                let pending = store.take_pending(&user_id_for_feedback).map(|mut p| {
+                    // Attach tool actions from current request to previous pending.
+                    // These actions happened AFTER memories were surfaced (previous call)
+                    // and BEFORE this call — exactly the attribution window.
+                    if !tool_actions_for_feedback.is_empty() {
+                        p.tool_actions = tool_actions_for_feedback;
+                    }
+                    p
+                });
                 let context_pattern = pending.as_ref().and_then(|p| {
                     if p.context_embedding.is_empty() {
                         return None;
                     }
                     store.detect_context_pattern(&user_id_for_feedback, &p.context_embedding)
                 });
-                (pending, context_pattern)
+
+                // Push the consumed pending into the window as a historical entry.
+                // This entry is now eligible for multi-turn credit from future turns.
+                if let Some(ref p) = pending {
+                    let window = store.get_or_create_window(&user_id_for_feedback);
+                    let turn_number = window.turn_counter;
+                    let entry = feedback::WindowEntry {
+                        turn_number,
+                        surfaced_memories: p.surfaced_memories.clone(),
+                        surfaced_at: p.surfaced_at,
+                        context_embedding: p.context_embedding.clone(),
+                        context_preview: p.context.chars().take(200).collect(),
+                        tool_actions: p.tool_actions.clone(),
+                    };
+                    store.push_window_entry(&user_id_for_feedback, entry);
+                }
+
+                // Snapshot window entries for Phase 2 (computed without lock)
+                let window_entries = store.snapshot_window_entries(&user_id_for_feedback);
+                let current_turn = store.window_turn_counter(&user_id_for_feedback);
+
+                (pending, context_pattern, window_entries, current_turn)
                 // write lock released here
             };
 
@@ -983,6 +1398,71 @@ pub async fn proactive_context(
                         .collect();
                 let context_embedding = pending.context_embedding.clone();
 
+                // Phase 2b: Compute temporally discounted signals for older window entries.
+                // The most recent window entry was just pushed in Phase 1 (it IS the taken
+                // pending), so we skip it — it was already processed above as the immediate
+                // signal. We process entries 0..N-1 (older turns).
+                let mut deferred_credits: Vec<(MemoryId, feedback::DeferredCredit)> = Vec::new();
+                let gamma = crate::constants::TEMPORAL_DISCOUNT_GAMMA;
+
+                if window_entries.len() > 1 {
+                    // Iterate all entries except the last one (which is the just-pushed pending)
+                    for entry in window_entries.iter().take(window_entries.len().saturating_sub(1)) {
+                        let turns_elapsed = current_turn.saturating_sub(entry.turn_number);
+                        if turns_elapsed == 0 {
+                            continue;
+                        }
+
+                        let discount = gamma.powi(turns_elapsed as i32);
+                        if discount < 0.05 {
+                            continue; // Below meaningful contribution
+                        }
+
+                        // Build a synthetic PendingFeedback from the window entry
+                        // to reuse existing signal computation
+                        let synthetic_pending = feedback::PendingFeedback::new(
+                            user_id_for_feedback.clone(),
+                            entry.context_preview.clone(),
+                            entry.context_embedding.clone(),
+                            entry.surfaced_memories.clone(),
+                        );
+
+                        let window_signals = feedback::process_implicit_feedback_with_semantics(
+                            &synthetic_pending,
+                            &response_text,
+                            None, // No followup for historical entries
+                            response_embedding.as_deref(),
+                        );
+
+                        for (memory_id, signal) in window_signals {
+                            let discounted_value = signal.value * discount;
+                            if discounted_value.abs() >= crate::constants::TEMPORAL_CREDIT_MIN_THRESHOLD {
+                                deferred_credits.push((
+                                    memory_id,
+                                    feedback::DeferredCredit {
+                                        raw_signal: signal.value,
+                                        confidence: signal.confidence,
+                                        trigger: signal.trigger,
+                                        turns_elapsed,
+                                        discounted_value,
+                                        computed_at: chrono::Utc::now(),
+                                    },
+                                ));
+                            }
+                        }
+                    }
+                }
+
+                // Detect session-level outcomes from the window
+                let session_outcome = if window_entries.len() >= 2 {
+                    // Build a temporary window to detect outcomes
+                    let mut temp_window = feedback::FeedbackWindow::new(user_id_for_feedback.clone());
+                    temp_window.entries = window_entries.into_iter().collect();
+                    temp_window.detect_session_outcome()
+                } else {
+                    None
+                };
+
                 // Classify signals before acquiring lock
                 let mut reinforced = Vec::new();
                 let mut weakened = Vec::new();
@@ -1000,8 +1480,11 @@ pub async fn proactive_context(
                     .collect();
 
                 // Phase 3: Apply momentum updates under brief write lock
+                let temporal_credits_count;
                 {
                     let mut store = feedback_store.write();
+
+                    // 3a: Apply immediate signals (same as before)
                     for (memory_id, signal, is_helpful, is_misleading) in &classified {
                         let momentum = store.get_or_create_momentum(
                             memory_id.clone(),
@@ -1034,6 +1517,125 @@ pub async fn proactive_context(
                         store.mark_dirty(memory_id);
                     }
 
+                    // 3b: Accumulate deferred credits from multi-turn window
+                    temporal_credits_count = deferred_credits.len();
+                    for (memory_id, credit) in deferred_credits {
+                        store.accumulate_deferred_credit(
+                            &user_id_for_feedback,
+                            &memory_id,
+                            credit,
+                        );
+                    }
+
+                    // 3c: Apply session-level outcome signals
+                    if let Some(ref outcome) = session_outcome {
+                        match outcome {
+                            feedback::SessionOutcome::TaskCompletion { turns_engaged, .. } => {
+                                // Boost all memories in window
+                                let window = store.get_or_create_window(&user_id_for_feedback);
+                                let all_ids = window.all_memory_ids();
+                                for id in all_ids {
+                                    let credit = feedback::DeferredCredit {
+                                        raw_signal: crate::constants::SESSION_COMPLETION_BOOST,
+                                        confidence: 0.7,
+                                        trigger: feedback::SignalTrigger::TopicChange {
+                                            similarity: 0.0,
+                                        },
+                                        turns_elapsed: 0,
+                                        discounted_value: crate::constants::SESSION_COMPLETION_BOOST,
+                                        computed_at: chrono::Utc::now(),
+                                    };
+                                    store.accumulate_deferred_credit(
+                                        &user_id_for_feedback,
+                                        &id,
+                                        credit,
+                                    );
+                                }
+                                tracing::info!(
+                                    user_id = %user_id_for_feedback,
+                                    turns = turns_engaged,
+                                    "Session outcome: task completion detected, boosting window memories"
+                                );
+                            }
+                            feedback::SessionOutcome::Abandonment { gap_seconds, frustration_detected } => {
+                                // Penalize last 2 entries
+                                let window = store.get_or_create_window(&user_id_for_feedback);
+                                let recent_ids: Vec<MemoryId> = window.entries
+                                    .iter()
+                                    .rev()
+                                    .take(2)
+                                    .flat_map(|e| e.surfaced_memories.iter().map(|m| m.id.clone()))
+                                    .collect();
+                                for id in recent_ids {
+                                    let credit = feedback::DeferredCredit {
+                                        raw_signal: crate::constants::SESSION_ABANDONMENT_PENALTY,
+                                        confidence: 0.5,
+                                        trigger: feedback::SignalTrigger::Ignored {
+                                            overlap_ratio: 0.0,
+                                        },
+                                        turns_elapsed: 0,
+                                        discounted_value: crate::constants::SESSION_ABANDONMENT_PENALTY,
+                                        computed_at: chrono::Utc::now(),
+                                    };
+                                    store.accumulate_deferred_credit(
+                                        &user_id_for_feedback,
+                                        &id,
+                                        credit,
+                                    );
+                                }
+                                tracing::info!(
+                                    user_id = %user_id_for_feedback,
+                                    gap_seconds,
+                                    frustration_detected,
+                                    "Session outcome: abandonment detected, penalizing recent memories"
+                                );
+                            }
+                            feedback::SessionOutcome::ReEngagement { gap_turns, topic_similarity } => {
+                                // Boost memories from the first entry (re-engaged topic)
+                                let window = store.get_or_create_window(&user_id_for_feedback);
+                                if let Some(first) = window.entries.front() {
+                                    let topic_ids: Vec<MemoryId> = first
+                                        .surfaced_memories
+                                        .iter()
+                                        .map(|m| m.id.clone())
+                                        .collect();
+                                    for id in topic_ids {
+                                        let credit = feedback::DeferredCredit {
+                                            raw_signal: crate::constants::SESSION_REENGAGEMENT_BOOST,
+                                            confidence: 0.75,
+                                            trigger: feedback::SignalTrigger::TopicChange {
+                                                similarity: *topic_similarity,
+                                            },
+                                            turns_elapsed: *gap_turns,
+                                            discounted_value: crate::constants::SESSION_REENGAGEMENT_BOOST,
+                                            computed_at: chrono::Utc::now(),
+                                        };
+                                        store.accumulate_deferred_credit(
+                                            &user_id_for_feedback,
+                                            &id,
+                                            credit,
+                                        );
+                                    }
+                                }
+                                tracing::info!(
+                                    user_id = %user_id_for_feedback,
+                                    gap_turns,
+                                    topic_similarity,
+                                    "Session outcome: re-engagement detected, boosting original topic memories"
+                                );
+                            }
+                            feedback::SessionOutcome::NaturalEnd => {}
+                        }
+                    }
+
+                    if temporal_credits_count > 0 {
+                        tracing::debug!(
+                            user_id = %user_id_for_feedback,
+                            credits = temporal_credits_count,
+                            "Accumulated temporal deferred credits from multi-turn window"
+                        );
+                    }
+
                     if let Err(e) = store.flush() {
                         tracing::warn!("Failed to flush feedback store: {}", e);
                     }
@@ -1045,19 +1647,25 @@ pub async fn proactive_context(
                     reinforced,
                     weakened,
                 };
-                (Some(result), helpful_ids, misleading_ids)
+                (Some(result), helpful_ids, misleading_ids, temporal_credits_count)
             } else {
-                (None, Vec::new(), Vec::new())
+                (None, Vec::new(), Vec::new(), 0usize)
             }
         })
         .await
         .map_err(|e| AppError::Internal(anyhow::anyhow!("Feedback task panicked: {e}")))?;
 
-        // Apply reinforcement to memory system and graph based on feedback
+        temporal_credits_total = temporal_credits_count as u32;
+
+        // Apply reinforcement to memory system, graph, AND retrieval weights
         if !helpful_ids.is_empty() || !misleading_ids.is_empty() {
             let memory_sys_for_reinforce = memory_system.clone();
             let graph_for_reinforce = graph_memory.clone();
             let helpful_ids_for_graph = helpful_ids.clone();
+            let relevance_engine = state.relevance_engine.clone();
+            let helpful_count = helpful_ids.len();
+            let misleading_count = misleading_ids.len();
+            let user_id = req.user_id.clone();
             tokio::task::spawn_blocking(move || {
                 let memory_guard = memory_sys_for_reinforce.read();
 
@@ -1105,6 +1713,68 @@ pub async fn proactive_context(
                         }
                     }
                 }
+
+                // Reinforce/weaken lineage edges connected to helpful/misleading memories.
+                // This is the selection pressure that makes causal chains adaptive:
+                // chains that participate in useful recalls get stronger, chains connected
+                // to misleading memories weaken. Without this, all inferred edges remain
+                // at their initial confidence with no learning signal.
+                {
+                    let lineage = memory_guard.lineage_graph();
+                    let mut reinforced_edge_ids = std::collections::HashSet::new();
+
+                    // Reinforce edges for helpful memories
+                    for memory_id in &helpful_ids_for_graph {
+                        for edges in [
+                            lineage.get_edges_from(&user_id, memory_id),
+                            lineage.get_edges_to(&user_id, memory_id),
+                        ]
+                        .into_iter()
+                        .flatten()
+                        {
+                            for mut edge in edges {
+                                if reinforced_edge_ids.insert(edge.id.clone()) {
+                                    edge.reinforce();
+                                    let _ = lineage.store_edge(&user_id, &edge);
+                                }
+                            }
+                        }
+                    }
+
+                    // Weaken edges for misleading memories, pruning zombie edges
+                    for memory_id in &misleading_ids {
+                        for edges in [
+                            lineage.get_edges_from(&user_id, memory_id),
+                            lineage.get_edges_to(&user_id, memory_id),
+                        ]
+                        .into_iter()
+                        .flatten()
+                        {
+                            for mut edge in edges {
+                                if reinforced_edge_ids.insert(edge.id.clone()) {
+                                    let should_prune = edge.weaken();
+                                    if should_prune {
+                                        let _ = lineage.delete_edge(&user_id, &edge.id);
+                                    } else {
+                                        let _ = lineage.store_edge(&user_id, &edge);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Update adaptive retrieval weights via gradient descent (Rescorla-Wagner, 1972).
+                // proactive_context always uses semantic retrieval; entity matching contributes
+                // when entities were extracted. This closes the loop: feedback now adjusts
+                // how much weight semantic vs entity vs tag signals get in future retrievals.
+                let entity_contributed = helpful_count > 0; // entities always extracted in proactive_context
+                for _ in 0..helpful_count {
+                    relevance_engine.apply_feedback(true, entity_contributed, false, true);
+                }
+                for _ in 0..misleading_count {
+                    relevance_engine.apply_feedback(true, entity_contributed, false, false);
+                }
             })
             .await
             .map_err(|e| AppError::Internal(anyhow::anyhow!("Reinforce task panicked: {e}")))?;
@@ -1125,8 +1795,24 @@ pub async fn proactive_context(
                     memory_type: Some("feedback".to_string()),
                     importance: None,
                     count: Some(feedback.memories_evaluated),
+                    entities: None,
                     results: None,
                 });
+
+                // Dishabituation: reset habituation counters for memories that received
+                // positive feedback. This models the biological dishabituation response —
+                // when a habituated stimulus produces a novel outcome, the response recovers.
+                if !feedback.reinforced.is_empty() {
+                    if let Some(user_map) = state.habituation_tracker.get(&req.user_id) {
+                        let now = chrono::Utc::now();
+                        for mem_id_str in &feedback.reinforced {
+                            if let Some(mut entry) = user_map.get_mut(mem_id_str) {
+                                entry.surfacings_without_utility = 0;
+                                entry.last_utility = Some(now);
+                            }
+                        }
+                    }
+                }
             }
         }
 
@@ -1290,7 +1976,11 @@ pub async fn proactive_context(
     // 2. Retrieve memories using unified 5-layer pipeline
     // The pipeline already applies: RRF fusion + hebbian + recency + feedback (PIPE-9)
     // No double-scoring needed - just use the scores from recall() directly
+    //
+    // Post-pipeline: adaptive involuntary memory constraints (Berntsen 2009)
+    // Applied here (not in semantic_retrieve) to keep voluntary recall untouched.
     let context_clone = req.context.clone();
+    let context_lower_for_tags = req.context.to_lowercase();
     let max_results = req.max_results;
     let user_id_for_query = req.user_id.clone();
     let entity_names_for_recall = context_entity_names.clone();
@@ -1298,6 +1988,21 @@ pub async fn proactive_context(
     let recency_weight = req.recency_weight;
     let semantic_threshold = req.semantic_threshold;
     let embedding_for_query = context_embedding.clone();
+    let habituation_tracker = state.habituation_tracker.clone();
+    let user_id_for_habituation = req.user_id.clone();
+    let graph_for_habituation = state.get_user_graph(&req.user_id).ok();
+    let neural_ner_for_proactive = state.get_neural_ner();
+    let memory_type_filter: Vec<ExperienceType> = req
+        .memory_types
+        .iter()
+        .filter_map(|s| match super::remember::parse_experience_type(Some(s)) {
+            Ok(t) => Some(t),
+            Err(e) => {
+                tracing::warn!("Ignoring invalid memory_type filter '{}': {}", s, e);
+                None
+            }
+        })
+        .collect();
     let memories: Vec<ProactiveSurfacedMemory> = {
         let memory = memory_system.clone();
         tokio::task::spawn_blocking(move || {
@@ -1313,7 +2018,7 @@ pub async fn proactive_context(
                 .filter(|w| w.len() >= 3)
                 .collect();
 
-            let query = MemoryQuery {
+            let mut query = MemoryQuery {
                 user_id: Some(user_id_for_query),
                 query_text: Some(context_clone),
                 query_embedding: if embedding_valid {
@@ -1324,9 +2029,17 @@ pub async fn proactive_context(
                 max_results,
                 recency_weight: Some(recency_weight),
                 prospective_signals,
+                experience_types: if memory_type_filter.is_empty() {
+                    None
+                } else {
+                    Some(memory_type_filter)
+                },
                 ..Default::default()
             };
-            let results = memory_guard.recall(&query).unwrap_or_default();
+            super::state::annotate_query_ner_with(&neural_ner_for_proactive, &mut query);
+            let results = memory_guard
+                .recall(&query)
+                .map_err(|e| anyhow::anyhow!("Recall failed: {e}"))?;
 
             let candidates: Vec<(SharedMemory, f32)> = results
                 .into_iter()
@@ -1341,10 +2054,15 @@ pub async fn proactive_context(
                     if alpha_count < 10 {
                         return false;
                     }
-                    // Anti-echo: skip memories that are just our own context echoed back
-                    // (auto-ingest stores context, which then gets retrieved for itself)
+                    // Anti-echo: skip auto-ingested memories that are just our own context
+                    // echoed back. Explicit memories can legitimately overlap the current
+                    // context and must still surface through proactive_context.
                     // Uses inline comparison to avoid allocating a HashSet<String> per candidate
-                    if !query_words.is_empty() {
+                    let is_auto_echo_candidate = m.experience.tags.iter().any(|tag| {
+                        tag.eq_ignore_ascii_case("auto-captured")
+                            || tag.eq_ignore_ascii_case("assistant-response")
+                    });
+                    if is_auto_echo_candidate && !query_words.is_empty() {
                         let mut mem_word_count = 0usize;
                         let mut overlap = 0usize;
                         for w in content.split_whitespace() {
@@ -1368,6 +2086,8 @@ pub async fn proactive_context(
                     (m, score)
                 })
                 .collect();
+
+            let context_lower = &context_lower_for_tags;
 
             // Compute entity matches and boost scores BEFORE quality gate
             let context_entity_count = entity_names_for_recall.len().max(1);
@@ -1414,10 +2134,56 @@ pub async fn proactive_context(
                         .cloned()
                         .collect();
 
-                    // Apply entity match boost: weight * (matched / total context entities)
+                    // Apply entity match boost with diminishing returns (log scaling).
+                    // Linear scaling over-rewards memories with many entity matches;
+                    // log scaling reflects cue distinctiveness (Berntsen 2009).
                     if !matched.is_empty() {
-                        score += entity_match_weight
-                            * (matched.len() as f32 / context_entity_count as f32);
+                        let match_ratio =
+                            (matched.len() as f32 / context_entity_count as f32).min(1.0);
+                        let diminishing = (1.0 + matched.len() as f32).ln() / (1.0_f32 + 3.0).ln();
+                        let entity_boost = entity_match_weight * match_ratio * diminishing.min(1.0);
+                        score *= 1.0 + entity_boost;
+                    }
+
+                    // Structured tag matching — boost memories whose hook-written
+                    // tags (tool:*, file:*, error) align with context signals.
+                    {
+                        let mut tag_matches: u32 = 0;
+                        for tag in &m.experience.tags {
+                            let lower_tag = tag.to_lowercase();
+                            if let Some(tool_name) = lower_tag.strip_prefix("tool:") {
+                                if entity_names_for_recall
+                                    .iter()
+                                    .any(|e| e.eq_ignore_ascii_case(tool_name))
+                                {
+                                    tag_matches += 1;
+                                }
+                            } else if let Some(file_path) = lower_tag.strip_prefix("file:") {
+                                let file_name = file_path
+                                    .rsplit('/')
+                                    .next()
+                                    .or_else(|| file_path.rsplit('\\').next())
+                                    .unwrap_or(file_path);
+                                if file_name.len() >= 3
+                                    && entity_names_for_recall.iter().any(|e| {
+                                        e.contains(file_name) || file_name.contains(e.as_str())
+                                    })
+                                {
+                                    tag_matches += 1;
+                                }
+                            } else if lower_tag == "error"
+                                && (context_lower.contains("error")
+                                    || context_lower.contains("fail")
+                                    || context_lower.contains("bug")
+                                    || context_lower.contains("fix"))
+                            {
+                                tag_matches += 1;
+                            }
+                        }
+                        if tag_matches > 0 {
+                            let capped = tag_matches.min(3) as f32;
+                            score *= 1.0 + crate::constants::TAG_RELEVANCE_BOOST * capped;
+                        }
                     }
 
                     (m, score, matched)
@@ -1427,23 +2193,164 @@ pub async fn proactive_context(
             // Sort by boosted score (highest first)
             enriched.sort_by(|a, b| b.1.total_cmp(&a.1));
 
-            // Drop results below minimum absolute score — don't pad with irrelevant filler
-            // Also drop results that are < 30% of the top score (too weak relative to best)
-            let top_score = enriched.first().map(|(_, s, _)| *s).unwrap_or(0.0);
-            let abs_min = semantic_threshold;
-            let relative_min = top_score * 0.30;
-            let effective_min = abs_min.max(relative_min);
-            enriched.retain(|(_, s, _)| *s >= effective_min);
+            // --- Adaptive involuntary memory constraints (Berntsen 2009) ---
+            // These operate ONLY on proactive_context, not voluntary recall.
 
-            // Normalize scores for display: scale relative to top result
+            // (A) Elaboration quality gate — rich memories outrank fragments.
+            // Quality factor: content_len/200 scaled by structural richness.
+            // Multiplicative so fragments score lower, not zero.
+            {
+                use crate::constants::ELABORATION_QUALITY_MIN;
+                for (m, score, _) in enriched.iter_mut() {
+                    let content_len = m.experience.content.len() as f32;
+                    let length_factor = (content_len / 200.0).min(1.0);
+                    let has_entities = if m.experience.entities.is_empty() {
+                        0.0
+                    } else {
+                        0.1
+                    };
+                    let has_context = if m.experience.context.is_some() {
+                        0.1
+                    } else {
+                        0.0
+                    };
+                    let quality = (length_factor * (1.0 + has_entities + has_context))
+                        .max(ELABORATION_QUALITY_MIN);
+                    *score *= quality;
+                }
+                enriched.sort_by(|a, b| b.1.total_cmp(&a.1));
+            }
+
+            // (B) Steeper proactive recency — involuntary memories favor recent events.
+            // Applies an additional recency adjustment on top of Layer 5's recency boost.
+            // Uses PROACTIVE_RECENCY_DECAY_RATE (0.03/h) vs voluntary's 0.01/h.
+            {
+                use crate::constants::PROACTIVE_RECENCY_DECAY_RATE;
+                let now = chrono::Utc::now();
+                // Layer 5 already applied exp(-0.01*h)*recency_weight.
+                // We apply the *differential*: exp(-(0.03-0.01)*h) = exp(-0.02*h)
+                let differential_rate = PROACTIVE_RECENCY_DECAY_RATE - 0.01;
+                for (m, score, _) in enriched.iter_mut() {
+                    let hours_old = (now - m.created_at).num_hours().max(0) as f32;
+                    let proactive_recency_factor = (-differential_rate * hours_old).exp();
+                    *score *= proactive_recency_factor;
+                }
+                enriched.sort_by(|a, b| b.1.total_cmp(&a.1));
+            }
+
+            // (C) Habituation — penalize memories surfaced repeatedly without utility.
+            // Thompson & Spencer (1966): repeated stimulation without reinforcement
+            // diminishes response. Logarithmic decay prevents permanent suppression.
+            {
+                use crate::constants::{HABITUATION_DECAY_FACTOR, HABITUATION_MAX_PENALTY};
+                let user_map = habituation_tracker
+                    .entry(user_id_for_habituation.clone())
+                    .or_insert_with(DashMap::new);
+                for (m, score, _) in enriched.iter_mut() {
+                    let mem_id = m.id.0.to_string();
+                    if let Some(entry) = user_map.get(&mem_id) {
+                        if entry.surfacings_without_utility > 0 {
+                            let penalty = (HABITUATION_DECAY_FACTOR
+                                * (1.0 + entry.surfacings_without_utility as f32).ln())
+                            .min(HABITUATION_MAX_PENALTY);
+                            *score *= 1.0 - penalty;
+                        }
+                    }
+                }
+                enriched.sort_by(|a, b| b.1.total_cmp(&a.1));
+            }
+
+            // (D) Lateral inhibition — similar candidates suppress each other.
+            // O'Reilly & McClelland (1994): pattern separation via competition.
+            // Greedy top-down: each selected memory inhibits similar remaining candidates.
+            {
+                use crate::constants::{LATERAL_INHIBITION_STRENGTH, LATERAL_INHIBITION_THRESHOLD};
+                let mut selected_embeddings: Vec<Vec<f32>> = Vec::new();
+                for (m, score, _) in enriched.iter_mut() {
+                    if let Some(ref emb) = m.experience.embeddings {
+                        if !emb.is_empty() {
+                            // Check against all already-selected memories
+                            let mut max_sim: f32 = 0.0;
+                            for sel_emb in &selected_embeddings {
+                                if sel_emb.len() == emb.len() {
+                                    let sim = cosine_similarity(emb, sel_emb);
+                                    if sim > max_sim {
+                                        max_sim = sim;
+                                    }
+                                }
+                            }
+                            if max_sim > LATERAL_INHIBITION_THRESHOLD {
+                                // Suppress: the more similar, the stronger the inhibition
+                                *score *= 1.0 - LATERAL_INHIBITION_STRENGTH * max_sim;
+                            }
+                            selected_embeddings.push(emb.clone());
+                        }
+                    }
+                }
+                // Final sort after all biological constraints applied
+                enriched.sort_by(|a, b| b.1.total_cmp(&a.1));
+            }
+
+            // Normalize scores before applying the public threshold. Raw pipeline scores are
+            // often tiny after proactive recency decay, while the API exposes scores on the
+            // same relative 0.0-0.95 scale as recall().
+            let top_score = enriched.first().map(|(_, s, _)| *s).unwrap_or(0.0);
             if top_score > 0.0 {
                 for (_, score, _) in enriched.iter_mut() {
                     *score = (*score / top_score) * 0.95;
                 }
             }
 
+            // Drop results below minimum normalized score — don't pad with irrelevant filler.
+            // Also drop results that are < 30% of the top normalized score.
+            let top_normalized_score = if top_score > 0.0 { 0.95 } else { 0.0 };
+            let abs_min = semantic_threshold;
+            let relative_min = top_normalized_score * 0.30;
+            let effective_min = abs_min.max(relative_min);
+            enriched.retain(|(_, s, _)| *s >= effective_min);
+
+            // (E) Update habituation state — record that these memories were surfaced.
+            // Positive feedback resets count in Phase 0 of the next call.
+            // Also penalize entities when memories exceed habituation threshold.
+            {
+                use crate::constants::{
+                    ENTITY_SALIENCE_HABITUATION_PENALTY, ENTITY_SALIENCE_HABITUATION_THRESHOLD,
+                };
+                let user_map = habituation_tracker
+                    .entry(user_id_for_habituation)
+                    .or_insert_with(DashMap::new);
+                let now = chrono::Utc::now();
+                for (m, score, _) in enriched.iter() {
+                    if *score >= effective_min {
+                        let mem_id = m.id.0.to_string();
+                        let mem_uuid = m.id.0;
+                        let mut entry = user_map.entry(mem_id).or_insert_with(|| {
+                            super::state::HabituationEntry {
+                                surfacings_without_utility: 0,
+                                last_surfaced: now,
+                                last_utility: None,
+                            }
+                        });
+                        entry.surfacings_without_utility += 1;
+                        entry.last_surfaced = now;
+
+                        // Penalize entities when memory repeatedly ignored
+                        if entry.surfacings_without_utility > ENTITY_SALIENCE_HABITUATION_THRESHOLD
+                        {
+                            if let Some(ref graph) = graph_for_habituation {
+                                let graph_guard = graph.read();
+                                let _ = graph_guard.reinforce_entity_salience(
+                                    &[mem_uuid],
+                                    ENTITY_SALIENCE_HABITUATION_PENALTY,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+
             // Return top results with entity overlap annotation
-            enriched
+            let result = enriched
                 .into_iter()
                 .take(max_results)
                 .map(|(m, score, matched)| {
@@ -1472,10 +2379,12 @@ pub async fn proactive_context(
                         embedding: m.experience.embeddings.clone().unwrap_or_default(),
                     }
                 })
-                .collect()
+                .collect();
+            Ok::<_, anyhow::Error>(result)
         })
         .await
         .map_err(|e| AppError::Internal(anyhow::anyhow!("Blocking task panicked: {e}")))?
+        .map_err(AppError::Internal)?
     };
 
     let t_recall = op_start.elapsed();
@@ -1487,22 +2396,9 @@ pub async fn proactive_context(
         "proactive_context [phase:recall] memory retrieval complete"
     );
 
-    // 2.5. Record coactivation - fire-and-forget (doesn't affect response)
-    // When memories are retrieved together, their graph edges get stronger (Hebbian learning)
-    if memories.len() >= 2 {
-        let graph = graph_memory.clone();
-        let memory_ids: Vec<uuid::Uuid> = memories
-            .iter()
-            .filter_map(|m| uuid::Uuid::parse_str(&m.id).ok())
-            .collect();
-        tokio::task::spawn(async move {
-            let _ = tokio::task::spawn_blocking(move || {
-                let graph_guard = graph.write();
-                let _ = graph_guard.record_memory_coactivation(&memory_ids);
-            })
-            .await;
-        });
-    }
+    // 2.5. Coactivation already recorded inside semantic_retrieve() — no duplicate call.
+    // Previously this fired a second record_memory_coactivation() on the filtered subset,
+    // inflating Hebbian edge weights 2x per proactive_context call.
 
     // 3. Store pending feedback (fast, in-memory — do before parallel block)
     if embedding_valid {
@@ -1587,6 +2483,16 @@ pub async fn proactive_context(
                                     "assistant-response".to_string(),
                                     "auto-captured".to_string(),
                                 ],
+                                context: super::remember::build_rich_context(
+                                    None,
+                                    None,
+                                    None,
+                                    Some("ai_generated".to_string()),
+                                    Some(0.6),
+                                    None,
+                                    None,
+                                    None,
+                                ),
                                 ..Default::default()
                             };
                             let _ = memory_guard.remember(experience, None);
@@ -1629,7 +2535,10 @@ pub async fn proactive_context(
         && !is_duplicate
         && clean_context.len() > 50
         && clean_context.len() < 5000
-        && !is_bare_question(&clean_context);
+        && !is_bare_question(&clean_context)
+        && !is_tool_output_noise(&clean_context)
+        && has_sufficient_alpha_ratio(&clean_context)
+        && !is_formatted_recall_output(&clean_context);
 
     let ingested_memory_id = if should_ingest {
         let context = clean_context;
@@ -1647,6 +2556,16 @@ pub async fn proactive_context(
                         experience_type: segment.experience_type,
                         entities: segment.entities,
                         tags: vec!["auto-captured".to_string()],
+                        context: super::remember::build_rich_context(
+                            None,
+                            None,
+                            None,
+                            Some("user".to_string()),
+                            Some(0.9),
+                            None,
+                            None,
+                            None,
+                        ),
                         ..Default::default()
                     };
                     if let Ok(id) = memory_guard.remember(experience, None) {
@@ -2007,6 +2926,7 @@ pub async fn proactive_context(
         memory_type: Some("proactive".to_string()),
         importance: None,
         count: Some(memory_count + reminder_count),
+        entities: None,
         results: Some(proactive_results),
     });
 
@@ -2072,6 +2992,11 @@ pub async fn proactive_context(
         relevant_facts,
         latency_ms,
         detected_entities,
+        temporal_credits_applied: if temporal_credits_total > 0 {
+            Some(temporal_credits_total)
+        } else {
+            None
+        },
     }))
 }
 
@@ -2131,6 +3056,7 @@ pub async fn surface_relevant(
         memory_type: Some("proactive".to_string()),
         importance: None,
         count: Some(response.memories.len()),
+        entities: None,
         results: None,
     });
 
@@ -2162,22 +3088,27 @@ pub async fn recall_tracked(
     let limit = req.limit;
     let user_id = req.user_id.clone();
     let retrieval_mode = parse_retrieval_mode(&req.mode);
+    let neural_ner_for_tracked = state.get_neural_ner();
 
     let memories = {
         let memory = memory.clone();
         tokio::task::spawn_blocking(move || {
             let memory_guard = memory.read();
-            let query = MemoryQuery {
+            let mut query = MemoryQuery {
                 user_id: Some(user_id),
                 query_text: Some(query_text),
                 max_results: limit,
                 retrieval_mode,
                 ..Default::default()
             };
-            memory_guard.recall(&query).unwrap_or_default()
+            super::state::annotate_query_ner_with(&neural_ner_for_tracked, &mut query);
+            memory_guard
+                .recall(&query)
+                .map_err(|e| anyhow::anyhow!("Recall failed: {e}"))
         })
         .await
         .map_err(|e| AppError::Internal(anyhow::anyhow!("Blocking task panicked: {e}")))?
+        .map_err(AppError::Internal)?
     };
 
     // Extract memory IDs for tracking
@@ -2186,16 +3117,22 @@ pub async fn recall_tracked(
     // Generate tracking ID (could be stored for audit, but for now just a UUID)
     let tracking_id = uuid::Uuid::new_v4().to_string();
 
-    // Convert to response format
-    let total = memories.len();
+    // Normalize scores relative to top result (same as recall handler)
+    let raw_scores: Vec<f32> = memories
+        .iter()
+        .map(|m| m.score.unwrap_or_else(|| m.salience_score_with_access()))
+        .collect();
+    let top_score = raw_scores.iter().cloned().fold(0.0_f32, f32::max);
+
     let recall_memories: Vec<RecallMemory> = memories
-        .into_iter()
-        .enumerate()
-        .map(|(rank, m)| {
-            // Score based on rank position and salience
-            let rank_score = 1.0 - (rank as f32 / total.max(1) as f32);
-            let salience = m.salience_score_with_access();
-            let score = rank_score * 0.7 + salience * 0.3;
+        .iter()
+        .zip(raw_scores.iter())
+        .map(|(m, &raw)| {
+            let score = if top_score > 0.0 {
+                (raw / top_score) * 0.95
+            } else {
+                0.0
+            };
             RecallMemory {
                 id: m.id.0.to_string(),
                 experience: RecallExperience {
@@ -2207,6 +3144,7 @@ pub async fn recall_tracked(
                 created_at: m.created_at.to_rfc3339(),
                 score,
                 tier: format!("{:?}", m.tier),
+                score_attribution: None,
             }
         })
         .collect();
@@ -2288,7 +3226,10 @@ pub async fn reinforce_feedback(
         .map_err(AppError::Internal)?;
 
     // Run reinforcement in blocking task (involves RocksDB writes)
-    let stats = {
+    let graph = state.get_user_graph(&req.user_id).ok();
+
+    let memory_uuids: Vec<uuid::Uuid> = memory_ids.iter().map(|m| m.0).collect();
+    let mut stats = {
         let memory = memory.clone();
         tokio::task::spawn_blocking(move || {
             let memory_guard = memory.read();
@@ -2299,12 +3240,47 @@ pub async fn reinforce_feedback(
         .map_err(AppError::Internal)?
     };
 
+    // Propagate feedback to entity salience in the knowledge graph
+    if let Some(graph) = graph {
+        let boost = match outcome {
+            crate::memory::RetrievalOutcome::Helpful => {
+                crate::constants::ENTITY_SALIENCE_HELPFUL_BOOST
+            }
+            crate::memory::RetrievalOutcome::Misleading => {
+                crate::constants::ENTITY_SALIENCE_MISLEADING_PENALTY
+            }
+            crate::memory::RetrievalOutcome::Neutral => 0.0,
+        };
+        if boost != 0.0 {
+            let graph_clone = graph.clone();
+            let uuids = memory_uuids.clone();
+            match tokio::task::spawn_blocking(move || {
+                let graph_guard = graph_clone.read();
+                graph_guard.reinforce_entity_salience(&uuids, boost)
+            })
+            .await
+            {
+                Ok(Ok(count)) => {
+                    stats.entity_edges_reinforced = count;
+                    tracing::info!(
+                        entities_reinforced = count,
+                        boost = boost,
+                        "Entity salience reinforcement applied"
+                    );
+                }
+                Ok(Err(e)) => tracing::warn!("Entity reinforcement failed: {}", e),
+                Err(e) => tracing::warn!("Entity reinforcement task panicked: {}", e),
+            }
+        }
+    }
+
     tracing::info!(
         user_id = %req.user_id,
         processed = stats.memories_processed,
         strengthened = stats.associations_strengthened,
         boosts = stats.importance_boosts,
         decays = stats.importance_decays,
+        entity_salience_reinforced = stats.entity_edges_reinforced,
         "Hebbian reinforcement applied"
     );
 
@@ -2384,6 +3360,7 @@ pub async fn recall_by_tags(
         memory_type: Some("by_tags".to_string()),
         importance: None,
         count: Some(count),
+        entities: None,
         results: None,
     });
 
@@ -2453,8 +3430,177 @@ pub async fn recall_by_date(
         memory_type: Some("by_date".to_string()),
         importance: None,
         count: Some(count),
+        entities: None,
         results: None,
     });
 
     Ok(Json(RetrieveResponse { memories, count }))
+}
+
+/// Response for paginated recall
+#[derive(Serialize)]
+pub struct PaginatedRecallResponse {
+    pub memories: Vec<RecallMemory>,
+    pub has_more: bool,
+    pub total_count: Option<usize>,
+    pub offset: usize,
+    pub limit: usize,
+}
+
+/// POST /api/recall/paginated - Paginated memory recall
+///
+/// Like /api/recall but returns pagination metadata (has_more, offset, limit).
+/// Useful for large memory stores where results need to be paged through.
+pub async fn paginated_recall(
+    State(state): State<AppState>,
+    Json(req): Json<RecallRequest>,
+) -> Result<Json<PaginatedRecallResponse>, AppError> {
+    validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
+    validation::validate_max_results(req.limit).map_validation_err("limit")?;
+    validation::validate_query_text(&req.query).map_validation_err("query")?;
+
+    let retrieval_mode = parse_retrieval_mode(&req.mode);
+
+    // Validate and build geo_filter
+    let geo_filter = match (req.geo_lat, req.geo_lon, req.geo_radius_meters) {
+        (Some(lat), Some(lon), Some(radius)) => {
+            validation::validate_geo_filter(lat, lon, radius).map_validation_err("geo_filter")?;
+            Some(GeoFilter::new(lat, lon, radius))
+        }
+        (None, None, None) => None,
+        _ => {
+            return Err(AppError::InvalidInput {
+                field: "geo_filter".to_string(),
+                reason: "geo_lat, geo_lon, and geo_radius_meters must all be provided together"
+                    .to_string(),
+            });
+        }
+    };
+
+    let reward_range = match (req.reward_min, req.reward_max) {
+        (Some(min), Some(max)) => Some((min, max)),
+        (Some(min), None) => Some((min, 1.0)),
+        (None, Some(max)) => Some((-1.0, max)),
+        (None, None) => None,
+    };
+
+    let memory = state
+        .get_user_memory(&req.user_id)
+        .map_err(AppError::Internal)?;
+
+    let user_id = req.user_id.clone();
+    let query_text = req.query.clone();
+    let limit = req.limit;
+    let offset = req.offset;
+    let session_id = req.session_id.clone();
+    let robot_id = req.robot_id.clone();
+    let mission_id = req.mission_id.clone();
+    let action_type = req.action_type.clone();
+    let outcome_type = req.outcome_type.clone();
+    let terrain_type = req.terrain_type.clone();
+    let tags = req.tags.clone();
+    let failures_only = req.failures_only.unwrap_or(false);
+
+    let paginated = tokio::task::spawn_blocking(move || {
+        let memory_guard = memory.read();
+
+        let query = MemoryQuery {
+            user_id: Some(user_id),
+            query_text: Some(query_text),
+            max_results: limit,
+            offset,
+            retrieval_mode,
+            session_id,
+            robot_id,
+            mission_id,
+            geo_filter,
+            action_type,
+            reward_range,
+            outcome_type,
+            failures_only,
+            terrain_type,
+            tags,
+            ..Default::default()
+        };
+
+        memory_guard.paginated_recall(&query)
+    })
+    .await
+    .map_err(|e| AppError::Internal(anyhow::anyhow!("Blocking task panicked: {e}")))?
+    .map_err(AppError::Internal)?;
+
+    let memories: Vec<RecallMemory> = paginated
+        .results
+        .into_iter()
+        .map(|m| {
+            let score = m.score.unwrap_or_else(|| m.salience_score_with_access());
+            RecallMemory {
+                id: m.id.0.to_string(),
+                experience: RecallExperience {
+                    content: m.experience.content.clone(),
+                    memory_type: Some(format!("{:?}", m.experience.experience_type)),
+                    tags: m.experience.entities.clone(),
+                },
+                importance: m.importance(),
+                created_at: m.created_at.to_rfc3339(),
+                score,
+                tier: format!("{:?}", m.tier),
+                score_attribution: None,
+            }
+        })
+        .collect();
+
+    Ok(Json(PaginatedRecallResponse {
+        memories,
+        has_more: paginated.has_more,
+        total_count: paginated.total_count,
+        offset: paginated.offset,
+        limit: paginated.limit,
+    }))
+}
+
+#[cfg(test)]
+mod layer_mode_parsing_tests {
+    use super::parse_layer_mode;
+    use crate::memory::types::LayerMode;
+
+    #[test]
+    fn parses_canonical_layer_keys() {
+        // The canonical keys here MUST match `LayerMode::report_key()` and
+        // the strings the recall harness emits in its JSON report. If this
+        // test ever needs an exception, the eval data is ambiguous.
+        assert_eq!(parse_layer_mode("vamana_only"), Some(LayerMode::VamanaOnly));
+        assert_eq!(
+            parse_layer_mode("+spreading"),
+            Some(LayerMode::PlusSpreading)
+        );
+        assert_eq!(parse_layer_mode("+bm25"), Some(LayerMode::PlusBm25));
+        assert_eq!(parse_layer_mode("+rerank"), Some(LayerMode::PlusRerank));
+        assert_eq!(parse_layer_mode("+facts"), Some(LayerMode::PlusFacts));
+        assert_eq!(parse_layer_mode("full"), Some(LayerMode::Full));
+    }
+
+    #[test]
+    fn accepts_kebab_aliases_for_cli_friendly_callers() {
+        // Mirrors `recall-eval --layer vamana-only` and friends so a
+        // human typing the value into curl from memory still works.
+        assert_eq!(parse_layer_mode("vamana-only"), Some(LayerMode::VamanaOnly));
+        assert_eq!(
+            parse_layer_mode("plus-spreading"),
+            Some(LayerMode::PlusSpreading)
+        );
+        assert_eq!(parse_layer_mode("plus_bm25"), Some(LayerMode::PlusBm25));
+        assert_eq!(parse_layer_mode("plus-rerank"), Some(LayerMode::PlusRerank));
+        assert_eq!(parse_layer_mode("plus_facts"), Some(LayerMode::PlusFacts));
+    }
+
+    #[test]
+    fn rejects_unknown_layer_strings() {
+        // Silent fall-through to Full would make per-layer eval lie
+        // about which stages ran, so unknown strings MUST be rejected.
+        assert_eq!(parse_layer_mode("unknown"), None);
+        assert_eq!(parse_layer_mode("Full"), None); // case-sensitive on purpose
+        assert_eq!(parse_layer_mode("+SPREADING"), None);
+        assert_eq!(parse_layer_mode(""), None);
+    }
 }

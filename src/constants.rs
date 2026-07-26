@@ -82,6 +82,111 @@ pub const HEBBIAN_DECAY_MISLEADING: f32 = 0.10;
 /// - Allows for context-dependent recovery
 pub const IMPORTANCE_FLOOR: f32 = 0.05;
 
+/// Reward-based edge strength modulation factor for robotics feedback.
+///
+/// When a memory carries an explicit reward signal (from robot action outcomes),
+/// initial graph edge strength is scaled by (1.0 + reward × this factor).
+/// - reward=+1.0 → edges 40% stronger (successful action → reinforce associations)
+/// - reward=0.0  → no change (neutral outcome)
+/// - reward=-1.0 → edges 40% weaker (failed action → weaken associations)
+///
+/// Justification:
+/// - Bridges explicit RL reward signals to Hebbian graph learning
+/// - 0.4 keeps modulation within ±40% of baseline, preventing runaway strengthening
+/// - Applied at store time (immediate effect) rather than deferred consolidation
+pub const REWARD_EDGE_MODULATION: f32 = 0.4;
+
+// =============================================================================
+// NEUROSCIENCE-INSPIRED DYNAMICS
+// =============================================================================
+
+/// Synaptic homeostasis scaling factor (Tononi & Cirelli 2003).
+///
+/// After each graph maintenance cycle, ALL edge strengths are multiplied by this
+/// factor. Strong edges (>0.7) survive with minimal impact; weak edges (<0.2)
+/// fall below prune threshold and get cleared. Edges with LtpStatus::Full are
+/// protected (fully consolidated synapses resist homeostatic downscaling).
+///
+/// Justification:
+/// - 0.995 = 0.5% reduction per cycle, conservative synaptic renormalization
+/// - At 48 cycles/day: 0.995^48 ≈ 0.786 (21% daily reduction without reinforcement)
+/// - Unreinforced L1 edge (0.4) reaches prune threshold (0.2) in ~3.5 days
+/// - L3 edges at 0.7: 0.7 × 0.995^48 ≈ 0.55 (well above L3 prune threshold 0.3)
+/// - Prevents runaway strengthening while giving edges time to prove themselves
+///
+/// Reference: Tononi & Cirelli (2003) "Sleep and synaptic homeostasis: a hypothesis"
+pub const HOMEOSTASIS_SCALING_FACTOR: f32 = 0.995;
+
+/// Emotional decay modulation factor (Amygdala-Hippocampal coupling).
+///
+/// High-arousal memories decay slower. The effective decay factor is:
+///   effective_decay = base_decay × (1.0 - arousal × EMOTIONAL_DECAY_MODULATION)
+///
+/// At max arousal (1.0), decay is 30% slower. At zero arousal, baseline decay.
+///
+/// Justification:
+/// - 0.3 is conservative — prevents immortal memories while preserving emotional salience
+/// - Matches amygdala modulation of hippocampal consolidation strength
+/// - Frustrating bugs (arousal=0.8) decay 24% slower than routine observations (arousal=0.2)
+///
+/// Reference: McGaugh (2004) "The amygdala modulates the consolidation of memories"
+pub const EMOTIONAL_DECAY_MODULATION: f32 = 0.3;
+
+/// Graph retrieval lateral inhibition strength (cortical winner-take-all dynamics).
+///
+/// After scoring candidates in graph retrieval, high-scoring memories suppress
+/// semantically similar lower-ranked competitors by this factor of their score.
+///
+/// penalty = higher.score × GRAPH_LATERAL_INHIBITION_STRENGTH × cosine_similarity
+///
+/// Justification:
+/// - 0.15 = mild suppression, sharpens recall without discarding valid alternatives
+/// - Prevents retrieval of near-duplicate memories that dilute answer quality
+/// - Total penalty capped at 50% of original score to prevent over-suppression
+///
+/// Note: Distinct from LATERAL_INHIBITION_STRENGTH (0.3) used in proactive_context.
+/// Graph retrieval uses gentler inhibition because it feeds into the RRF fusion stage.
+///
+/// Reference: Rumelhart & Zipser (1985) "Feature discovery by competitive learning"
+pub const GRAPH_LATERAL_INHIBITION_STRENGTH: f32 = 0.15;
+
+/// Graph retrieval cosine similarity threshold for lateral inhibition.
+///
+/// Only memories with cosine similarity above this threshold to a higher-ranked
+/// memory receive inhibitory suppression. Below threshold = independent memories.
+///
+/// Justification:
+/// - 0.80 = very high similarity required before inhibition fires
+/// - In MiniLM-L6 384-dim space, 0.80 cosine targets true near-duplicates/paraphrases
+/// - 0.70 was too aggressive — caught related-but-distinct memories (e.g., two different
+///   RocksDB issues would hit 0.72 cosine and suppress each other incorrectly)
+/// - Conservative: only suppress when memories are genuinely redundant
+pub const GRAPH_LATERAL_INHIBITION_THRESHOLD: f32 = 0.80;
+
+/// Minimum prediction error multiplier (VTA/Dopamine system).
+///
+/// When feedback confirms expectations (high-score memory marked Helpful),
+/// the learning signal is scaled down to this multiplier (0.5x).
+///
+/// Justification:
+/// - Expected outcomes produce small prediction errors → modest learning
+/// - Matches reward prediction error in dopaminergic systems (Schultz 1997)
+/// - Prevents over-learning from confirmatory signals
+///
+/// Reference: Schultz et al. (1997) "A neural substrate of prediction and reward"
+pub const PREDICTION_ERROR_MIN_MULTIPLIER: f32 = 0.5;
+
+/// Maximum prediction error multiplier (VTA/Dopamine system).
+///
+/// When feedback surprises (high-score memory marked Misleading, or low-score
+/// memory marked Helpful), the learning signal is scaled up to this multiplier (2.0x).
+///
+/// Justification:
+/// - Surprising outcomes produce large prediction errors → accelerated learning
+/// - 2.0x = double the normal learning rate for maximum surprise
+/// - Enables rapid adaptation when retrieval confidence is miscalibrated
+pub const PREDICTION_ERROR_MAX_MULTIPLIER: f32 = 2.0;
+
 // =============================================================================
 // MEMORY GRAPH EDGE CONSTANTS
 // =============================================================================
@@ -173,6 +278,15 @@ pub const ENTITY_EMBEDDING_CACHE_MAX: usize = 10_000;
 ///
 /// Reference: Lund & Burgess (1996) "Producing high-dimensional semantic spaces"
 pub const EDGE_SEMANTIC_WEIGHT_FLOOR: f32 = 0.2;
+
+/// Minimum PMI-derived edge-weight multiplier. PMI (pointwise mutual information)
+/// weights an edge by how much MORE two entities co-occur than chance:
+/// `PMI = log2(co·N / (df_x·df_y))`, normalized by `log2(N)` into a [floor, 1] factor on
+/// the base edge strength. A ≤-chance pair has PPMI=0; this floor keeps a weak edge for any
+/// observed co-occurrence rather than deleting the association outright (a single
+/// co-occurrence is still weak evidence, not zero). Replaces the selectivity-IDF proxy as
+/// the principled, frequency-aware edge weighting (KG-RAG edge statistics).
+pub const GRAPH_PMI_WEIGHT_FLOOR: f32 = 0.1;
 
 /// Whether to apply degree normalization during spreading activation.
 ///
@@ -330,6 +444,59 @@ pub const HYBRID_GRAPH_WEIGHT: f32 = 0.35;
 pub const HYBRID_LINGUISTIC_WEIGHT: f32 = 0.15;
 
 // =============================================================================
+// POLAR / NEGATION-AWARE RETRIEVAL (RH-14)
+// =============================================================================
+// MiniLM-L6-v2 (and most bi-encoders) project "we use X" and "we do not use X"
+// within ~5° cosine — bi-encoder polarity blindness, documented in:
+//   - Ettinger 2020, "What BERT Is Not" (TACL)
+//   - "Negation is Not Semantic: Diagnosing Dense Retrieval Failure Modes"
+//     (arXiv 2603.17580, 2026) — proposes deeper lexical pool + NegEx filtering
+//   - Chapman et al. 2001, "A simple algorithm for identifying negated findings
+//     and diseases" (NegEx) — i2b2 clinical NLP standard
+//
+// Strategy (combined): when a query is polar (yes/no auxiliary leader) or
+// contains explicit negation tokens, (a) deepen BM25 candidate pool, (b) augment
+// the BM25 query with negation cue terms so passages containing "not"/"no"/etc.
+// near the focal entity float up, and (c) compute a second vector embedding
+// using a templated negated form of the polar question. This gets the right
+// negating passage INTO the candidate pool — pure post-fusion reranking cannot
+// rescue a passage that was never retrieved.
+
+/// Auxiliary verb leaders that mark a polar (yes/no) question.
+///
+/// Used by `query_parser::is_polar_question()` to detect queries like
+/// "Are we using HNSW?" / "Did learning history move to postcard?" where the
+/// expected answer carries explicit negation ("we use Vamana, not HNSW").
+pub const POLAR_QUESTION_LEADERS: &[&str] = &[
+    "are", "is", "am", "was", "were", "do", "does", "did", "have", "has", "had", "can", "could",
+    "will", "would", "should", "shall", "may", "might", "must",
+];
+
+/// BM25 candidate pool depth multiplier for polarity-sensitive queries.
+///
+/// When polar/negation query detected, multiply `hybrid_search.candidate_count`
+/// by this factor to ensure passages containing negation tokens enter the pool.
+/// arXiv 2603.17580 uses K=1000 (10x) for biomedical contradiction detection;
+/// we use 3x as a conservative starting point given much smaller corpora.
+pub const POLAR_QUERY_BM25_POOL_MULTIPLIER: usize = 3;
+
+/// Vector candidate pool depth multiplier for polarity-sensitive queries.
+///
+/// Same rationale as `POLAR_QUERY_BM25_POOL_MULTIPLIER` but for the dense leg.
+/// Combined with the negated-form embedding (HyDE-style), this widens the pool
+/// to capture passages the positive-form query alone would rank below cutoff.
+pub const POLAR_QUERY_VECTOR_POOL_MULTIPLIER: usize = 2;
+
+/// Negation cue tokens injected into the BM25 query for polarity-sensitive queries.
+///
+/// These low-IDF terms add a small additive BM25 score to passages containing
+/// negation markers near the focal entity (e.g., "We use Vamana, **not** HNSW").
+/// Per-token contribution is small by design — this is candidate-pool engineering,
+/// not score domination.
+pub const POLAR_BM25_NEGATION_CUES: &[&str] =
+    &["not", "no", "never", "without", "instead", "actually"];
+
+// =============================================================================
 // DENSITY-DEPENDENT RETRIEVAL WEIGHTS (SHO-26)
 // Based on GraphRAG Survey (arXiv 2408.08921) - hybrid KG-Vector improves 13.1%
 // Biological model: Dense graphs = noisy (fresh L1 edges), Sparse = curated (pruned)
@@ -464,12 +631,33 @@ pub const IMPORTANCE_RECENCY_DAYS: f64 = 7.0;
 // SEMANTIC CONSOLIDATION THRESHOLDS
 // =============================================================================
 
-/// Minimum supporting memories to extract a semantic fact
+/// Minimum supporting memories to extract a semantic fact (base value).
 ///
 /// Justification:
 /// - 2 minimum ensures pattern isn't a one-off
 /// - Higher values (3-5) for more confidence but slower learning
+/// - Overridden by adaptive thresholds when corpus is large
 pub const CONSOLIDATION_MIN_SUPPORT: usize = 2;
+
+/// Adaptive min_support thresholds based on eligible memory count.
+///
+/// Models the LTP induction threshold from neuroscience: as overall neural
+/// activity increases (more memories), the threshold for long-term potentiation
+/// rises to prevent noise from being encoded as durable knowledge.
+///
+/// Reference: Bienenstock, Cooper & Munro (1982) "Theory for the development
+/// of neuron selectivity" — the BCM sliding threshold.
+pub const CONSOLIDATION_MIN_SUPPORT_SMALL: usize = 2; // <= 100 eligible memories
+pub const CONSOLIDATION_MIN_SUPPORT_MEDIUM: usize = 3; // <= 1000 eligible memories
+pub const CONSOLIDATION_MIN_SUPPORT_LARGE: usize = 4; // > 1000 eligible memories
+
+/// Maximum members in a single consolidation cluster.
+///
+/// Prevents semantic drift in greedy clustering: once a cluster reaches this
+/// size, new candidates start fresh clusters instead of being absorbed.
+/// Models dentate gyrus pattern separation — sparse, non-overlapping
+/// representations that resist interference.
+pub const CONSOLIDATION_CLUSTER_SIZE_CAP: usize = 20;
 
 /// Minimum age in days before consolidation
 ///
@@ -532,6 +720,7 @@ pub const FACT_DECAY_HALF_LIFE_PER_SUPPORT_DAYS: f64 = 30.0;
 /// - MiniLM-L6-v2 cosine > 0.80 indicates near-paraphrase for short factual statements
 /// - Below 0.80 risks merging topically related but semantically distinct facts
 /// - Combined with entity + polarity gates for high precision
+///
 /// Reference: Reimers & Gurevych 2019 (Sentence-BERT)
 pub const FACT_DEDUP_COSINE_THRESHOLD: f32 = 0.80;
 
@@ -546,10 +735,12 @@ pub const FACT_DEDUP_JACCARD_FLOOR: f32 = 0.30;
 /// Legacy Jaccard-only threshold (fallback when embedder is unavailable)
 ///
 /// Justification:
-/// - Original threshold for pure Jaccard dedup (preserved for graceful degradation)
+/// - Fallback threshold for Jaccard-only dedup when embeddings unavailable
 /// - Used when embedder fails (circuit breaker open, model load failure)
 /// - Also used per-candidate when an existing fact has no stored embedding
-pub const FACT_DEDUP_JACCARD_FALLBACK: f32 = 0.70;
+/// - Raised from 0.70 to 0.75 to reduce asymmetry with the cosine path
+///   (cosine 0.80 + Jaccard 0.30 is roughly equivalent to Jaccard 0.75 alone)
+pub const FACT_DEDUP_JACCARD_FALLBACK: f32 = 0.75;
 
 /// Negation markers for polarity detection in fact deduplication
 ///
@@ -603,6 +794,40 @@ pub const FACT_NEGATION_MARKERS: &[&str] = &[
 /// "Set the same Cache object on all the table_options for all the Column
 /// Families of all DB's managed by the process."
 pub const ROCKSDB_SHARED_CACHE_BYTES: usize = 256 * 1024 * 1024;
+
+/// Environment variable for overriding the shared RocksDB block cache capacity.
+///
+/// Value is in MiB. Invalid, zero, or overflowing values fall back to
+/// `ROCKSDB_SHARED_CACHE_BYTES`.
+pub const ROCKSDB_SHARED_CACHE_MB_ENV: &str = "SHODH_ROCKSDB_BLOCK_CACHE_MB";
+
+/// Parse a MiB override for the shared RocksDB block cache.
+pub(crate) fn parse_rocksdb_shared_cache_capacity_bytes(raw: &str) -> Option<usize> {
+    let mib = raw.trim().parse::<usize>().ok()?;
+    if mib == 0 {
+        return None;
+    }
+    mib.checked_mul(1024 * 1024)
+}
+
+/// Shared RocksDB block cache capacity after applying the optional env override.
+pub fn rocksdb_shared_cache_capacity_bytes() -> usize {
+    let Ok(raw) = std::env::var(ROCKSDB_SHARED_CACHE_MB_ENV) else {
+        return ROCKSDB_SHARED_CACHE_BYTES;
+    };
+    match parse_rocksdb_shared_cache_capacity_bytes(&raw) {
+        Some(bytes) => bytes,
+        None => {
+            tracing::warn!(
+                "{}={} is invalid; using default {}MiB RocksDB block cache",
+                ROCKSDB_SHARED_CACHE_MB_ENV,
+                raw,
+                ROCKSDB_SHARED_CACHE_BYTES / (1024 * 1024)
+            );
+            ROCKSDB_SHARED_CACHE_BYTES
+        }
+    }
+}
 
 /// Per-DB write buffer size for MemoryStorage (bytes).
 ///
@@ -867,6 +1092,275 @@ pub const SPREADING_NORMALIZATION_FACTOR: f32 = 2.0;
 pub const SALIENCE_BOOST_FACTOR: f32 = 1.0;
 
 // =============================================================================
+// ONTOLOGICAL RETRIEVAL CONSTANTS
+// =============================================================================
+// Emergent ontology: entity labels and relation types are already stored on every
+// graph node/edge. These constants control how that dormant type information is
+// activated during retrieval when query signals indicate type-constrained intent.
+//
+// Reference: Collins & Quillian (1969) "Retrieval time from semantic memory"
+
+/// Minimum ontological intent confidence to activate type-aware retrieval.
+/// Below this, retrieval proceeds unfiltered (backward compatible).
+/// 0.3 = requires at least a question word OR a matching verb.
+pub const ONTOLOGICAL_MIN_CONFIDENCE: f32 = 0.3;
+
+/// Penalty multiplier for edges whose RelationType doesn't match the inferred intent.
+/// 0.4 = wrong-type edges carry 40% of normal activation. Not zero — preserves
+/// serendipitous discovery through unexpected paths.
+/// Reference: Selective spreading (Anderson 1983) — attention gates activation paths.
+pub const ONTOLOGICAL_RELATION_PENALTY: f32 = 0.4;
+
+/// Penalty multiplier for target entities whose EntityLabel doesn't match expected types.
+/// 0.5 = more generous than relation penalty because NER labels are noisier.
+pub const ONTOLOGICAL_ENTITY_PENALTY: f32 = 0.5;
+
+/// Graph density threshold above which ontological filtering is disabled.
+/// Dense/young graphs have too many noisy L1 edges for type filtering to help.
+/// Uses same scale as entities_average_density() (edges per entity).
+pub const ONTOLOGICAL_DENSITY_THRESHOLD: f32 = 8.0;
+
+/// Post-RRF boost per type-matching entity connected to a memory (Layer 4.9).
+/// Additive on fused score. 0.08 per match, max 0.25.
+pub const ONTOLOGICAL_RERANK_BOOST: f32 = 0.08;
+
+/// Maximum ontological re-rank boost per memory.
+pub const ONTOLOGICAL_RERANK_MAX: f32 = 0.25;
+
+// =============================================================================
+// RECIPROCAL RANK FUSION (RRF) CONSTANTS
+// Based on Cormack, Clarke & Büttcher (2009) — "Reciprocal Rank Fusion
+// outperforms Condorcet and individual Rank Learning Methods"
+// Standard RRF uses K=60. Lower K gives more weight to top-ranked results.
+// Two-stage fusion: inner pass (BM25+vector) and outer pass (graph+hybrid)
+// use different K values reflecting different rank distribution properties.
+// =============================================================================
+
+/// RRF K for inner BM25+vector fusion in HybridSearchEngine
+///
+/// Used in `hybrid_search.rs::search_with_dynamic_weights()` to fuse BM25
+/// keyword scores with vector similarity scores.
+///
+/// K=45 (vs standard K=60) slightly emphasizes top-ranked results from each
+/// signal. Both BM25 and vector produce well-calibrated rank orderings,
+/// so moderate top-weighting is appropriate.
+pub const RRF_K_HYBRID_FUSION: f32 = 45.0;
+
+/// RRF K for outer graph+hybrid fusion in Layer 4 of semantic_retrieve()
+///
+/// Used in `mod.rs::semantic_retrieve()` to fuse graph spreading activation
+/// results with the already-fused hybrid (BM25+vector) results.
+///
+/// K=30 (more aggressive than inner K=45) because graph results are pre-sorted
+/// by activation strength and the top graph results carry high signal — justified
+/// by ACT-R's spreading activation model where top-activated items have
+/// disproportionately stronger evidence (Anderson & Lebiere, 1998).
+pub const RRF_K_GRAPH_FUSION: f32 = 30.0;
+
+// =============================================================================
+// RETRIEVAL PIPELINE BOOST CONSTANTS
+// All boosts are multiplicative factors applied to the RRF-fused base score.
+// Multiplicative (not additive) prevents boosts from dwarfing the semantic
+// relevance signal computed by RRF fusion.
+//
+// Design: base_score × (1 + Σ boost_i) × feedback_multiplier
+// Each boost_i is small enough that the base score remains the dominant signal.
+// =============================================================================
+
+/// Attribute query boost — multiplicative factor for attribute-matching memories
+///
+/// When a memory matches both entity AND attribute synonyms for an attribute
+/// query (e.g., "What is Caroline's relationship status?"), multiply its score.
+///
+/// Justification:
+/// - Attribute matches are strong relevance signals (user is asking about a
+///   specific property), so we use a significant boost
+/// - 2.5x multiplier (1.0 + 1.5) keeps the base semantic score dominant while
+///   giving clear priority to attribute-matching memories
+/// - Previously hardcoded as additive 0.5 (31x RRF scale — overwhelming)
+///
+/// Reference: Attribute-value pair retrieval in knowledge-grounded QA systems
+pub const ATTRIBUTE_QUERY_BOOST: f32 = 1.5;
+
+/// Temporal fact boost — multiplicative factor for temporal fact source memories
+///
+/// When a temporal query matches a fact's temporal references, boost the
+/// source memory (e.g., "When did Melanie paint a sunrise?" boosts the memory
+/// that recorded the painting event).
+///
+/// Justification:
+/// - Temporal fact matches are high-confidence relevance signals
+/// - 2.0x multiplier (1.0 + 1.0) is strong but doesn't override semantic ranking
+/// - Previously hardcoded as additive 0.4 (25x RRF scale — overwhelming)
+///
+/// Reference: TEMPR temporal retrieval approach (multi-hop temporal reasoning)
+pub const TEMPORAL_FACT_BOOST: f32 = 1.0;
+
+/// Activation bonus scale — maximum contribution of graph spreading activation
+///
+/// ACT-R spreading activation provides a relevance signal from the knowledge
+/// graph topology. This constant scales the activation value (0-1) into a
+/// multiplicative boost on the base score.
+///
+/// Justification:
+/// - Graph activation is a complementary signal, not a primary one
+/// - 0.3 means a fully-activated memory gets 1.3x its base score
+/// - Scaled further by graph_w (density weight), so effective range is 0.03-0.15
+/// - Previously hardcoded as additive 0.2 * graph_w (up to 6x RRF scale)
+///
+/// Reference: Anderson & Lebiere (1998) ACT-R spreading activation theory
+pub const ACTIVATION_BONUS_SCALE: f32 = 0.3;
+
+/// Recency boost scale — maximum multiplicative boost for recent memories
+///
+/// Applied as: recency_boost = exp(-RECENCY_DECAY_RATE × hours) × scale
+/// This modulates base score rather than adding to it.
+///
+/// Justification:
+/// - 0.5 means a just-created memory gets up to 1.5x its base score
+/// - Decays exponentially: 24h ≈ 1.37x, 72h ≈ 1.24x, 168h ≈ 1.09x
+/// - Previously hardcoded as additive 0.1 (5x RRF scale — dominant signal)
+///
+/// Reference: Wixted (2004) exponential-power law forgetting curves
+pub const RECENCY_BOOST_SCALE: f32 = 0.5;
+
+/// Arousal boost scale — multiplicative weight for emotional arousal signal
+///
+/// High-arousal memories (errors, breakthroughs, critical decisions) should
+/// be more easily retrieved. Arousal is in [0, 1].
+///
+/// Justification:
+/// - 0.15 means max arousal gives 1.15x boost (modest but meaningful)
+/// - Previously hardcoded as additive 0.05 (3x RRF scale)
+///
+/// Reference: LaBar & Cabeza (2006) emotional arousal enhances memory retrieval
+pub const AROUSAL_BOOST_SCALE: f32 = 0.15;
+
+/// Credibility boost scale — multiplicative weight for source credibility
+///
+/// Applied only when credibility > 0.5 (above-average sources).
+/// Formula: (credibility - 0.5) × scale
+///
+/// Justification:
+/// - 0.2 means credibility=1.0 gives (0.5 × 0.2) = 0.1 → 1.1x boost
+/// - Modest: source credibility is a tiebreaker, not a ranking signal
+/// - Previously hardcoded as additive (credibility - 0.5) * 0.1
+pub const CREDIBILITY_BOOST_SCALE: f32 = 0.2;
+
+/// Same-episode boost — additive score for memories sharing the current episode
+///
+/// When the query specifies an episode_id and a candidate belongs to the same
+/// episode, this boost surfaces co-occurring memories from the same work session.
+///
+/// Justification:
+/// - 0.3 is an additive constant in the contextual scoring layer (not the RRF
+///   multiplicative pipeline), matching the scale of other additive adjustments
+///   in `apply_context_scoring` (credibility +0.05, mood congruence +0.1)
+/// - Episode membership is a strong relevance signal — co-occurring memories
+///   share causal/temporal context that semantic similarity alone cannot capture
+///
+/// Reference: Tulving (1983) "Elements of Episodic Memory" — encoding specificity
+pub const SAME_EPISODE_BOOST: f32 = 0.3;
+
+/// Temporal match boost — maximum multiplicative boost for temporal date matching
+///
+/// Three tiers:
+/// - Exact date match: TEMPORAL_MATCH_BOOST_EXACT
+/// - Within 7 days: linearly scaled
+/// - Within 30 days: smaller linearly scaled boost
+///
+/// Justification:
+/// - Exact temporal match is a very strong relevance signal for temporal queries
+/// - 1.5x for exact, decaying to 1.0x at 30 days
+/// - Previously hardcoded as additive 0.25/0.15/0.05 (16x/10x/3x RRF scale)
+///
+/// Reference: TEMPR multi-hop temporal retrieval
+pub const TEMPORAL_MATCH_BOOST_EXACT: f32 = 0.5;
+pub const TEMPORAL_MATCH_BOOST_WEEK: f32 = 0.3;
+pub const TEMPORAL_MATCH_BOOST_MONTH: f32 = 0.1;
+
+/// Temporal pre-filter boost — multiplicative boost for memories within the query's date range
+///
+/// When a query has parsed temporal references (e.g., "yesterday", "in March 2026"),
+/// we pre-fetch memories from that date range via SearchCriteria::ByDate and boost
+/// them in Layer 4.45 of the fusion pipeline. This ensures date-relevant memories
+/// rise above semantically similar but temporally wrong results.
+///
+/// 0.15 is conservative: a moderate nudge that won't override strong semantic matches
+/// but gives temporal-range memories a meaningful advantage.
+pub const TEMPORAL_PREFILTER_BOOST: f32 = 0.15;
+
+/// Minimum confidence for temporal prefix injection into query embeddings
+///
+/// Only inject a temporal context prefix (e.g., "[March 2026]") into the query
+/// embedding when parsed temporal refs have confidence >= this threshold.
+/// Prevents noisy prefix injection from low-confidence date parses.
+pub const TEMPORAL_PREFIX_MIN_CONFIDENCE: f32 = 0.8;
+
+/// Prospective signal boost — per-match multiplicative factor for goal-relevant memories
+///
+/// Memories matching active goals/reminders get boosted to surface proactively.
+///
+/// Justification:
+/// - 0.25 per match, max 0.75 total → up to 1.75x boost
+/// - Previously hardcoded as additive 0.15 per match, max 0.5
+pub const PROSPECTIVE_BOOST_PER_MATCH: f32 = 0.25;
+pub const PROSPECTIVE_BOOST_MAX: f32 = 0.75;
+
+/// Hebbian association weight — contribution of learned graph associations
+///
+/// Scales the Hebbian boost from strengthened graph edges into the base score.
+///
+/// Justification:
+/// - 0.1 (10%) means graph associations are a modest supplement to RRF
+/// - Previously hardcoded as 0.1 (additive, but magnitude was correct given
+///   Hebbian scores are already in a small range)
+pub const HEBBIAN_ASSOCIATION_WEIGHT: f32 = 0.1;
+
+/// Multi-seed coverage bonus for spreading-activation episode scoring (G5).
+///
+/// The multi_hop discriminator. 96% of multi_hop gold is 1-hop reachable — but
+/// so are hundreds of HUB episodes wired to the same ubiquitous speaker entity,
+/// so raw summed activation cannot separate them (the reachability hub artifact).
+/// The real signal: GOLD is connected to MULTIPLE distinct query entities
+/// (speaker AND topic), a hub-distractor to only one. An episode's activation is
+/// scaled by `1 + SEED_COVERAGE_BONUS × (distinct_query_seeds_covered − 1)`, so a
+/// 2-seed episode gets ×(1+bonus) over a 1-seed hub. Single-seed queries are
+/// unaffected (coverage is always 1), so this cannot regress single_hop/temporal.
+/// The graph leg ranks by this, feeding fusion by rank — the brain-native
+/// spreading-activation discriminator, not a Layer-5 rescore.
+pub const SEED_COVERAGE_BONUS: f32 = 1.0;
+
+/// Importance scoring factor — how much importance modulates the retrieval score
+///
+/// Formula: importance_factor = SCORING_IMPORTANCE_FLOOR + importance × SCORING_IMPORTANCE_RANGE
+/// Range [0.7, 1.0]: low-importance memories lose up to 30% of base score.
+///
+/// Reference: Importance as a modulator of encoding strength (Craik & Lockhart 1972)
+pub const SCORING_IMPORTANCE_FLOOR: f32 = 0.7;
+pub const SCORING_IMPORTANCE_RANGE: f32 = 0.3;
+
+/// Feedback momentum range — symmetric ±15% multiplicative adjustment
+///
+/// Positive momentum (helpful) boosts up to ±50%, negative (misleading) suppresses
+/// up to 50%. Raised 0.15→0.50: at 0.15 accumulated momentum was imperceptible
+/// (Helpful gold-rank moved −0.11 over 8 cycles); at 0.50 learning is load-bearing
+/// (−0.78, 4/9 cases improve) while staying gradual (EMA inertia) and safe for cold
+/// recall (no feedback → momentum 0 → no effect on baseline ranking). Tunable at
+/// runtime via SHODH_FEEDBACK_MOMENTUM_SCALE.
+///
+/// Reference: Reinforcement learning in memory retrieval (Anderson & Bjork 1994)
+pub const FEEDBACK_MOMENTUM_SCALE: f32 = 0.50;
+
+/// Recency decay rate — exponential time constant for recency scoring
+///
+/// Formula: exp(-RECENCY_DECAY_RATE × hours_old)
+/// λ = 0.01 means ~50% at 70 hours, ~25% at 140 hours
+///
+/// Reference: Wixted (2004) time-based forgetting curves
+pub const RECENCY_DECAY_RATE: f32 = 0.01;
+
+// =============================================================================
 // EDGE-TIER TRUST WEIGHTS FOR SPREADING ACTIVATION
 // Based on hippocampal-cortical consolidation: edges that survive decay are
 // more reliable for graph traversal. Dense graphs (L1) are noisy for search,
@@ -949,6 +1443,68 @@ pub const MEMORY_TIER_GRAPH_MULT_LONGTERM: f32 = 1.0;
 /// - Only accessed via strong associations
 /// - Boost graph weight to surface archived knowledge
 pub const MEMORY_TIER_GRAPH_MULT_ARCHIVE: f32 = 1.2;
+
+// =============================================================================
+// RECALL QUALITY: TYPE-AWARE SCORING (PIPE-8)
+// Hook-generated memories (CodeEdit, Command) outnumber intentional memories
+// ~6:1 in edge creation volume. Without type-awareness, they dominate graph
+// traversal through sheer volume. These constants modulate signal at both
+// write-time (edge creation) and read-time (spreading activation + Layer 5).
+// =============================================================================
+
+/// Edge weight multiplier by ExperienceType at graph ingestion time.
+/// Applied multiplicatively to `L1Working.initial_weight()` in
+/// `process_experience_into_graph`. Intentional types get full weight;
+/// auto-generated noise types get dampened.
+///
+/// Reference: Signal detection theory (Green & Swets, 1966)
+pub const EDGE_WEIGHT_MULT_DECISION: f32 = 1.0;
+pub const EDGE_WEIGHT_MULT_LEARNING: f32 = 1.0;
+pub const EDGE_WEIGHT_MULT_DISCOVERY: f32 = 1.0;
+pub const EDGE_WEIGHT_MULT_ERROR: f32 = 0.9;
+pub const EDGE_WEIGHT_MULT_PATTERN: f32 = 1.0;
+pub const EDGE_WEIGHT_MULT_OBSERVATION: f32 = 0.8;
+pub const EDGE_WEIGHT_MULT_CONTEXT: f32 = 0.7;
+pub const EDGE_WEIGHT_MULT_TASK: f32 = 0.8;
+pub const EDGE_WEIGHT_MULT_CONVERSATION: f32 = 0.5;
+pub const EDGE_WEIGHT_MULT_CODE_EDIT: f32 = 0.3;
+pub const EDGE_WEIGHT_MULT_FILE_ACCESS: f32 = 0.25;
+pub const EDGE_WEIGHT_MULT_SEARCH: f32 = 0.25;
+pub const EDGE_WEIGHT_MULT_COMMAND: f32 = 0.3;
+pub const EDGE_WEIGHT_MULT_INTENTION: f32 = 0.9;
+
+/// Activation multiplier for spreading activation retrieval (read-time).
+/// Applied to `final_score` when resolving episodes to memories.
+/// Complementary to write-time dampening — stacks multiplicatively.
+///
+/// Effective combined signal: CodeEdit = 0.3 × 0.4 = 0.12x of Decision.
+/// CodeEdit memories still surface through vector search (Layer 1/3)
+/// when semantically relevant; only the graph path is dampened.
+pub const ACTIVATION_MULT_DECISION: f32 = 1.0;
+pub const ACTIVATION_MULT_LEARNING: f32 = 1.0;
+pub const ACTIVATION_MULT_DISCOVERY: f32 = 1.0;
+pub const ACTIVATION_MULT_ERROR: f32 = 0.95;
+pub const ACTIVATION_MULT_PATTERN: f32 = 1.0;
+pub const ACTIVATION_MULT_OBSERVATION: f32 = 0.85;
+pub const ACTIVATION_MULT_CONTEXT: f32 = 0.75;
+pub const ACTIVATION_MULT_TASK: f32 = 0.85;
+pub const ACTIVATION_MULT_CONVERSATION: f32 = 0.6;
+pub const ACTIVATION_MULT_CODE_EDIT: f32 = 0.4;
+pub const ACTIVATION_MULT_FILE_ACCESS: f32 = 0.35;
+pub const ACTIVATION_MULT_SEARCH: f32 = 0.35;
+pub const ACTIVATION_MULT_COMMAND: f32 = 0.4;
+pub const ACTIVATION_MULT_INTENTION: f32 = 0.95;
+
+/// Importance floor for `strengthen_with_importance()`.
+/// Even low-importance memories get this fraction of the full Hebbian boost,
+/// preventing complete starvation of auto-generated edge strengthening.
+pub const STRENGTHEN_IMPORTANCE_FLOOR: f32 = 0.2;
+
+/// Layer 5 tag penalties for auto-generated content.
+/// Multiplicative on final unified score.
+/// Combined penalty for assistant-response + auto-captured = 0.85 × 0.90 = 0.765.
+pub const AUTO_CAPTURED_TAG_PENALTY: f32 = 0.85;
+pub const ASSISTANT_RESPONSE_TAG_PENALTY: f32 = 0.90;
 
 // =============================================================================
 // LONG-TERM POTENTIATION (LTP) CONSTANTS
@@ -1036,6 +1592,54 @@ pub const LTP_MIN_STRENGTH: f32 = 0.01;
 pub const LTP_PRUNE_FLOOR: f32 = 0.05;
 
 // =============================================================================
+// TOPOLOGY-AWARE DECAY (W1-B) — bridge protection in the prune gate.
+//
+// Gated behind SHODH_TOPOLOGY_AWARE_DECAY (default OFF). A low-traffic node that
+// is the ONLY connector between two clusters is exactly what multi-hop retrieval
+// needs alive (measured: fragment bridges took lineage r@10 0.05 → 1.0), but
+// time+usage decay is blind to structure. In the heavy "sleep" cycle an iterative
+// Tarjan pass scores each node's structural criticality; a budgeted top slice of
+// prune-candidate edges whose loss would fragment the graph is rescued.
+// =============================================================================
+
+/// Hysteresis decay applied to a node's smoothed protection each heavy cycle it
+/// is NOT structurally critical. `protection = max(new_score, old · decay)`.
+///
+/// Articulation status flickers as edges churn; toggling protection with it would
+/// forget a bridge in the single cycle it is briefly bypassed. At 0.5 the smoothed
+/// value halves per quiet cycle (1.0 → 0.5 → 0.25 → 0.125), so protection persists
+/// ≈4 cycles ≈1 day at the ~6h heavy-cycle cadence — long enough to ride churn,
+/// short enough that a genuinely dissolved bridge stops being protected within a
+/// day. Measured articulation fraction was low (3.17% on the W1-C ingested graph),
+/// so this smoothing acts on a small, well-separated population, not a noisy mass.
+pub const TOPOLOGY_HYSTERESIS_DECAY: f32 = 0.5;
+
+/// Weight α on structural protection in the prune-gate keep score
+/// `keep = post_decay_strength + α · protection`. Used as the RANKING key that
+/// orders rescue-eligible prune candidates (a near-threshold protected bridge
+/// outranks a fully-dead one), not as an absolute gate — the step-1 measurement
+/// showed absolute scores are corpus-relative and compressed (max 0.16), so
+/// selection is by rank within a budget, not by clearing a fixed threshold.
+pub const TOPOLOGY_RESCUE_ALPHA: f32 = 0.6;
+
+/// Rescue-budget cap as a fraction of the prune candidates in a single cycle. At
+/// most this fraction (rounded up, ≥1 when any structure qualifies) of the edges
+/// that WOULD be pruned this cycle may be rescued, so over-protection can never
+/// defeat forgetting — the product's differentiator. On the measured graph only 1
+/// of 2202 undirected edges was a true bridge and 3.17% of nodes were articulation
+/// points, so the eligible population is naturally tiny; this 5% ceiling is a
+/// safety bound, rarely the active constraint.
+pub const TOPOLOGY_RESCUE_BUDGET_FRAC: f32 = 0.05;
+
+/// Minimum smoothed protection for an edge to be RESCUE-ELIGIBLE. A small epsilon
+/// (not an absolute magnitude threshold): it admits any edge touching genuine
+/// structure (articulation point / bridge endpoint, whose raw score is > 0) while
+/// rejecting numerical noise, and lets the rank + budget do the real selection.
+/// An absolute magnitude cutoff was rejected because step-1 showed scores are
+/// corpus-relative (the single true bridge was the p99 = max at only 0.16).
+pub const TOPOLOGY_RESCUE_MIN_PROTECTION: f32 = 1e-3;
+
+// =============================================================================
 // MULTI-SCALE LTP CONSTANTS (PIPE-4)
 // Based on multi-timescale memory consolidation research
 // Different activation patterns indicate different types of learning:
@@ -1114,19 +1718,21 @@ pub const LTP_WEEKLY_DECAY_FACTOR: f32 = 0.3;
 ///
 /// L2 edges store this many recent activation timestamps.
 ///
-/// Justification:
-/// - 100 timestamps covers ~3 months of daily use
-/// - Sufficient for weekly and monthly pattern detection
-/// - Memory: 100 × 8 bytes = 800 bytes per L2 edge
-pub const ACTIVATION_HISTORY_L2_CAPACITY: usize = 100;
+/// Calibration:
+/// - 30 timestamps = 1 per day × 30-day episodic lifecycle (L2_MAX_AGE_DAYS)
+/// - Perfectly sized: no wasted capacity, full lifecycle coverage
+/// - Sufficient for weekly pattern detection within the episodic window
+/// - Memory: 30 × 8 bytes = 240 bytes per L2 edge
+pub const ACTIVATION_HISTORY_L2_CAPACITY: usize = 30;
 
 /// Activation history capacity for L3 (Semantic) tier edges
 ///
 /// L3 edges store this many recent activation timestamps.
 ///
-/// Justification:
-/// - 200 timestamps covers ~6 months of regular use
-/// - Sufficient for seasonal pattern detection and temporal queries
+/// Calibration:
+/// - 200 timestamps ≈ 15 months at 3×/week activation frequency
+/// - L3 edges are near-permanent (L3_DECAY_PER_MONTH = 0.02), so deep history is warranted
+/// - Sufficient for monthly and seasonal pattern detection on long-lived semantic edges
 /// - Memory: 200 × 8 bytes = 1600 bytes per L3 edge
 pub const ACTIVATION_HISTORY_L3_CAPACITY: usize = 200;
 
@@ -1643,6 +2249,66 @@ pub const INTERFERENCE_VULNERABILITY_HOURS: i64 = 24;
 /// - Limits memory overhead
 pub const INTERFERENCE_MAX_TRACKED: usize = 10;
 
+/// Competition close-competitor threshold — ratio above which suppression fires
+///
+/// When two memories compete, suppression is applied only if the loser's score
+/// is within this ratio of the winner's score. Below this ratio, the memory
+/// is clearly weaker and passes through without suppression.
+///
+/// Justification:
+/// - 0.9 means only the top 10% competitive band triggers suppression
+/// - Below 0.9, the score gap is large enough that interference is minimal
+///
+/// Reference: Anderson & Bjork (1994) — retrieval-induced forgetting operates
+/// primarily on strong competitors, not weak ones
+pub const COMPETITION_CLOSE_RATIO: f32 = 0.9;
+
+/// Competition suppression multiplier — scales the suppression penalty
+///
+/// Formula: suppression = INTERFERENCE_COMPETITION_FACTOR × (1 - ratio) × COMPETITION_SUPPRESSION_SCALE
+///
+/// Justification:
+/// - 10.0 maps the tiny ratio gap (0.01-0.10) to meaningful suppression
+/// - With INTERFERENCE_COMPETITION_FACTOR=0.15: max suppression = 0.15 × 0.1 × 10 = 0.15
+pub const COMPETITION_SUPPRESSION_SCALE: f32 = 10.0;
+
+/// Minimum score for a suppressed memory to survive competition
+///
+/// If a memory's score falls below this after suppression, it is fully removed.
+/// Above this, it survives with a reduced score.
+pub const COMPETITION_SURVIVAL_FLOOR: f32 = 0.1;
+
+/// Interference damage scaling for close survivors vs fully suppressed
+///
+/// Close survivors (score > COMPETITION_SURVIVAL_FLOOR) record mild interference
+/// at this fraction of the full suppression amount. Fully suppressed memories
+/// record the full amount.
+pub const COMPETITION_SURVIVOR_DAMAGE_RATIO: f32 = 0.3;
+
+/// Retrieval-competition score multiplier applied to a "suppressed" memory.
+///
+/// Retrieval competition used to DELETE suppressed memories from the result
+/// set. Per-layer recall diagnostics showed this erased correct hits: 8 of the
+/// 108 smoke cases survived the entire pipeline through `+facts` and then
+/// vanished at `full`, because the suppression proxy is score-proximity (not
+/// content similarity) — a distinct, relevant memory whose score merely sat
+/// close to the top got removed. Suppressed memories are now DEMOTED by this
+/// factor and kept, so the final sort can still surface them. Kept mild (0.9)
+/// because suppressed memories are by definition high-scoring (ratio > 0.9 of
+/// the winner) and usually relevant — for multi-hop chains the co-tagged
+/// siblings are exactly these close-score "competitors".
+pub const COMPETITION_SUPPRESSED_DEMOTION: f32 = 0.9;
+
+/// Connectivity factor divisor for replay candidate prioritization
+///
+/// Higher connectivity = more important for consolidation.
+/// Formula: 1.0 + (connections / divisor).min(max_boost)
+pub const REPLAY_CONNECTIVITY_DIVISOR: f32 = 10.0;
+pub const REPLAY_CONNECTIVITY_MAX_BOOST: f32 = 0.5;
+
+/// Minimum activation floor after interference decay
+pub const INTERFERENCE_ACTIVATION_FLOOR: f32 = 0.05;
+
 // =============================================================================
 // PATTERN-TRIGGERED REPLAY CONSTANTS (PIPE-2)
 // Based on hippocampal sharp-wave ripple research (Rasch & Born 2013)
@@ -1725,6 +2391,18 @@ pub const HIGH_IMPORTANCE_THRESHOLD: f32 = 0.7;
 /// - Matches amygdala activation threshold from neuroscience
 /// - Error/surprise events typically exceed this
 pub const HIGH_AROUSAL_THRESHOLD: f32 = 0.7;
+
+/// Lower arousal threshold for anticipatory prefetch relevance boosting
+///
+/// Two-tier arousal gating: prefetch uses a lower bar than salience spike detection.
+/// Prefetch asks "is this worth surfacing proactively?" while salience spike asks
+/// "is this exceptional enough to trigger replay?"
+///
+/// Justification:
+/// - 0.6 captures moderately arousing memories for prefetch (LaBar & Cabeza, 2006)
+/// - Distinct from HIGH_AROUSAL_THRESHOLD (0.7) which gates replay/salience spikes
+/// - Memories in [0.6, 0.7) get prefetch boost but don't trigger salience replay
+pub const PREFETCH_AROUSAL_THRESHOLD: f32 = 0.6;
 
 /// Surprise factor threshold for salience-triggered replay
 ///
@@ -1882,6 +2560,449 @@ pub const TIER_RETRIEVAL_SUCCESS_BOOST: f32 = 0.25;
 /// Edges above 0.8 weight are considered "potentiated" and decay even slower.
 pub const TIER_LTP_THRESHOLD: f32 = 0.8;
 
+// === ADAPTIVE INVOLUNTARY MEMORY (Berntsen 2009) ===
+// Constraints that keep proactive_context adaptive rather than pathological.
+// proactive_context is an involuntary memory system — cue-driven surfacing
+// without explicit search. Without biological constraints, it degrades into
+// pathological intrusions (Ehlers & Clark 2000). These constants implement
+// the adaptive mechanisms from Berntsen's involuntary autobiographical memory
+// model: habituation, lateral inhibition, elaboration gating, and steep
+// recency gradients.
+
+/// Habituation decay factor for repeated surfacing without utility.
+///
+/// When a memory surfaces via proactive_context and receives no positive
+/// feedback (the agent never references it), its proactive retrieval weight
+/// decays logarithmically: penalty = factor * ln(1 + surfacings_without_utility).
+/// This mirrors neural habituation — repeated stimulation without reinforcement
+/// diminishes the response (Thompson & Spencer 1966).
+///
+/// 0.08 gives: 1 miss → -0.055, 3 misses → -0.111, 10 misses → -0.192
+///
+/// Reference: Thompson & Spencer (1966) "Habituation: A model phenomenon
+/// for the study of neuronal substrates of behavior"
+pub const HABITUATION_DECAY_FACTOR: f32 = 0.08;
+
+/// Maximum habituation penalty — prevents permanent suppression.
+///
+/// Biological habituation is never permanent; dishabituation occurs when
+/// context changes. The cap ensures memories can recover when context shifts.
+pub const HABITUATION_MAX_PENALTY: f32 = 0.4;
+
+/// Cosine similarity threshold for lateral inhibition between candidates.
+///
+/// When two surfaced memories are more similar than this threshold, the
+/// weaker one is suppressed — modeling lateral inhibition in neural
+/// pattern separation. Only the most distinctive match for each "region"
+/// of memory space survives.
+///
+/// 0.75 is high enough that genuinely different memories about the same
+/// topic survive, while near-duplicates and paraphrases suppress each other.
+///
+/// Reference: O'Reilly & McClelland (1994) "Hippocampal conjunctive encoding,
+/// storage, and recall: avoiding a trade-off"
+pub const LATERAL_INHIBITION_THRESHOLD: f32 = 0.75;
+
+/// Strength of lateral inhibition suppression.
+///
+/// When two candidates exceed the similarity threshold, the weaker one's
+/// score is reduced by: strength * similarity * (winner_score / loser_score).
+/// Higher values create more aggressive winner-take-all dynamics.
+pub const LATERAL_INHIBITION_STRENGTH: f32 = 0.3;
+
+/// Recency decay rate for proactive (involuntary) retrieval.
+///
+/// Involuntary memories show a steeper recency gradient than voluntary recall
+/// (Berntsen 2009, Ch. 6). proactive_context uses 0.03/hour vs the default
+/// 0.01/hour in semantic_retrieve, giving:
+///   - 50% boost remaining at ~23 hours (vs ~69 hours for voluntary)
+///   - 10% remaining at ~77 hours (vs ~230 hours for voluntary)
+///
+/// This ensures proactive surfacing strongly favors recent context while
+/// voluntary recall can still reach older memories when explicitly requested.
+///
+/// Reference: Berntsen (2009) "Involuntary Autobiographical Memories:
+/// An Introduction to the Unbidden Past", Ch. 6 (recency gradient)
+pub const PROACTIVE_RECENCY_DECAY_RATE: f32 = 0.03;
+
+/// Minimum elaboration quality factor for proactive surfacing.
+///
+/// Prevents zero-quality memories from being completely suppressed.
+/// Floor of 0.3 means even the shortest valid memories retain 30% of
+/// their score, while rich elaborated memories get full weight.
+pub const ELABORATION_QUALITY_MIN: f32 = 0.3;
+
+/// Tag relevance boost for proactive_context scoring.
+///
+/// When a memory's structured tags (tool:*, file:*, error) match patterns
+/// detected in the current context, the memory receives a multiplicative boost
+/// of (1 + TAG_RELEVANCE_BOOST × min(matches, 3)). This connects hook-written
+/// metadata to retrieval ranking without overriding semantic similarity.
+///
+/// Range: [0.0, 1.0]. At 0.05, maximum boost is +15% for 3 matching patterns.
+pub const TAG_RELEVANCE_BOOST: f32 = 0.05;
+
+// =============================================================================
+// TEMPORAL CREDIT ASSIGNMENT CONSTANTS
+// Multi-turn feedback attribution with exponential discounting.
+//
+// When memories are surfaced at turn T, they receive discounted credit from
+// signals at turns T+1 through T+W. This models delayed utility: a memory
+// surfaced early in a session may guide actions several turns later.
+//
+// Reference: Sutton & Barto (2018) "Reinforcement Learning", Ch. 7 (n-step TD)
+// =============================================================================
+
+/// Temporal discount factor (gamma) for multi-turn credit assignment.
+///
+/// credit(memory, turn) = signal(turn) * gamma^(turn - surfaced_turn)
+///
+/// At gamma = 0.7:
+///   T+1: 0.70, T+2: 0.49, T+3: 0.34, T+4: 0.24, T+5: 0.17
+///
+/// After 5 turns, 83% of total credit has been assigned.
+///
+/// Reference: Sutton (1988) "Learning to Predict by the Methods of Temporal Differences"
+pub const TEMPORAL_DISCOUNT_GAMMA: f32 = 0.70;
+
+/// Maximum turns in the feedback window.
+///
+/// Memories older than this stop accumulating credit.
+/// 5 turns covers ~90% of useful attribution (gamma^5 = 0.17).
+/// Memory overhead: ~5 entries × ~20 memories × ~500 bytes ≈ 50KB/user.
+pub const FEEDBACK_WINDOW_SIZE: usize = 5;
+
+/// Session gap threshold in seconds.
+///
+/// If time between proactive_context calls exceeds this, the window is
+/// flushed and a new session starts. 30 minutes matches standard web
+/// analytics session definitions (Google Analytics).
+pub const FEEDBACK_SESSION_GAP_SECS: i64 = 1800;
+
+/// Minimum turns of sustained engagement to detect task completion.
+///
+/// When the user has >= this many turns on the same topic (cosine > 0.5)
+/// followed by a topic change (cosine < 0.3), all window memories get
+/// a session-level completion boost.
+pub const SESSION_COMPLETION_MIN_TURNS: u32 = 3;
+
+/// Session-level completion boost for all window memories.
+///
+/// Applied once per detected task completion. Conservative at 0.15 to
+/// avoid overwhelming per-turn signals (range -1.0 to +1.0).
+pub const SESSION_COMPLETION_BOOST: f32 = 0.15;
+
+/// Session-level abandonment penalty for recent memories.
+///
+/// Applied to memories in the last 2 window entries when abandonment
+/// is detected. Mild at -0.10 because abandonment is ambiguous (user
+/// may have been interrupted, not dissatisfied).
+pub const SESSION_ABANDONMENT_PENALTY: f32 = -0.10;
+
+/// Re-engagement boost for topic return.
+///
+/// When a user returns to a topic after a gap, memories from the original
+/// topic receive this boost — they were worth returning to. Stronger
+/// than completion boost because re-engagement is a clearer utility signal.
+pub const SESSION_REENGAGEMENT_BOOST: f32 = 0.20;
+
+/// Minimum cumulative discounted attribution to trigger a momentum update.
+///
+/// Deferred credits below this are silently discarded to prevent noise
+/// from micro-signals polluting the momentum EMA.
+pub const TEMPORAL_CREDIT_MIN_THRESHOLD: f32 = 0.02;
+
+// =============================================================================
+// FORMAN-RICCI CURVATURE CONSTANTS
+// Discrete Ricci curvature on the knowledge graph, computed during heavy
+// maintenance cycles. Measures information flow structure: bridges vs. clusters.
+//
+// Reference: Leal, Restrepo, Stadler, Jost (2018) arXiv:1811.07825
+//            "Forman-Ricci curvature for hypergraphs"
+// Neuroscience: Farooq et al. (2019) Nature Communications — Ricci curvature
+//               detects structural differences in brain networks invisible to
+//               traditional graph metrics.
+// =============================================================================
+
+/// Selectivity threshold below which an entity is classified as a "stop word."
+///
+/// Entities with selectivity below this connect to everything uniformly
+/// (like `impl`, `check`, `encode`) — their LTP protection is reduced,
+/// allowing curvature-accelerated decay to clean up their noise edges.
+///
+/// Entities with selectivity above this have community structure (like
+/// "Hebbian learning", "RocksDB") and retain full LTP protection.
+///
+/// Derived from live graph measurement: noise hubs have selectivity ~0.0-0.5,
+/// concept entities have selectivity ~1.0-10.0+.
+pub const SELECTIVITY_STOP_WORD_THRESHOLD: f32 = 0.5;
+
+/// Half-saturation constant for selectivity-gated LTP.
+///
+/// Controls how sharply LTP protection transitions from full to zero
+/// as selectivity decreases. The effective LTP factor is:
+///   ltp_factor * (selectivity / (selectivity + SELECTIVITY_HALF_SAT))
+///
+/// At selectivity = SELECTIVITY_HALF_SAT: 50% of normal LTP protection.
+/// At selectivity = 2 * SELECTIVITY_HALF_SAT: 67% protection.
+/// At selectivity = 0: 0% protection (stop word, no LTP).
+///
+/// Set to match the stop word threshold for smooth transition.
+pub const SELECTIVITY_HALF_SAT: f32 = 0.5;
+
+/// Minimum number of edges required before curvature computation runs.
+///
+/// Below this threshold the graph is too sparse for curvature to be meaningful.
+/// A single connected component needs at least ~10 edges for the degree
+/// distribution to produce non-trivial curvature variation.
+pub const CURVATURE_MIN_EDGES: usize = 10;
+
+/// Scale factor for curvature → path_boost conversion in retrieval.
+/// Positive curvature (community) increases boost, negative (bridge) decreases.
+/// 0.05 gives ±0.5 range for typical curvature values of [-10, +10].
+pub const CURVATURE_PATH_BOOST_SCALE: f32 = 0.05;
+
+// =============================================================================
+// CAUSAL LINEAGE CONSTANTS (SHO-118)
+// Lineage inference detects causal relationships between memories using
+// temporal proximity, entity overlap, and memory type patterns.
+//
+// Reference: Shanahan (2005) "Perception as Abduction: Turning Sensor Data
+// into Meaningful Representation" — causal abduction from temporal sequences
+// =============================================================================
+
+/// Maximum temporal gap (days) between memories for causal inference.
+///
+/// Associative learning literature caps validated causal windows at 21 hours
+/// (Greville & Buehner 2023, "Temporal predictability facilitates causal learning").
+/// However, software development operates on longer ecological timescales — a bug
+/// found on Monday causes a fix on Thursday, a design decision this week shapes
+/// implementation next week. We use 14 days as an ecological compromise:
+///
+/// - Captures within-sprint causality (typical 2-week sprint)
+/// - The temporal_factor formula applies linear decay (14-day gap → factor 0.0),
+///   so distant connections self-attenuate without hard cutoff artifacts
+/// - 7-day gap → factor 0.5, 3-day gap → factor 0.79 (natural recency bias)
+///
+/// Previous value: 7 days (too aggressive, missed cross-week links).
+/// Previous value: 30 days (no literature support, produced noise edges).
+///
+/// Reference: Greville & Buehner (2023) — max validated causal delay: 21 hours
+pub const LINEAGE_MAX_TEMPORAL_GAP_DAYS: i64 = 14;
+
+/// Minimum semantic signal (Jaccard entity overlap or cosine embedding similarity)
+/// for causal inference.
+///
+/// Memories must share at least 30% semantic overlap to infer causation.
+/// This threshold serves as a pattern completion cue fraction: Marr (1971)
+/// showed that 20-30% of the original cue pattern suffices for successful
+/// recall in autoassociative networks. 0.3 sits at the upper bound,
+/// trading recall for precision — appropriate for causal inference where
+/// false positives (spurious causal links) are costlier than false negatives.
+///
+/// Also used as the gate for embedding-only inference (when NER produces
+/// no entities), ensuring cosine similarity meets the same bar.
+///
+/// Reference: Marr (1971) "Simple memory: a theory for archicortex" — 0.2-0.3 cue fraction
+pub const LINEAGE_MIN_ENTITY_OVERLAP: f32 = 0.3;
+
+/// Minimum embedding cosine similarity for lineage inference when entities
+/// are absent (embedding-only gate).
+///
+/// Lower than LINEAGE_MIN_ENTITY_OVERLAP (0.3) because cosine similarity
+/// on MiniLM-L6-v2 (384-dim) is a stronger signal than Jaccard overlap on
+/// noisy NER output. 0.25 on MiniLM means "vaguely related" — enough to
+/// let the type-pair table and temporal gating decide. The entity overlap
+/// threshold is calibrated for sparse binary sets (Jaccard), not dense
+/// continuous embeddings.
+///
+/// Reference: Reimers & Gurevych (2019) "Sentence-BERT" — cosine similarity
+/// distributions on paraphrase tasks show meaningful separation at ~0.3.
+pub const LINEAGE_MIN_EMBEDDING_SIMILARITY: f32 = 0.25;
+
+/// Maximum candidate memories to evaluate for lineage inference.
+///
+/// Caps the per-memory inference cost. 20 candidates × O(1) inference
+/// ≈ negligible latency. Higher values catch more distant causal links
+/// but increase background task duration.
+pub const LINEAGE_MAX_CANDIDATES: usize = 20;
+
+/// Lookback window (days) for finding candidate memories during inference.
+///
+/// Controls how far back the graph entity index is searched for
+/// co-occurring memories. Set to half of LINEAGE_MAX_TEMPORAL_GAP_DAYS
+/// because candidate discovery is capped at LINEAGE_MAX_CANDIDATES (20).
+/// 7 days captures the most causally-dense period (within-week links)
+/// while the recency fallback in remember.rs catches edge cases.
+pub const LINEAGE_LOOKBACK_DAYS: i64 = 7;
+
+/// Base confidence for Caused relation (Error → Task).
+pub const LINEAGE_CONFIDENCE_CAUSED: f32 = 0.8;
+
+/// Base confidence for ResolvedBy relation (Task → Learning).
+pub const LINEAGE_CONFIDENCE_RESOLVED_BY: f32 = 0.85;
+
+/// Base confidence for InformedBy relation (Learning/Discovery → Decision).
+pub const LINEAGE_CONFIDENCE_INFORMED_BY: f32 = 0.7;
+
+/// Base confidence for SupersededBy relation (Decision → Decision).
+pub const LINEAGE_CONFIDENCE_SUPERSEDED_BY: f32 = 0.6;
+
+/// Base confidence for TriggeredBy relation (Discovery/Learning → Task).
+pub const LINEAGE_CONFIDENCE_TRIGGERED_BY: f32 = 0.75;
+
+/// Base confidence for BranchedFrom relation (pivot detection).
+pub const LINEAGE_CONFIDENCE_BRANCHED_FROM: f32 = 0.9;
+
+/// Base confidence for RelatedTo relation (same-group fallback).
+pub const LINEAGE_CONFIDENCE_RELATED_TO: f32 = 0.5;
+
+/// Minimum confidence to persist an inferred lineage edge — the LTP induction
+/// threshold. In Bienenstock-Cooper-Munro (BCM) theory, synaptic stimulation
+/// below the modification threshold θ produces long-term depression (weakening),
+/// not long-term potentiation. Similarly, inferred edges below this threshold
+/// are noise that would drown out genuine causal structure if stored.
+///
+/// At 0.20, this retains edges where confidence = base × entity_overlap ×
+/// temporal_factor is non-trivial (e.g., RelatedTo at 0.5 base needs ≥40%
+/// effective overlap × temporal proximity), while pruning the 0.075-level
+/// noise that constitutes ~99% of weak RelatedTo edges.
+///
+/// Reference: Bienenstock, Cooper & Munro (1982) "Theory for the development of
+/// neuron selectivity: orientation specificity and binocular interaction"
+pub const LINEAGE_MIN_STORE_CONFIDENCE: f32 = 0.20;
+
+/// Scale factor for propagating lineage confidence into graph edge weights.
+///
+/// When a causal lineage edge is inferred between two memories with confidence C,
+/// the corresponding graph edges between their entities are strengthened by
+/// C * LINEAGE_GRAPH_BOOST_SCALE. This bidirectionally couples the lineage system
+/// (explicit causal chains) with the knowledge graph (spreading activation), so
+/// causally-linked memories naturally co-activate during retrieval.
+///
+/// Conservative value: lineage inferences are probabilistic, so we attenuate the
+/// boost to prevent false causal links from dominating the graph topology.
+///
+/// Reference: Anderson (1983) "The Architecture of Cognition" — spreading activation
+/// strength should reflect the reliability of the association source.
+pub const LINEAGE_GRAPH_BOOST_SCALE: f32 = 0.15;
+
+/// Minimum confidence for a lineage edge to generate typed graph edges.
+///
+/// Sub-threshold lineage inferences are too noisy to bridge into the graph.
+/// Only edges above this floor create Causes/Triggers/SupersededBy edges
+/// visible to spreading activation. Below this, only Hebbian strengthening
+/// (via strengthen_lineage_connection) applies — a softer signal.
+pub const LINEAGE_GRAPH_BRIDGE_MIN_CONFIDENCE: f32 = 0.4;
+
+/// Strength multiplier for lineage→graph bridge edges.
+///
+/// Applied as `L2_initial_weight * confidence * BRIDGE_BOOST`. At confidence=0.7
+/// and L2 base weight 0.6, this produces edges of strength 0.6 * 0.7 * 0.3 = 0.126.
+/// Strong enough to be discovered by spreading activation but not so strong
+/// that uncertain causal inferences dominate entity-level co-occurrence edges.
+pub const LINEAGE_GRAPH_BRIDGE_BOOST: f32 = 0.3;
+
+/// Boost applied when a user explicitly confirms a lineage edge.
+///
+/// Confirmation is a strong signal — the user validated the causal relationship.
+/// This uses a higher boost than automatic inference to reward human-in-the-loop
+/// validation and make confirmed causal paths more prominent in retrieval.
+pub const LINEAGE_CONFIRM_GRAPH_BOOST: f32 = 0.3;
+
+/// Scale factor for lineage-aware retrieval score boosting.
+///
+/// When recalled memories have causal chain connections, the connected memories
+/// receive a score boost of `edge.confidence * LINEAGE_RETRIEVAL_BOOST_SCALE`.
+/// This implements spreading activation from causally-linked memories.
+///
+/// Anderson (1983) ACT-R theory predicts 5-15% facilitation from associative
+/// priming. At 0.06 per edge with typical confidence 0.7, the per-edge boost
+/// is ~4.2%, requiring 2-3 converging edges to reach meaningful facilitation.
+/// This prevents single weak causal links from distorting retrieval while
+/// rewarding memories with multiple independent causal paths.
+///
+/// Max boost per memory capped at LINEAGE_RETRIEVAL_MAX_BOOST.
+///
+/// Reference: Anderson (1983) "The Architecture of Cognition" — spreading activation
+pub const LINEAGE_RETRIEVAL_BOOST_SCALE: f32 = 0.06;
+
+/// Maximum total lineage boost per memory during retrieval.
+///
+/// Prevents a memory with many lineage edges from dominating results.
+/// With BOOST_SCALE=0.06 and this cap=0.15, a memory needs ~3 high-confidence
+/// edges to reach the cap. The 15% ceiling aligns with the upper bound of
+/// Anderson (1983)'s observed priming facilitation range (5-15%).
+///
+/// Reference: Anderson (1983) "The Architecture of Cognition" — 5-15% priming
+pub const LINEAGE_RETRIEVAL_MAX_BOOST: f32 = 0.15;
+
+/// Minimum edge confidence for lineage retrieval boosting.
+///
+/// Only edges above this threshold affect retrieval scores. This filters out
+/// low-confidence inferred edges that haven't been reinforced by feedback.
+/// At 0.5, roughly half of freshly-inferred edges qualify (those with good
+/// entity overlap and temporal proximity), while weakened edges (after
+/// misleading feedback) are excluded.
+pub const LINEAGE_RETRIEVAL_MIN_CONFIDENCE: f32 = 0.5;
+
+/// Maximum number of causally-connected memories to inject into recall results.
+///
+/// When recalled memories have high-confidence causal edges to memories NOT
+/// in the result set, those connected memories are fetched and appended.
+/// This prevents causal chains from being invisible when the connected memory
+/// didn't score high enough on semantic similarity alone.
+///
+/// Capped at 3 to avoid overwhelming results with tangential causal links.
+/// Each injected memory gets a score derived from the connecting edge's
+/// confidence and the source memory's score, so they sort naturally.
+pub const LINEAGE_EXPANSION_MAX: usize = 3;
+
+/// Minimum edge confidence for candidate expansion (higher bar than boost).
+///
+/// Candidate expansion injects new memories into results, which is a stronger
+/// signal than re-ranking. Requires higher confidence (0.7) than boost (0.5)
+/// to prevent noise injection. Only confirmed or strongly-inferred edges qualify.
+pub const LINEAGE_EXPANSION_MIN_CONFIDENCE: f32 = 0.7;
+
+// =============================================================================
+// PROVENANCE-DRIVEN MULTI-HOP COMPANION INJECTION (Increment 2)
+// =============================================================================
+//
+// multi_hop questions have MULTIPLE gold turns; recall reliably surfaces the
+// best anchor, but companion evidence ranks 11-50 and falls outside the top-k.
+// An edge's `provenance` trail (Increment 1) lists every source episode that
+// attested it. When recall touches such an edge — via the entities of the
+// memories it already returned — those source episodes are exactly the
+// companion turns. Injecting them (gated, sub-source, accumulate-not-displace)
+// gives the missing gold a path into the result set.
+//
+// Gated behind `SHODH_COMPANION_MULTIHOP_GATE=1` AND a positive multi-hop
+// intent classification. Default OFF → zero overhead and byte-identical recall.
+
+/// Minimum confidence for a provenance record to seed a companion candidate.
+///
+/// Provenance confidence is optional (legacy/co-occurrence edges record `None`);
+/// when absent we fall back to the edge's `effective_strength()`. This bar
+/// (0.5, matching `LINEAGE_RETRIEVAL_MIN_CONFIDENCE`) filters weakly-attested
+/// edges so a single noisy co-occurrence cannot drag in an unrelated episode.
+pub const COMPANION_INJECTION_MIN_CONFIDENCE: f32 = 0.5;
+
+/// Maximum number of provenance companions injected into a single recall.
+///
+/// Caps the blast radius so a hub entity with many attesting episodes cannot
+/// flood the result tail. Five is enough to cover the companion turns of a
+/// typical multi-hop chain without overwhelming genuine top-k results.
+pub const COMPANION_INJECTION_MAX: usize = 5;
+
+/// Score factor applied to an injected companion (sub-source).
+///
+/// A companion's score = source_score × confidence-weight × this factor. At
+/// 0.5 a perfectly-attested companion of the top result scores at most half of
+/// it, so it sorts strictly below its source and only enters the kept window
+/// when a slot is open — it never displaces a genuinely higher-scored result.
+pub const COMPANION_SCORE_FACTOR: f32 = 0.5;
+
 // =============================================================================
 // CONSTANTS USAGE DOCUMENTATION
 // =============================================================================
@@ -2000,4 +3121,181 @@ pub const TIER_LTP_THRESHOLD: f32 = 0.8;
 // | PREFETCH_RECENCY_FULL_BOOST   | memory/retrieval.rs | AnticipatoryPrefetch::relevance()   |
 // | PREFETCH_RECENCY_PARTIAL_BOOST| memory/retrieval.rs | AnticipatoryPrefetch::relevance()   |
 //
+// ## Ontological Retrieval Constants (Collins & Quillian 1969)
+// | Constant                      | File                      | Function/Context                    |
+// |-------------------------------|---------------------------|-------------------------------------|
+// | ONTOLOGICAL_MIN_CONFIDENCE    | memory/graph_retrieval.rs | spreading_activation_retrieve()     |
+// | ONTOLOGICAL_RELATION_PENALTY  | memory/graph_retrieval.rs | spread_single_direction()           |
+// | ONTOLOGICAL_ENTITY_PENALTY    | memory/graph_retrieval.rs | spread_single_direction()           |
+// | ONTOLOGICAL_DENSITY_THRESHOLD | memory/graph_retrieval.rs | spreading_activation_retrieve()     |
+// | ONTOLOGICAL_DENSITY_THRESHOLD | memory/mod.rs             | semantic_retrieve() density gating  |
+// | ONTOLOGICAL_MIN_CONFIDENCE    | memory/mod.rs             | semantic_retrieve() density gating  |
+// | ONTOLOGICAL_RERANK_BOOST      | memory/mod.rs             | semantic_retrieve() Layer 4.9       |
+// | ONTOLOGICAL_RERANK_MAX        | memory/mod.rs             | semantic_retrieve() Layer 4.9       |
+//
+// ## RRF Fusion Constants (Cormack et al. 2009, Anderson & Lebiere 1998)
+// | Constant                      | File                      | Function/Context                    |
+// |-------------------------------|---------------------------|-------------------------------------|
+// | RRF_K_HYBRID_FUSION           | memory/hybrid_search.rs   | search_with_dynamic_weights()       |
+// | RRF_K_GRAPH_FUSION            | memory/mod.rs             | semantic_retrieve() Layer 4         |
+// | ATTRIBUTE_QUERY_BOOST         | memory/mod.rs             | semantic_retrieve() Layer 4.5       |
+// | TEMPORAL_FACT_BOOST           | memory/mod.rs             | semantic_retrieve() Layer 4.55      |
+// | ACTIVATION_BONUS_SCALE        | memory/mod.rs             | semantic_retrieve() Layer 4 graph   |
+// | PROSPECTIVE_BOOST_PER_MATCH   | memory/mod.rs             | semantic_retrieve() Layer 4.7       |
+// | PROSPECTIVE_BOOST_MAX         | memory/mod.rs             | semantic_retrieve() Layer 4.7       |
+// | RECENCY_BOOST_SCALE           | memory/mod.rs             | semantic_retrieve() Layer 5         |
+// | RECENCY_DECAY_RATE            | memory/mod.rs             | semantic_retrieve() Layer 5         |
+// | AROUSAL_BOOST_SCALE           | memory/mod.rs             | semantic_retrieve() Layer 5         |
+// | CREDIBILITY_BOOST_SCALE       | memory/mod.rs             | semantic_retrieve() Layer 5         |
+// | TEMPORAL_MATCH_BOOST_EXACT    | memory/mod.rs             | semantic_retrieve() Layer 5         |
+// | TEMPORAL_MATCH_BOOST_WEEK     | memory/mod.rs             | semantic_retrieve() Layer 5         |
+// | TEMPORAL_MATCH_BOOST_MONTH    | memory/mod.rs             | semantic_retrieve() Layer 5         |
+// | TEMPORAL_PREFILTER_BOOST      | memory/mod.rs             | semantic_retrieve() Layer 4.45      |
+// | TEMPORAL_PREFIX_MIN_CONFIDENCE| memory/mod.rs             | semantic_retrieve() embedding       |
+// | HEBBIAN_ASSOCIATION_WEIGHT    | memory/mod.rs             | semantic_retrieve() Layer 5         |
+// | SCORING_IMPORTANCE_FLOOR      | memory/mod.rs             | semantic_retrieve() Layer 5         |
+// | SCORING_IMPORTANCE_RANGE      | memory/mod.rs             | semantic_retrieve() Layer 5         |
+// | FEEDBACK_MOMENTUM_SCALE       | memory/mod.rs             | semantic_retrieve() Layer 5         |
+//
+// ## Emotional Arousal Constants (LaBar & Cabeza 2006)
+// | Constant                      | File                      | Function/Context                    |
+// |-------------------------------|---------------------------|-------------------------------------|
+// | HIGH_AROUSAL_THRESHOLD        | memory/pattern_detection.rs| check_salience_spike()             |
+// | PREFETCH_AROUSAL_THRESHOLD    | memory/retrieval.rs       | PrefetchContext::relevance_score() |
+//
+// ## Adaptive Involuntary Memory Constants (Berntsen 2009)
+// | Constant                      | File                      | Function/Context                    |
+// |-------------------------------|---------------------------|-------------------------------------|
+// | HABITUATION_DECAY_FACTOR      | handlers/recall.rs        | proactive_context() habituation     |
+// | HABITUATION_MAX_PENALTY       | handlers/recall.rs        | proactive_context() habituation cap |
+// | LATERAL_INHIBITION_THRESHOLD  | handlers/recall.rs        | proactive_context() pattern sep.    |
+// | LATERAL_INHIBITION_STRENGTH   | handlers/recall.rs        | proactive_context() inhibition      |
+// | PROACTIVE_RECENCY_DECAY_RATE  | handlers/recall.rs        | proactive_context() recency curve   |
+// | ELABORATION_QUALITY_MIN       | handlers/recall.rs        | proactive_context() quality gate    |
+// | TAG_RELEVANCE_BOOST           | handlers/recall.rs        | proactive_context() tag boost       |
+//
+// ## Temporal Credit Assignment Constants (Sutton & Barto 2018)
+// | Constant                      | File                      | Function/Context                    |
+// |-------------------------------|---------------------------|-------------------------------------|
+// | TEMPORAL_DISCOUNT_GAMMA       | handlers/recall.rs        | proactive_context() multi-turn TD   |
+// | FEEDBACK_WINDOW_SIZE          | memory/feedback.rs        | FeedbackWindow sliding window       |
+// | FEEDBACK_SESSION_GAP_SECS     | memory/feedback.rs        | Session boundary detection          |
+// | SESSION_COMPLETION_MIN_TURNS  | memory/feedback.rs        | Task completion detection            |
+// | SESSION_COMPLETION_BOOST      | memory/feedback.rs        | Session-level positive signal        |
+// | SESSION_ABANDONMENT_PENALTY   | memory/feedback.rs        | Session-level negative signal        |
+// | SESSION_REENGAGEMENT_BOOST    | memory/feedback.rs        | Topic return detection               |
+// | TEMPORAL_CREDIT_MIN_THRESHOLD | memory/feedback.rs        | Deferred credit noise filter         |
+//
+// ## Entity Salience Reward Loop Constants (Piece 3)
+// | Constant                            | File                | Function/Context                     |
+// |-------------------------------------|---------------------|--------------------------------------|
+// | ENTITY_SALIENCE_HELPFUL_BOOST       | handlers/recall.rs  | reinforce_feedback() entity salience |
+// | ENTITY_SALIENCE_MISLEADING_PENALTY  | handlers/recall.rs  | reinforce_feedback() entity salience |
+// | ENTITY_SALIENCE_HABITUATION_PENALTY | handlers/recall.rs  | proactive_context() habituation      |
+// | ENTITY_SALIENCE_FILTER_FLOOR        | handlers/state.rs   | process_experience entity filtering  |
+// | ENTITY_SALIENCE_FILTER_MIN_MENTIONS | handlers/state.rs   | process_experience entity filtering  |
+//
 // =============================================================================
+
+// =============================================================================
+// ENTITY SALIENCE REWARD LOOP
+// =============================================================================
+
+/// Salience boost per helpful recall feedback (+3%).
+/// Asymmetric with penalty: rewards accumulate slowly, punishments hit harder.
+/// This prevents runaway positive feedback while allowing noise to decay fast.
+pub const ENTITY_SALIENCE_HELPFUL_BOOST: f32 = 0.03;
+
+/// Salience penalty per misleading recall feedback (-5%).
+/// Asymmetric: misleading is penalized ~1.7× harder than helpful is rewarded.
+/// Rationale: a single misleading recall is more damaging than a single helpful
+/// recall is valuable — false positives erode trust faster than true positives build it.
+pub const ENTITY_SALIENCE_MISLEADING_PENALTY: f32 = -0.05;
+
+/// Salience penalty per habituation event (-1%).
+/// Applied when a memory has been surfaced 3+ times without utility.
+/// Tiny because habituation is noisy — the user may ignore a memory for reasons
+/// unrelated to entity quality (context mismatch, timing, etc.).
+pub const ENTITY_SALIENCE_HABITUATION_PENALTY: f32 = -0.01;
+
+/// Minimum salience before an entity gets filtered from extraction (feedback-driven floor).
+/// Entities driven below this by the reward loop are excluded from new memories.
+/// The floor is 0.15, well below the default 0.5 — entities need sustained negative
+/// feedback to reach this threshold.
+pub const ENTITY_SALIENCE_FILTER_FLOOR: f32 = 0.15;
+
+/// Minimum mention count before salience filtering applies.
+/// Prevents filtering entities that haven't accumulated enough feedback signal.
+/// An entity must have been seen 5+ times before its salience is trusted as a quality signal.
+pub const ENTITY_SALIENCE_FILTER_MIN_MENTIONS: usize = 5;
+
+/// Minimum character length for NER entities to enter the graph.
+///
+/// BERT-tiny-NER produces 2-char token fragments ("au", "th") from BPE
+/// tokenizer misalignment. These are high-confidence garbage — the model
+/// is confident about the BIO tag but the underlying text is meaningless.
+/// Raised from 2 to 3 after observing systematic token fragment pollution.
+pub const NER_ENTITY_MIN_LENGTH: usize = 3;
+
+/// Confidence floor for NER entities at graph insertion time.
+///
+/// The NER model filters at 0.7 during extraction (SHODH_NER_CONFIDENCE env),
+/// but some garbage entities ("decided", common verbs) pass at 0.7-0.8 confidence.
+/// This second gate at graph insertion catches marginal entities that shouldn't
+/// become graph nodes. Raised from 0.5 to 0.6 after observing verb noise.
+pub const NER_GRAPH_CONFIDENCE_FLOOR: f32 = 0.6;
+
+/// Minimum surfacings without utility before habituation penalty kicks in.
+/// Below this threshold, we assume the memory might still be useful in the right context.
+pub const ENTITY_SALIENCE_HABITUATION_THRESHOLD: u32 = 3;
+
+// =============================================================================
+// SEMANTIC CLUSTERING (MAINTENANCE)
+// Controls how many memories are sampled and how many neighbors are searched
+// during heavy maintenance to feed `detect_semantic_clusters()`.
+// =============================================================================
+
+/// Number of recent memories to sample for semantic clustering during heavy maintenance.
+///
+/// Justification:
+/// - 50 samples × 10 neighbors = 500 Vamana lookups, each O(log N) ~1ms.
+/// - Total budget ~0.5s, well within the 6-hour heavy maintenance window.
+/// - Sampling recent memories biases toward active knowledge, which is where
+///   emerging clusters are most valuable.
+pub const SEMANTIC_CLUSTER_SAMPLE_SIZE: usize = 50;
+
+/// Number of nearest neighbors to retrieve per sampled memory for clustering.
+///
+/// Justification:
+/// - k=10 strikes a balance: high enough to find cluster structure, low enough
+///   to keep the similarity triple count manageable (≤500 pairs).
+/// - Matches typical HNSW ef_search defaults for recall-oriented searches.
+pub const SEMANTIC_CLUSTER_NEIGHBOR_K: usize = 10;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_rocksdb_shared_cache_capacity_mib() {
+        assert_eq!(
+            parse_rocksdb_shared_cache_capacity_bytes("64"),
+            Some(64 * 1024 * 1024)
+        );
+        assert_eq!(
+            parse_rocksdb_shared_cache_capacity_bytes(" 128 "),
+            Some(128 * 1024 * 1024)
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_rocksdb_shared_cache_capacity() {
+        assert_eq!(parse_rocksdb_shared_cache_capacity_bytes("0"), None);
+        assert_eq!(parse_rocksdb_shared_cache_capacity_bytes(""), None);
+        assert_eq!(parse_rocksdb_shared_cache_capacity_bytes("64MB"), None);
+        assert_eq!(
+            parse_rocksdb_shared_cache_capacity_bytes(&usize::MAX.to_string()),
+            None
+        );
+    }
+}

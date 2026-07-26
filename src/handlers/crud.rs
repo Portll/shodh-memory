@@ -40,10 +40,26 @@ pub struct MemoryWithHierarchy {
 // LIST MEMORIES TYPES
 // =============================================================================
 
+/// Hard ceiling on `limit` for the memory-listing endpoints (`/api/list/{user_id}`,
+/// `/api/memories`). Callers may request any `limit`, but it is always clamped to
+/// this value to bound per-request memory use (each returned item clones up to
+/// 500 chars of content plus tags/metadata) and RocksDB scan cost. Large exports
+/// should page through with repeated `offset`-advancing requests rather than
+/// requesting everything in one call.
+///
+/// See issue #407: the previous hard cap of 1000 (with no way to page past it)
+/// made records beyond the first 1000 permanently unreachable via this API.
+const MAX_LIST_LIMIT: usize = 10_000;
+
 /// Query parameters for listing memories
 #[derive(Debug, Deserialize)]
 pub struct ListQuery {
+    /// Max items to return. Defaults to 100, clamped to [`MAX_LIST_LIMIT`].
     pub limit: Option<usize>,
+    /// Items to skip before collecting `limit` results. Defaults to 0.
+    /// Combine with `total` in the response to page through results beyond
+    /// `MAX_LIST_LIMIT` (e.g. offset=10000, offset=20000, ...).
+    pub offset: Option<usize>,
     #[serde(rename = "type")]
     pub memory_type: Option<String>,
     /// Text search query - filters by content or tags (case-insensitive)
@@ -54,6 +70,9 @@ pub struct ListQuery {
 #[derive(Debug, Serialize)]
 pub struct ListResponse {
     pub memories: Vec<ListMemoryItem>,
+    /// Total number of memories matching the filters (`type`/`query`), independent
+    /// of `limit`/`offset`. Callers can compare `memories.len() + offset` against
+    /// `total` to know whether more pages remain.
     pub total: usize,
 }
 
@@ -61,7 +80,10 @@ pub struct ListResponse {
 #[derive(Debug, Deserialize)]
 pub struct ListMemoriesRequest {
     pub user_id: String,
+    /// Max items to return. Defaults to 100, clamped to [`MAX_LIST_LIMIT`].
     pub limit: Option<usize>,
+    /// Items to skip before collecting `limit` results. Defaults to 0.
+    pub offset: Option<usize>,
     #[serde(rename = "type")]
     pub memory_type: Option<String>,
     pub query: Option<String>,
@@ -70,13 +92,29 @@ pub struct ListMemoriesRequest {
 #[derive(Debug, Serialize)]
 pub struct ListMemoryItem {
     pub id: String,
+    /// Content preview, truncated to 500 chars. Check `content_truncated` before
+    /// treating this as the full content — fetch GET /api/memories/{id} for the
+    /// complete text.
     pub content: String,
+    /// True if `content` was cut short of the memory's actual content. When true,
+    /// `content_length` holds the true character count so callers know how much
+    /// is missing.
+    pub content_truncated: bool,
+    /// True character length of the full (untruncated) content.
+    pub content_length: usize,
     pub memory_type: String,
     pub importance: f32,
     pub tags: Vec<String>,
     pub created_at: String,
     pub tier: String,
 }
+
+/// Hard ceiling on the content preview returned by the memory-listing endpoints
+/// (`/api/list/{user_id}`, `/api/memories`). Content beyond this length is cut off
+/// in `ListMemoryItem::content`; `content_truncated`/`content_length` on the item
+/// signal when that happened so callers know to fetch the full record rather than
+/// silently treating the preview as complete.
+const LIST_CONTENT_PREVIEW_CHARS: usize = 500;
 
 // =============================================================================
 // UPDATE/DELETE RESPONSE TYPES
@@ -238,7 +276,9 @@ pub async fn get_memory(
 // =============================================================================
 
 /// GET /api/list/{user_id} - List all memories for a user
-/// Query params: ?limit=100&type=Decision
+/// Query params: ?limit=100&offset=0&type=Decision
+/// `limit` defaults to 100 and is clamped to [`MAX_LIST_LIMIT`]; `offset` defaults
+/// to 0. Use `total` in the response to page through results (offset += limit).
 #[tracing::instrument(skip(state), fields(user_id = %user_id))]
 pub async fn list_memories(
     State(state): State<AppState>,
@@ -292,19 +332,32 @@ pub async fn list_memories(
     }
 
     let total = filtered.len();
-    let limit = query.limit.unwrap_or(100).min(1000);
+    let limit = query.limit.unwrap_or(100).min(MAX_LIST_LIMIT);
+    let offset = query.offset.unwrap_or(0);
 
     let memories: Vec<ListMemoryItem> = filtered
         .into_iter()
+        .skip(offset)
         .take(limit)
-        .map(|m| ListMemoryItem {
-            id: m.id.0.to_string(),
-            content: m.experience.content.chars().take(500).collect(),
-            memory_type: format!("{:?}", m.experience.experience_type),
-            importance: m.importance(),
-            tags: m.experience.entities.clone(),
-            created_at: m.created_at.to_rfc3339(),
-            tier: format!("{:?}", m.tier),
+        .map(|m| {
+            let content_length = m.experience.content.chars().count();
+            let content_truncated = content_length > LIST_CONTENT_PREVIEW_CHARS;
+            ListMemoryItem {
+                id: m.id.0.to_string(),
+                content: m
+                    .experience
+                    .content
+                    .chars()
+                    .take(LIST_CONTENT_PREVIEW_CHARS)
+                    .collect(),
+                content_truncated,
+                content_length,
+                memory_type: format!("{:?}", m.experience.experience_type),
+                importance: m.importance(),
+                tags: m.experience.entities.clone(),
+                created_at: m.created_at.to_rfc3339(),
+                tier: format!("{:?}", m.tier),
+            }
         })
         .collect();
 
@@ -325,13 +378,16 @@ pub async fn list_memories_post(
 #[derive(Debug, Deserialize)]
 pub struct ListMemoriesQuery {
     pub user_id: String,
+    /// Max items to return. Defaults to 100, clamped to [`MAX_LIST_LIMIT`].
     pub limit: Option<usize>,
+    /// Items to skip before collecting `limit` results. Defaults to 0.
+    pub offset: Option<usize>,
     #[serde(rename = "type")]
     pub memory_type: Option<String>,
     pub query: Option<String>,
 }
 
-/// GET /api/memories?user_id=...&limit=... - List memories via query params
+/// GET /api/memories?user_id=...&limit=...&offset=... - List memories via query params
 /// Cloudflare Worker compatibility alias for POST /api/memories
 #[tracing::instrument(skip(state), fields(user_id = %params.user_id))]
 pub async fn list_memories_get(
@@ -341,6 +397,7 @@ pub async fn list_memories_get(
     let req = ListMemoriesRequest {
         user_id: params.user_id,
         limit: params.limit,
+        offset: params.offset,
         memory_type: params.memory_type,
         query: params.query,
     };
@@ -399,19 +456,32 @@ async fn list_memories_inner(
     }
 
     let total = filtered.len();
-    let limit = req.limit.unwrap_or(100).min(1000);
+    let limit = req.limit.unwrap_or(100).min(MAX_LIST_LIMIT);
+    let offset = req.offset.unwrap_or(0);
 
     let memories: Vec<ListMemoryItem> = filtered
         .into_iter()
+        .skip(offset)
         .take(limit)
-        .map(|m| ListMemoryItem {
-            id: m.id.0.to_string(),
-            content: m.experience.content.chars().take(500).collect(),
-            memory_type: format!("{:?}", m.experience.experience_type),
-            importance: m.importance(),
-            tags: m.experience.entities.clone(),
-            created_at: m.created_at.to_rfc3339(),
-            tier: format!("{:?}", m.tier),
+        .map(|m| {
+            let content_length = m.experience.content.chars().count();
+            let content_truncated = content_length > LIST_CONTENT_PREVIEW_CHARS;
+            ListMemoryItem {
+                id: m.id.0.to_string(),
+                content: m
+                    .experience
+                    .content
+                    .chars()
+                    .take(LIST_CONTENT_PREVIEW_CHARS)
+                    .collect(),
+                content_truncated,
+                content_length,
+                memory_type: format!("{:?}", m.experience.experience_type),
+                importance: m.importance(),
+                tags: m.experience.entities.clone(),
+                created_at: m.created_at.to_rfc3339(),
+                tier: format!("{:?}", m.tier),
+            }
         })
         .collect();
 
@@ -518,6 +588,7 @@ pub async fn delete_memory(
         memory_type: None,
         importance: None,
         count: None,
+        entities: None,
         results: None,
     });
 
@@ -568,6 +639,7 @@ pub async fn forget_by_id(
         memory_type: None,
         importance: None,
         count: None,
+        entities: None,
         results: None,
     });
 
@@ -821,6 +893,7 @@ pub async fn forget_by_tags(
         memory_type: None,
         importance: None,
         count: Some(deleted_count),
+        entities: None,
         results: None,
     });
 
@@ -881,6 +954,7 @@ pub async fn forget_by_date(
         memory_type: None,
         importance: None,
         count: Some(deleted_count),
+        entities: None,
         results: None,
     });
 
@@ -1057,5 +1131,73 @@ fn parse_experience_type(type_str: &str) -> Result<ExperienceType, AppError> {
             field: "memory_type".to_string(),
             reason: format!("Invalid memory type: {type_str}"),
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::handlers::test_helpers::{self, TestHarness};
+    use crate::memory::Experience;
+    use axum::http::StatusCode;
+
+    /// Regression test for the silent-truncation bug: `/api/list/{user_id}`
+    /// used to cut content to 500 chars with no signal it was incomplete.
+    /// Verifies `content_truncated`/`content_length` correctly flag a long
+    /// memory and correctly report `false`/exact-length for a short one.
+    #[tokio::test]
+    async fn list_memories_marks_truncated_content() {
+        let harness = TestHarness::new();
+        let user_id = "truncation-user";
+
+        let long_content = "a".repeat(600);
+        let short_content = "b".repeat(42);
+
+        {
+            let memory = harness.manager.get_user_memory(user_id).unwrap();
+            let guard = memory.read();
+            guard
+                .remember(
+                    Experience {
+                        content: long_content.clone(),
+                        ..Default::default()
+                    },
+                    None,
+                )
+                .unwrap();
+            guard
+                .remember(
+                    Experience {
+                        content: short_content.clone(),
+                        ..Default::default()
+                    },
+                    None,
+                )
+                .unwrap();
+        }
+
+        let req = test_helpers::get(&format!("/api/list/{user_id}?limit=10"));
+        let (status, body) = test_helpers::send(harness.router(), req).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let memories = body["memories"].as_array().unwrap();
+        assert_eq!(memories.len(), 2);
+
+        let long_item = memories
+            .iter()
+            .find(|m| m["content_truncated"] == true)
+            .expect("expected one truncated item");
+        assert_eq!(long_item["content_length"], 600u64);
+        assert_eq!(
+            long_item["content"].as_str().unwrap().chars().count(),
+            500,
+            "preview must still be capped at 500 chars"
+        );
+
+        let short_item = memories
+            .iter()
+            .find(|m| m["content_truncated"] == false)
+            .expect("expected one non-truncated item");
+        assert_eq!(short_item["content_length"], 42u64);
+        assert_eq!(short_item["content"], short_content);
     }
 }

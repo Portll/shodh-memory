@@ -26,7 +26,7 @@
 //! - Complexity reduction: O(b^d) → O(2 × b^(d/2)) for multi-entity queries
 
 use anyhow::Result;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 use uuid::Uuid;
 
@@ -39,13 +39,17 @@ use crate::constants::{
     EDGE_TIER_TRUST_LTP, HYBRID_GRAPH_WEIGHT, HYBRID_LINGUISTIC_WEIGHT, HYBRID_SEMANTIC_WEIGHT,
     IMPORTANCE_DECAY_MAX, IMPORTANCE_DECAY_MIN, MEMORY_TIER_GRAPH_MULT_ARCHIVE,
     MEMORY_TIER_GRAPH_MULT_LONGTERM, MEMORY_TIER_GRAPH_MULT_SESSION,
-    MEMORY_TIER_GRAPH_MULT_WORKING, SALIENCE_BOOST_FACTOR, SPREADING_ACTIVATION_THRESHOLD,
-    SPREADING_DEGREE_NORMALIZATION, SPREADING_EARLY_TERMINATION_CANDIDATES,
-    SPREADING_EARLY_TERMINATION_RATIO, SPREADING_MAX_HOPS, SPREADING_MIN_CANDIDATES,
-    SPREADING_MIN_HOPS, SPREADING_NORMALIZATION_FACTOR, SPREADING_RELAXED_THRESHOLD,
+    MEMORY_TIER_GRAPH_MULT_WORKING, ONTOLOGICAL_DENSITY_THRESHOLD, ONTOLOGICAL_ENTITY_PENALTY,
+    ONTOLOGICAL_MIN_CONFIDENCE, ONTOLOGICAL_RELATION_PENALTY, SALIENCE_BOOST_FACTOR,
+    SEED_COVERAGE_BONUS, SPREADING_ACTIVATION_THRESHOLD, SPREADING_DEGREE_NORMALIZATION,
+    SPREADING_EARLY_TERMINATION_CANDIDATES, SPREADING_EARLY_TERMINATION_RATIO, SPREADING_MAX_HOPS,
+    SPREADING_MIN_CANDIDATES, SPREADING_MIN_HOPS, SPREADING_NORMALIZATION_FACTOR,
+    SPREADING_RELAXED_THRESHOLD,
 };
 use crate::embeddings::Embedder;
-use crate::graph_memory::{EdgeTier, EpisodicNode, GraphMemory};
+use crate::graph_memory::{EdgeTier, EntityLabel, EpisodicNode, GraphMemory, RelationType};
+use crate::memory::query_parser::{infer_ontological_intent, OntologicalIntent};
+use crate::memory::recall_readonly;
 use crate::memory::types::MemoryTier;
 // Note: compute_relevance removed - using unified density-weighted scoring directly
 use crate::memory::query_parser::{analyze_query, QueryAnalysis};
@@ -56,11 +60,8 @@ use crate::similarity::cosine_similarity;
 #[derive(Debug, Clone)]
 pub struct ActivatedMemory {
     pub memory: SharedMemory,
-    #[allow(dead_code)] // Useful for debugging score breakdown
     pub activation_score: f32,
-    #[allow(dead_code)] // Useful for debugging score breakdown
     pub semantic_score: f32,
-    #[allow(dead_code)] // Useful for debugging score breakdown
     pub linguistic_score: f32,
     pub final_score: f32,
 }
@@ -165,13 +166,44 @@ fn spread_single_direction(
     graph: &GraphMemory,
     max_hops: usize,
     threshold: f32,
+    ontological_intent: Option<&OntologicalIntent>,
+    entity_label_cache: &mut HashMap<Uuid, Option<Vec<EntityLabel>>>,
 ) -> Result<(HashMap<Uuid, f32>, Vec<Uuid>)> {
     let mut activation_map: HashMap<Uuid, f32> = seeds.iter().cloned().collect();
     let mut traversed_edges: Vec<Uuid> = Vec::new();
 
+    // Audit fix #5 (flag-gated) — repair the 2-hop activation collapse. The
+    // default per-edge spread multiplies four sub-1.0 factors per hop and
+    // double-uses edge strength (it sets the decay rate AND is multiplied in),
+    // so a distal (2-hop) target collapses below `threshold` and is pruned before
+    // it can be scored. E3 proved this is the real multi-hop bottleneck (a fusion
+    // patch could not fix it without wrecking single-hop). When enabled: gentle
+    // FIXED per-hop decay (not the compounding importance-weighted rate), and edge
+    // strength / tier-trust as ADDITIVE PRIORS with a floor so a weak edge
+    // attenuates but never zeroes the path. Default off → unchanged.
+    let spread_fix = std::env::var("SHODH_SPREAD_FIX")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let dir_fix = edge_dir_fix_enabled();
+    const SPREAD_FIX_HOP_DECAY: f32 = 0.6;
+    const SPREAD_FIX_PRIOR_FLOOR: f32 = 0.5;
+
+    // Lever-1 prototype: weight each hop by the edge's relation type so activation
+    // flows along meaningful predicates (causal/structural) rather than mere
+    // co-occurrence. Read once; applied per edge below. Default off → unchanged.
+    let predicate_weights = std::env::var("SHODH_GRAPH_PREDICATE_WEIGHTS")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+
     for hop in 1..=max_hops {
-        let current_activated: Vec<(Uuid, f32)> =
+        // Deterministic spread order: targets accumulate `+= spread_amount`
+        // below, and f32 addition is non-associative, so a per-process-random
+        // HashMap iteration order produces slightly different sums and flips
+        // near-tie ranks between repeats (the query-time residual after the
+        // ingest-order fixes). Sorting by Uuid pins the accumulation order.
+        let mut current_activated: Vec<(Uuid, f32)> =
             activation_map.iter().map(|(id, act)| (*id, *act)).collect();
+        current_activated.sort_unstable_by(|a, b| a.0.cmp(&b.0));
 
         for (entity_uuid, source_activation) in current_activated {
             if source_activation < threshold {
@@ -192,7 +224,7 @@ fn spread_single_direction(
             };
 
             for edge in edges {
-                let target_uuid = edge.to_entity;
+                let target_uuid = edge_neighbor(&edge, &entity_uuid, dir_fix);
 
                 // Edge-tier trust weight
                 let tier_trust = if edge.is_potentiated() {
@@ -205,13 +237,82 @@ fn spread_single_direction(
                     }
                 };
 
-                // Importance-weighted decay (using effective_strength for time-aware decay)
                 let effective = edge.effective_strength();
-                let decay_rate = calculate_importance_weighted_decay(effective);
-                let decay = (-decay_rate * hop as f32).exp();
+                let base_spread = if spread_fix {
+                    // Additive priors + fixed hop decay: distal targets retain
+                    // meaningful activation instead of collapsing below threshold.
+                    // effective is used ONCE (strength prior), not twice.
+                    let hop_decay = SPREAD_FIX_HOP_DECAY.powi(hop as i32);
+                    let trust_prior =
+                        SPREAD_FIX_PRIOR_FLOOR + (1.0 - SPREAD_FIX_PRIOR_FLOOR) * tier_trust;
+                    let strength_prior =
+                        SPREAD_FIX_PRIOR_FLOOR + (1.0 - SPREAD_FIX_PRIOR_FLOOR) * effective;
+                    source_activation * hop_decay * trust_prior * strength_prior * degree_norm
+                } else {
+                    // Default: importance-weighted decay (effective sets the decay
+                    // rate AND is multiplied in — the double-use the fix removes).
+                    let decay_rate = calculate_importance_weighted_decay(effective);
+                    let decay = (-decay_rate * hop as f32).exp();
+                    source_activation * decay * effective * tier_trust * degree_norm
+                };
 
-                let spread_amount =
-                    source_activation * decay * effective * tier_trust * degree_norm;
+                // Lever-1: scale by the relation type's intrinsic spreading weight
+                // so a real predicate (e.g. Causes 1.3) carries more activation than
+                // bare co-occurrence (0.5).
+                let base_spread = if predicate_weights {
+                    base_spread * edge.relation_type.spreading_weight()
+                } else {
+                    base_spread
+                };
+
+                // Ontological type penalty: dampen activation through wrong-type edges/entities.
+                // CoOccurs, RelatedTo, CoRetrieved are generic bridges — never penalized.
+                let spread_amount = if let Some(intent) = ontological_intent {
+                    let mut penalty = 1.0_f32;
+
+                    // Relation type penalty
+                    if !intent.relation_types.is_empty()
+                        && !matches!(
+                            edge.relation_type,
+                            RelationType::CoOccurs
+                                | RelationType::RelatedTo
+                                | RelationType::CoRetrieved
+                                | RelationType::AssociatedWith
+                        )
+                        && !intent.relation_types.contains(&edge.relation_type)
+                    {
+                        penalty *= ONTOLOGICAL_RELATION_PENALTY;
+                    }
+
+                    // Entity type penalty (target entity label mismatch)
+                    // Uses hierarchical matching: Team matches Organization, Service matches Technology
+                    // Cached: each entity is read from RocksDB at most once across all hops.
+                    if !intent.expected_labels.is_empty() {
+                        let cached_labels =
+                            entity_label_cache.entry(target_uuid).or_insert_with(|| {
+                                graph
+                                    .get_entity(&target_uuid)
+                                    .ok()
+                                    .flatten()
+                                    .map(|e| e.labels)
+                            });
+                        if let Some(labels) = cached_labels {
+                            let type_match = labels.iter().any(|l| {
+                                intent
+                                    .expected_labels
+                                    .iter()
+                                    .any(|exp| l.matches_with_hierarchy(exp))
+                            });
+                            if !type_match {
+                                penalty *= ONTOLOGICAL_ENTITY_PENALTY;
+                            }
+                        }
+                    }
+
+                    base_spread * penalty
+                } else {
+                    base_spread
+                };
 
                 let new_activation = activation_map.entry(target_uuid).or_insert(0.0);
                 *new_activation += spread_amount;
@@ -260,6 +361,7 @@ fn bidirectional_spread(
     graph: &GraphMemory,
     total_salience: f32,
     hops_per_direction: usize,
+    ontological_intent: Option<&OntologicalIntent>,
 ) -> Result<(HashMap<Uuid, f32>, Vec<Uuid>, usize)> {
     // Split entities into forward/backward sets (alternating assignment)
     // This distributes entities evenly regardless of count
@@ -290,12 +392,27 @@ fn bidirectional_spread(
     );
 
     // Spread from both directions with density-adaptive hops
+    // Shared entity label cache: each entity is read from RocksDB at most once
+    // across both forward and backward passes.
+    let mut entity_label_cache: HashMap<Uuid, Option<Vec<EntityLabel>>> = HashMap::new();
     let threshold = SPREADING_ACTIVATION_THRESHOLD;
-    let (forward_map, forward_edges) =
-        spread_single_direction(&forward_seeds, graph, hops_per_direction, threshold)?;
+    let (forward_map, forward_edges) = spread_single_direction(
+        &forward_seeds,
+        graph,
+        hops_per_direction,
+        threshold,
+        ontological_intent,
+        &mut entity_label_cache,
+    )?;
 
-    let (backward_map, backward_edges) =
-        spread_single_direction(&backward_seeds, graph, hops_per_direction, threshold)?;
+    let (backward_map, backward_edges) = spread_single_direction(
+        &backward_seeds,
+        graph,
+        hops_per_direction,
+        threshold,
+        ontological_intent,
+        &mut entity_label_cache,
+    )?;
 
     // Combine maps with intersection boost
     let mut combined_map: HashMap<Uuid, f32> = HashMap::new();
@@ -348,6 +465,548 @@ fn bidirectional_spread(
 /// spreading activation model adapted for episodic memory retrieval.
 ///
 /// For SHO-26 density-dependent weights, use `spreading_activation_retrieve_with_stats`
+/// Intern an entity UUID into the dense PPR node index (push a new row if unseen).
+fn ppr_intern(
+    u: Uuid,
+    nodes: &mut Vec<Uuid>,
+    node_idx: &mut HashMap<Uuid, usize>,
+    adj: &mut Vec<Vec<(usize, f32)>>,
+) -> usize {
+    if let Some(&i) = node_idx.get(&u) {
+        return i;
+    }
+    let i = nodes.len();
+    nodes.push(u);
+    adj.push(Vec::new());
+    node_idx.insert(u, i);
+    i
+}
+
+/// Resolve the spreading-activation *neighbour* of `current` across `edge`.
+///
+/// Edges are indexed under BOTH endpoints (`GraphMemory::index_entity_edge` is
+/// called for `from_entity` and `to_entity`), so `get_entity_relationships_limited`
+/// returns incoming edges too. The legacy traversal blindly used `edge.to_entity`
+/// as the neighbour, which means every edge where `current` is already the `to`
+/// endpoint resolved to `current` itself — a self-loop that silently dropped all
+/// incoming connectivity (and pumped activation back into the source node instead
+/// of the real neighbour). With `dir_fix` on, the neighbour is the OTHER endpoint:
+/// `current` is always one endpoint (the edge came from its index), so when it is
+/// the `to`, the neighbour is `from`. With `dir_fix` off, the exact legacy
+/// behaviour is preserved so it can serve as the A/B control.
+/// Diagnostic counter: how many times the direction fix actually changed the
+/// traversal target (the current node was the `to` endpoint, so the true
+/// neighbour is `from`). Zero overhead when the fix is off, because the
+/// increment is gated behind the same `dir_fix` branch. Lets an eval prove the
+/// fix executed and altered traversal even when a coarse metric like recall@10
+/// does not move.
+static EDGE_DIR_FLIPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Total edge-direction flips since process start (see [`edge_neighbor`]).
+pub fn edge_dir_flip_count() -> u64 {
+    EDGE_DIR_FLIPS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[inline]
+fn edge_neighbor(
+    edge: &crate::graph_memory::RelationshipEdge,
+    current: &Uuid,
+    dir_fix: bool,
+) -> Uuid {
+    if dir_fix && edge.from_entity != *current {
+        EDGE_DIR_FLIPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        edge.from_entity
+    } else {
+        edge.to_entity
+    }
+}
+
+/// Read the `SHODH_GRAPH_EDGE_DIR` A/B flag: when set, spreading/PPR/beam traversal
+/// follows edges to their true non-source endpoint instead of the legacy
+/// `to_entity`-only behaviour. Default off until the multi_hop comparison confirms
+/// it before flipping the production default.
+fn edge_dir_fix_enabled() -> bool {
+    std::env::var("SHODH_GRAPH_EDGE_DIR")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// Intrinsic (decay-free, degree-free) transition weight of an edge for PPR: the
+/// `effective_strength × tier_trust` an edge contributes, optionally scaled by the
+/// relation-type spreading weight and the ontological penalty. The per-hop decay and
+/// degree normalisation of the hand-rolled spread are NOT applied here — PPR's restart
+/// factor and column-normalisation subsume them.
+fn ppr_edge_weight(
+    edge: &crate::graph_memory::RelationshipEdge,
+    // The TRUE traversal neighbour (the `edge_neighbor` result), NOT `edge.to_entity`.
+    // The entity-type penalty must key on the endpoint activation actually flows to,
+    // or it penalises the wrong node once SHODH_GRAPH_EDGE_DIR routes to `from_entity`.
+    neighbor: Uuid,
+    intent: Option<&OntologicalIntent>,
+    predicate_weights: bool,
+    graph: &GraphMemory,
+    label_cache: &mut HashMap<Uuid, Option<Vec<EntityLabel>>>,
+) -> f32 {
+    let tier_trust = if edge.is_potentiated() {
+        EDGE_TIER_TRUST_LTP
+    } else {
+        match edge.tier {
+            EdgeTier::L3Semantic => EDGE_TIER_TRUST_L3,
+            EdgeTier::L2Episodic => EDGE_TIER_TRUST_L2,
+            EdgeTier::L1Working => EDGE_TIER_TRUST_L1,
+        }
+    };
+    let mut w = edge.effective_strength() * tier_trust;
+    if predicate_weights {
+        w *= edge.relation_type.spreading_weight();
+    }
+    if let Some(intent) = intent {
+        if !intent.relation_types.is_empty()
+            && !matches!(
+                edge.relation_type,
+                RelationType::CoOccurs
+                    | RelationType::RelatedTo
+                    | RelationType::CoRetrieved
+                    | RelationType::AssociatedWith
+            )
+            && !intent.relation_types.contains(&edge.relation_type)
+        {
+            w *= ONTOLOGICAL_RELATION_PENALTY;
+        }
+        if !intent.expected_labels.is_empty() {
+            let labels = label_cache
+                .entry(neighbor)
+                .or_insert_with(|| graph.get_entity(&neighbor).ok().flatten().map(|e| e.labels));
+            if let Some(labels) = labels {
+                let type_match = labels.iter().any(|l| {
+                    intent
+                        .expected_labels
+                        .iter()
+                        .any(|exp| l.matches_with_hierarchy(exp))
+                });
+                if !type_match {
+                    w *= ONTOLOGICAL_ENTITY_PENALTY;
+                }
+            }
+        }
+    }
+    w.max(0.0)
+}
+
+/// Personalized PageRank / Random-Walk-with-Restart over the local entity subgraph —
+/// the principled, convergent form of spreading activation (PPR over the entity KG). Seeds the restart
+/// vector with the query-entity activations, BFS-expands a bounded subgraph, then
+/// power-iterates `r = (1-α)·Wᵀr + α·p` (α = restart prob). Multi-hop mass and multi-seed
+/// "bridge" boosting fall out for free. Returns (entity → stationary activation, traversed
+/// edge uuids). See `drafts/graph-substrate-plan.md`.
+/// PPR output: (entity → stationary activation, episode → max-normalized passage
+/// mass, traversed edge uuids).
+type PprOutput = (HashMap<Uuid, f32>, HashMap<Uuid, f32>, Vec<Uuid>);
+
+/// When `passage_weight` is Some(w), episode (passage) nodes are interned into the
+/// PPR graph with "contains" edges (HippoRAG 2, Gutiérrez 2025: unified phrase+passage
+/// graph — the stationary distribution over passage nodes IS the episode ranking,
+/// replacing the unnormalized sum-of-entity-activations). The second returned map is
+/// episode uuid → max-normalized stationary mass (empty when off).
+fn personalized_pagerank(
+    graph: &GraphMemory,
+    seeds: &HashMap<Uuid, f32>,
+    intent: Option<&OntologicalIntent>,
+    predicate_weights: bool,
+    specificity: bool,
+    passage_weight: Option<f32>,
+) -> Result<PprOutput> {
+    const ALPHA: f32 = 0.5; // restart probability (PPR damping = 0.5)
+    const ITERS: usize = 30;
+    const TOL: f32 = 1e-6;
+    const EXPAND_HOPS: usize = 3;
+    const MAX_NODES: usize = 5000;
+    const MAX_EDGES_PER_NODE: usize = 100;
+    const MAX_PASSAGES: usize = 4000;
+    const MAX_EPISODES_PER_ENTITY: usize = 100;
+
+    let mut nodes: Vec<Uuid> = Vec::new();
+    let mut node_idx: HashMap<Uuid, usize> = HashMap::new();
+    let mut adj: Vec<Vec<(usize, f32)>> = Vec::new();
+    let mut traversed: Vec<Uuid> = Vec::new();
+    let mut label_cache: HashMap<Uuid, Option<Vec<EntityLabel>>> = HashMap::new();
+
+    // BFS-expand the subgraph reachable from the seeds, collecting weighted edges.
+    // Sort the initial frontier: seeds.keys() yields per-process-random HashMap
+    // order, which is the order nodes are interned into the dense PPR index. A
+    // different index assignment reorders the power-iteration matrix-vector
+    // sums, and f32 addition is non-associative, so the stationary masses wobble
+    // by a few ULPs between recall repeats — enough to flip near-tie episode
+    // ranks across the final-sort quantization boundary. Sorting makes the node
+    // ordering, and therefore the PPR result, bit-reproducible.
+    let mut frontier: Vec<Uuid> = seeds.keys().copied().collect();
+    frontier.sort_unstable();
+    let mut visited: HashSet<Uuid> = frontier.iter().copied().collect();
+    for &s in &frontier {
+        ppr_intern(s, &mut nodes, &mut node_idx, &mut adj);
+    }
+    for _hop in 0..EXPAND_HOPS {
+        if nodes.len() >= MAX_NODES {
+            break;
+        }
+        let mut next: Vec<Uuid> = Vec::new();
+        let dir_fix = edge_dir_fix_enabled();
+        for &u in &frontier {
+            let ui = ppr_intern(u, &mut nodes, &mut node_idx, &mut adj);
+            let edges = graph.get_entity_relationships_limited(&u, Some(MAX_EDGES_PER_NODE))?;
+            for edge in edges {
+                let nb = edge_neighbor(&edge, &u, dir_fix);
+                let w = ppr_edge_weight(
+                    &edge,
+                    nb,
+                    intent,
+                    predicate_weights,
+                    graph,
+                    &mut label_cache,
+                );
+                if w <= 0.0 {
+                    continue;
+                }
+                let ti = ppr_intern(nb, &mut nodes, &mut node_idx, &mut adj);
+                adj[ui].push((ti, w));
+                traversed.push(edge.uuid);
+                if visited.insert(nb) {
+                    next.push(nb);
+                }
+            }
+            if nodes.len() >= MAX_NODES {
+                break;
+            }
+        }
+        if next.is_empty() {
+            break;
+        }
+        frontier = next;
+    }
+
+    // Unified phrase+passage graph (HippoRAG 2): intern the episodes of every
+    // in-subgraph entity as passage nodes with bidirectional "contains" edges.
+    // Passages are added AFTER entity expansion and are never expansion sources,
+    // so the entity subgraph stays bounded; an episode's entities outside the
+    // subgraph are simply not connected. DELIBERATE DEVIATION from HippoRAG 2:
+    // they balance phrase-vs-passage influence via the reset vector (their dense
+    // leg); our vector leg already covers dense retrieval, so passages get ZERO
+    // reset mass and the balance lives in the flow — each entity's total
+    // contains out-weight is budgeted to `passage_weight` (split across its
+    // episodes) so episode fan-out cannot starve entity→entity spreading.
+    // Mass conservation is the point: a hub episode cannot accumulate an
+    // unbounded sum the way the legacy per-entity summation allowed.
+    let n_entities = nodes.len();
+    let mut passage_idx: HashMap<Uuid, usize> = HashMap::new();
+    if let Some(pw) = passage_weight {
+        let mut full = false;
+        for ei in 0..n_entities {
+            if full {
+                break;
+            }
+            let eu = nodes[ei];
+            let Ok(eps) = graph.get_episodes_by_entity(&eu) else {
+                continue;
+            };
+            let n_eps = eps.len().min(MAX_EPISODES_PER_ENTITY);
+            if n_eps == 0 {
+                continue;
+            }
+            let per_edge_w = pw / n_eps as f32;
+            for ep in eps.into_iter().take(MAX_EPISODES_PER_ENTITY) {
+                let pi = match passage_idx.get(&ep.uuid) {
+                    Some(&i) => i,
+                    None => {
+                        if passage_idx.len() >= MAX_PASSAGES {
+                            full = true;
+                            break;
+                        }
+                        let i = nodes.len();
+                        nodes.push(ep.uuid);
+                        adj.push(Vec::new());
+                        passage_idx.insert(ep.uuid, i);
+                        i
+                    }
+                };
+                adj[ei].push((pi, per_edge_w));
+                // episode→entity return edges are column-normalized among
+                // themselves, so weight 1.0 = an even split across the
+                // episode's in-subgraph entities.
+                adj[pi].push((ei, 1.0));
+            }
+        }
+        tracing::debug!(
+            "Unified PPR: {} passage nodes interned (budget w={pw})",
+            passage_idx.len()
+        );
+    }
+
+    let n = nodes.len();
+    if n == 0 {
+        return Ok((HashMap::new(), HashMap::new(), traversed));
+    }
+
+    // Restart/personalization vector p (L1-normalized seed activations).
+    //
+    // Node specificity (HippoRAG, Gutiérrez 2024): when enabled, each seed's restart
+    // mass is scaled by an inverse-frequency signal s_i = 1/mention_count before
+    // normalization, so a rare, discriminative query entity receives more restart
+    // probability than a ubiquitous hub seed that appears in many memories. This is a
+    // LOCAL IDF — it reads only the seed's own mention_count, never aggregating over the
+    // whole corpus — which keeps it within the edge-RAM budget. HippoRAG's ablation
+    // measured ~2.7 R@2 from this term; our raw seeds (salience-weighted activations)
+    // otherwise let a hub seed dominate the stationary distribution.
+    let spec_weight = |u: &Uuid, w: f32| -> f32 {
+        if !specificity {
+            return w;
+        }
+        let mention_count = graph
+            .get_entity(u)
+            .ok()
+            .flatten()
+            .map(|e| e.mention_count)
+            .unwrap_or(1)
+            .max(1);
+        w / mention_count as f32
+    };
+    let mut p = vec![0.0_f32; n];
+    let weighted: Vec<(usize, f32)> = seeds
+        .iter()
+        .filter_map(|(u, w)| node_idx.get(u).map(|&i| (i, spec_weight(u, *w))))
+        .collect();
+    let zsum: f32 = weighted.iter().map(|(_, w)| *w).sum::<f32>().max(1e-9);
+    for (i, w) in weighted {
+        p[i] += w / zsum;
+    }
+    // Weighted out-degree for column-stochastic normalization.
+    let mut outw = vec![0.0_f32; n];
+    for (ui, row) in adj.iter().enumerate() {
+        for &(_, w) in row {
+            outw[ui] += w;
+        }
+    }
+
+    // Power iteration: r = (1-α)·Wᵀ·r + α·p.
+    let mut r = p.clone();
+    for _ in 0..ITERS {
+        let mut nxt = vec![0.0_f32; n];
+        for ui in 0..n {
+            let ru = r[ui];
+            if ru == 0.0 || outw[ui] <= 0.0 {
+                continue;
+            }
+            let scale = (1.0 - ALPHA) * ru / outw[ui];
+            for &(ti, w) in &adj[ui] {
+                nxt[ti] += scale * w;
+            }
+        }
+        let mut delta = 0.0_f32;
+        for i in 0..n {
+            nxt[i] += ALPHA * p[i];
+            delta += (nxt[i] - r[i]).abs();
+        }
+        r = nxt;
+        if delta < TOL {
+            break;
+        }
+    }
+
+    traversed.sort_unstable();
+    traversed.dedup();
+    // Split the stationary distribution: indices < n_entities are entities,
+    // the rest are passages. Passage masses are max-normalized so the episode
+    // scores land on the same 0..1 scale the downstream hybrid mixing expects
+    // (raw stationary masses are ~1e-3 and would vanish next to semantic 0..1).
+    let mut activation = HashMap::with_capacity(n_entities);
+    for (i, &u) in nodes.iter().enumerate().take(n_entities) {
+        if r[i] > 1e-9 {
+            activation.insert(u, r[i]);
+        }
+    }
+    let mut passage_activation = HashMap::with_capacity(passage_idx.len());
+    if !passage_idx.is_empty() {
+        let max_mass = passage_idx
+            .values()
+            .map(|&i| r[i])
+            .fold(0.0_f32, f32::max)
+            .max(1e-9);
+        for (&u, &i) in &passage_idx {
+            if r[i] > 1e-9 {
+                passage_activation.insert(u, r[i] / max_mass);
+            }
+        }
+    }
+    Ok((activation, passage_activation, traversed))
+}
+
+/// Reachability injection (complete, threshold-free spreading). For every entity within
+/// REACH_HOPS of a query seed, compute its best-path activation — the max over paths of the
+/// edge-weight product, distance-decayed — with NO threshold pruning. The reachability
+/// diagnostic shows ~98% of gold is ≤2-hop reachable while ordinary spreading activation
+/// surfaces ~2%; threshold/decay drop reachable-but-weak paths before they can rank. This
+/// recovers them as graded candidates so downstream fusion can surface the reachable gold.
+/// Bounded by hops, a total node cap, and a per-node edge cap. Relaxation over REACH_HOPS
+/// rounds (re-expanding improved nodes) — exact best-path for the small hop budget.
+fn reachable_inject(
+    graph: &GraphMemory,
+    seeds: &HashMap<Uuid, f32>,
+    intent: Option<&OntologicalIntent>,
+    predicate_weights: bool,
+) -> Result<HashMap<Uuid, f32>> {
+    const REACH_HOPS: usize = 2;
+    const MAX_NODES: usize = 4000;
+    const MAX_EDGES_PER_NODE: usize = 100;
+    const HOP_DECAY: f32 = 0.5;
+    // Keep only the strongest-path reachable entities. Threshold-free expansion over a
+    // hub (degree 225 on LoCoMo) otherwise floods the candidate set — every reachable
+    // episode becomes a candidate, blowing up the O(n²) lateral-inhibition pass and the
+    // downstream pool. KG-RAG systems inject a BOUNDED, ranked
+    // set, not everything reachable. 1-hop gold (96% of cases) carries the strongest
+    // activation, so it survives the cap.
+    const REACH_MAX_ENTITIES: usize = 128;
+
+    let mut best: HashMap<Uuid, f32> = seeds.clone();
+    let mut frontier: Vec<Uuid> = seeds.keys().copied().collect();
+    let mut label_cache: HashMap<Uuid, Option<Vec<EntityLabel>>> = HashMap::new();
+
+    for _hop in 0..REACH_HOPS {
+        if best.len() >= MAX_NODES {
+            break;
+        }
+        let mut next: Vec<Uuid> = Vec::new();
+        let dir_fix = edge_dir_fix_enabled();
+        for &u in &frontier {
+            let au = best.get(&u).copied().unwrap_or(0.0);
+            if au <= 0.0 {
+                continue;
+            }
+            let edges = graph.get_entity_relationships_limited(&u, Some(MAX_EDGES_PER_NODE))?;
+            for edge in edges {
+                let nb = edge_neighbor(&edge, &u, dir_fix);
+                let w = ppr_edge_weight(
+                    &edge,
+                    nb,
+                    intent,
+                    predicate_weights,
+                    graph,
+                    &mut label_cache,
+                );
+                if w <= 0.0 {
+                    continue;
+                }
+                let new_act = au * w * HOP_DECAY;
+                if new_act > best.get(&nb).copied().unwrap_or(0.0) {
+                    best.insert(nb, new_act);
+                    next.push(nb);
+                }
+            }
+            if best.len() >= MAX_NODES {
+                break;
+            }
+        }
+        if next.is_empty() {
+            break;
+        }
+        frontier = next;
+    }
+
+    // Bound the injected set to the strongest-path reachable entities.
+    if best.len() > REACH_MAX_ENTITIES {
+        let mut items: Vec<(Uuid, f32)> = best.into_iter().collect();
+        items.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
+        items.truncate(REACH_MAX_ENTITIES);
+        return Ok(items.into_iter().collect());
+    }
+    Ok(best)
+}
+
+/// Graph-native multi-hop traversal — "walk the reasoning". Beam search from the query seeds
+/// along the strongest INTENT-MATCHING edge paths (scored by `ppr_edge_weight`, which encodes
+/// edge strength × relation-intent match), returning the reached NON-seed entities scored by
+/// path strength. The endpoint of an A→B→C walk IS the composed answer — this turns the graph
+/// from a retrieval index (rank passages) into a reasoner (compose by traversal). Retrieval
+/// alone cannot answer multi-hop; traversal can. LLM-free; adapts the embedding-guided neural
+/// search recipe (arXiv 2511.19648) to our stack. Returns entity uuid → best path score.
+fn traverse_beam(
+    graph: &GraphMemory,
+    seeds: &HashMap<Uuid, f32>,
+    intent: Option<&OntologicalIntent>,
+    predicate_weights: bool,
+) -> Result<HashMap<Uuid, f32>> {
+    const HOPS: usize = 2;
+    const BEAM: usize = 32;
+    const MAX_EDGES: usize = 100;
+
+    struct BeamPath {
+        endpoint: Uuid,
+        score: f32,
+        visited: HashSet<Uuid>,
+    }
+    let mut beam: Vec<BeamPath> = seeds
+        .iter()
+        .map(|(&u, &w)| {
+            let mut visited = HashSet::new();
+            visited.insert(u);
+            BeamPath {
+                endpoint: u,
+                score: w.max(1e-3),
+                visited,
+            }
+        })
+        .collect();
+    let mut reached: HashMap<Uuid, f32> = HashMap::new();
+    let mut label_cache: HashMap<Uuid, Option<Vec<EntityLabel>>> = HashMap::new();
+
+    let dir_fix = edge_dir_fix_enabled();
+    for _ in 0..HOPS {
+        let mut next: Vec<BeamPath> = Vec::new();
+        for p in &beam {
+            let edges = graph.get_entity_relationships_limited(&p.endpoint, Some(MAX_EDGES))?;
+            for edge in edges {
+                let nb = edge_neighbor(&edge, &p.endpoint, dir_fix);
+                if p.visited.contains(&nb) {
+                    continue;
+                }
+                let w = ppr_edge_weight(
+                    &edge,
+                    nb,
+                    intent,
+                    predicate_weights,
+                    graph,
+                    &mut label_cache,
+                );
+                if w <= 0.0 {
+                    continue;
+                }
+                let mut visited = p.visited.clone();
+                visited.insert(nb);
+                next.push(BeamPath {
+                    endpoint: nb,
+                    score: p.score * w,
+                    visited,
+                });
+            }
+        }
+        if next.is_empty() {
+            break;
+        }
+        next.sort_unstable_by(|a, b| b.score.total_cmp(&a.score));
+        next.truncate(BEAM);
+        for p in &next {
+            let e = reached.entry(p.endpoint).or_insert(0.0);
+            if p.score > *e {
+                *e = p.score;
+            }
+        }
+        beam = next;
+    }
+    // The composed answer is a NEW entity reached by the walk, never a seed.
+    for s in seeds.keys() {
+        reached.remove(s);
+    }
+    Ok(reached)
+}
+
 pub fn spreading_activation_retrieve(
     query_text: &str,
     query: &Query,
@@ -362,6 +1021,8 @@ pub fn spreading_activation_retrieve(
         graph,
         embedder,
         None, // No density = use legacy fixed weights
+        None, // No pre-computed intent = compute internally
+        None, // No pre-computed embedding
         episode_to_memory_fn,
     )?;
     Ok(memories)
@@ -380,16 +1041,20 @@ pub fn spreading_activation_retrieve(
 /// - `graph`: The knowledge graph for spreading activation
 /// - `embedder`: Embedding model for semantic scoring
 /// - `graph_density`: Optional density (edges/memories). If None, uses fixed weights.
+/// - `ontological_intent`: Pre-computed ontological intent. When `Some`, avoids recomputing.
 /// - `episode_to_memory_fn`: Function to convert episodes to memories
 ///
 /// # Returns
 /// (Vec<ActivatedMemory>, RetrievalStats)
+#[allow(clippy::too_many_arguments)]
 pub fn spreading_activation_retrieve_with_stats(
     query_text: &str,
     query: &Query,
     graph: &GraphMemory,
     embedder: &dyn Embedder,
     graph_density: Option<f32>,
+    ontological_intent: Option<&OntologicalIntent>,
+    pre_computed_embedding: Option<&[f32]>,
     episode_to_memory_fn: impl Fn(&EpisodicNode) -> Result<Option<SharedMemory>>,
 ) -> Result<(Vec<ActivatedMemory>, RetrievalStats)> {
     let start_time = Instant::now();
@@ -416,6 +1081,36 @@ pub fn spreading_activation_retrieve_with_stats(
 
     // Step 1: Linguistic query analysis (Lioma & Ounis 2006)
     let analysis = analyze_query(query_text);
+
+    // Ontological intent: use pre-computed if provided, otherwise infer from query structure
+    let computed_intent;
+    let ontological_intent_resolved = match ontological_intent {
+        Some(intent) => intent,
+        None => {
+            computed_intent = infer_ontological_intent(query_text, &analysis);
+            &computed_intent
+        }
+    };
+    let use_ontology = ontological_intent_resolved.confidence >= ONTOLOGICAL_MIN_CONFIDENCE
+        && !graph_density.is_some_and(|d| d >= ONTOLOGICAL_DENSITY_THRESHOLD);
+    let intent_ref = if use_ontology {
+        Some(ontological_intent_resolved)
+    } else {
+        None
+    };
+
+    if use_ontology {
+        tracing::info!(
+            "Ontological intent: labels={:?}, relations={:?}, confidence={:.2}",
+            ontological_intent_resolved.expected_labels,
+            ontological_intent_resolved
+                .relation_types
+                .iter()
+                .map(|r| r.as_str())
+                .collect::<Vec<_>>(),
+            ontological_intent_resolved.confidence
+        );
+    }
 
     tracing::info!("🔍 Query Analysis:");
     tracing::info!(
@@ -469,6 +1164,45 @@ pub fn spreading_activation_retrieve_with_stats(
         }
     }
 
+    // Query-NER seeding (query-analysis audit 2026-06-10): augment the heuristic
+    // focal entities with NEURAL-NER entities annotated on the query by the
+    // caller that owns the model (recall handler / eval runner, behind
+    // SHODH_QUERY_NER). The POS heuristic measurably seeds the graph with verbs
+    // and months while demoting real entities to modifiers; the 17MB NER model
+    // fixes exactly this at ingest but never saw queries. AUGMENT, not replace:
+    // NER misses stay covered by the heuristic; duplicates dedup by entity uuid.
+    // Seed IC weight matches the noun IC (2.3) the heuristic would assign.
+    if let Some(ner_names) = query.ner_entities.as_deref() {
+        const QUERY_NER_SEED_IC: f32 = 2.3;
+        let seen: HashSet<Uuid> = entity_data.iter().map(|(u, _, _, _)| *u).collect();
+        let mut added = 0usize;
+        for name in ner_names {
+            if name.trim().len() < 2 {
+                continue;
+            }
+            if let Some(entity_node) = graph.find_entity_by_name(name)? {
+                if !seen.contains(&entity_node.uuid) {
+                    entity_data.push((
+                        entity_node.uuid,
+                        name.clone(),
+                        QUERY_NER_SEED_IC,
+                        entity_node.salience,
+                    ));
+                    added += 1;
+                }
+            }
+        }
+        if added > 0 {
+            tracing::debug!("Query-NER seeding: +{added} neural-NER graph seeds");
+        }
+    }
+
+    // G5: the query-entity seed set, for multi-seed coverage scoring. An episode
+    // connected to MORE distinct query seeds is more relevant (the multi_hop
+    // discriminator); raw summed activation alone cannot separate gold from
+    // hub-distractors that share one ubiquitous seed.
+    let seed_set: HashSet<Uuid> = entity_data.iter().map(|(u, _, _, _)| *u).collect();
+
     // Calculate total salience for normalization (attention budget)
     let total_salience: f32 = entity_data.iter().map(|(_, _, _, s)| s).sum();
     let total_salience = total_salience.max(0.1); // Prevent division by zero
@@ -511,12 +1245,77 @@ pub fn spreading_activation_retrieve_with_stats(
         return Ok((Vec::new(), stats)); // Caller should fall back to semantic search
     }
 
+    // Snapshot seed activations BEFORE spreading overwrites activation_map — the
+    // reachability-injection pass re-derives a complete, threshold-free best-path
+    // activation from these seeds.
+    let seed_activations = activation_map.clone();
+    let reach_inject = std::env::var("SHODH_GRAPH_REACH_INJECT")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+
     // Step 3: Spread activation through graph
     // PIPE-7: Use bidirectional spreading when 2+ focal entities, else unidirectional
     let graph_start = Instant::now();
     let mut traversed_edges: Vec<Uuid>;
+    // Unified-PPR passage masses (SHODH_PPR_PASSAGE); empty unless the PPR
+    // branch ran with passages enabled.
+    let mut ppr_passage_map: HashMap<Uuid, f32> = HashMap::new();
 
-    if entity_data.len() >= BIDIRECTIONAL_MIN_ENTITIES {
+    // SHODH_PPR: Personalized PageRank replaces the hand-rolled BFS spread — the
+    // convergent, mass-conserving form of spreading activation. The seed
+    // activation_map becomes the restart vector; PPR's stationary distribution becomes the
+    // new activation_map consumed by the shared episode-scoring path below.
+    //
+    // DEFAULT ON since runs 27252898191 + 27255557316 (reproduced to 4 decimals):
+    // recall@10 ALL 0.6853→0.6976 with single_hop +0.018 AND temporal +0.014 —
+    // the first graph-side lever WITHOUT the structural category tradeoff
+    // (multi_hop -0.006 the only cost; p@1/MRR also up; funnel graph present%
+    // 51→76). PPR subsumes the BFS spread's patches in one principled mechanism:
+    // no per-hop threshold pruning (the 2-3 hop activation collapse), restart
+    // mass replaces ad-hoc hop decay, and column normalization handles hubs.
+    // SHODH_PPR=0 restores the legacy BFS spread (escape hatch).
+    let ppr_enabled = std::env::var("SHODH_PPR")
+        .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
+        .unwrap_or(true);
+
+    if ppr_enabled {
+        let pred_w = std::env::var("SHODH_GRAPH_PREDICATE_WEIGHTS")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        // SHODH_PPR_SPECIFICITY: node-specificity restart weighting (HippoRAG).
+        // DEFAULT ON (run 27326218586): multi_hop +0.0066 both with and without
+        // semantic relations (arms B vs A and D vs C), zero regression anywhere.
+        // SHODH_PPR_SPECIFICITY=0 disables.
+        let specificity = std::env::var("SHODH_PPR_SPECIFICITY")
+            .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
+            .unwrap_or(true);
+        // SHODH_PPR_PASSAGE: unified phrase+passage PPR (HippoRAG 2). The value
+        // is the per-entity contains-edge flow budget (e.g. 0.5); unset/0 = off.
+        // A/B spike — default off.
+        let passage_weight = std::env::var("SHODH_PPR_PASSAGE")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .filter(|w| *w > 0.0);
+        tracing::info!(
+            "🌐 Using Personalized PageRank ({} seed entities, specificity={}, passages={:?})",
+            activation_map.len(),
+            specificity,
+            passage_weight
+        );
+        let (ppr_map, passage_map, edges) = personalized_pagerank(
+            graph,
+            &activation_map,
+            intent_ref,
+            pred_w,
+            specificity,
+            passage_weight,
+        )?;
+        activation_map = ppr_map;
+        ppr_passage_map = passage_map;
+        traversed_edges = edges;
+        stats.entities_activated = activation_map.len();
+        stats.graph_hops = 3; // PPR EXPAND_HOPS
+    } else if entity_data.len() >= BIDIRECTIONAL_MIN_ENTITIES {
         // PIPE-7: Bidirectional spreading activation
         // Split entities into forward/backward sets, spread from each, boost intersections
         // Density-adaptive hops: dense (fresh) graphs use fewer hops, sparse (mature) use more
@@ -529,8 +1328,13 @@ pub fn spreading_activation_retrieve_with_stats(
             graph_density.unwrap_or(0.0)
         );
 
-        let (bidirectional_map, edges, intersection_count) =
-            bidirectional_spread(&entity_data, graph, total_salience, adaptive_hops)?;
+        let (bidirectional_map, edges, intersection_count) = bidirectional_spread(
+            &entity_data,
+            graph,
+            total_salience,
+            adaptive_hops,
+            intent_ref,
+        )?;
 
         activation_map = bidirectional_map;
         traversed_edges = edges;
@@ -552,6 +1356,14 @@ pub fn spreading_activation_retrieve_with_stats(
 
         let mut edges_collected: Vec<Uuid> = Vec::new();
         let mut current_threshold = SPREADING_ACTIVATION_THRESHOLD;
+        // Entity label cache: each entity is read from RocksDB at most once across all hops.
+        let mut entity_label_cache: HashMap<Uuid, Option<Vec<EntityLabel>>> = HashMap::new();
+        // Lever-1 prototype: weight each hop by the edge's relation type (see
+        // spread_single_direction). Read once; applied per edge below.
+        let predicate_weights = std::env::var("SHODH_GRAPH_PREDICATE_WEIGHTS")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        let dir_fix = edge_dir_fix_enabled();
 
         for hop in 1..=SPREADING_MAX_HOPS {
             stats.graph_hops = hop;
@@ -564,9 +1376,14 @@ pub fn spreading_activation_retrieve_with_stats(
                 current_threshold
             );
 
-            // Clone to avoid borrow issues
-            let current_activated: Vec<(Uuid, f32)> =
+            // Clone to avoid borrow issues. Sort by Uuid so the `+=`
+            // accumulation into shared targets below is order-deterministic:
+            // f32 addition is non-associative, and HashMap iteration order
+            // varies per process, which otherwise flips near-tie ranks
+            // between repeats.
+            let mut current_activated: Vec<(Uuid, f32)> =
                 activation_map.iter().map(|(id, act)| (*id, *act)).collect();
+            current_activated.sort_unstable_by(|a, b| a.0.cmp(&b.0));
 
             for (entity_uuid, source_activation) in current_activated {
                 // Only spread from entities with sufficient activation
@@ -579,9 +1396,17 @@ pub fn spreading_activation_retrieve_with_stats(
                 let edges = graph
                     .get_entity_relationships_limited(&entity_uuid, Some(MAX_EDGES_PER_SPREAD))?;
 
+                // Degree normalization: prevent hub nodes from flooding the network.
+                // Matches bidirectional path (Anderson & Reder 1999 ACT-R).
+                let degree_norm = if SPREADING_DEGREE_NORMALIZATION {
+                    1.0 / (1.0 + edges.len() as f32).sqrt()
+                } else {
+                    1.0
+                };
+
                 for edge in edges {
                     // Spread activation to connected entity
-                    let target_uuid = edge.to_entity;
+                    let target_uuid = edge_neighbor(&edge, &entity_uuid, dir_fix);
 
                     // Edge-tier trust weight (SHO-D1, PIPE-4)
                     let tier_trust = if edge.is_potentiated() {
@@ -599,7 +1424,54 @@ pub fn spreading_activation_retrieve_with_stats(
                     let decay_rate = calculate_importance_weighted_decay(effective);
                     let decay = (-decay_rate * hop as f32).exp();
 
-                    let spread_amount = source_activation * decay * effective * tier_trust;
+                    let base_spread =
+                        source_activation * decay * effective * tier_trust * degree_norm;
+                    // Lever-1: scale by relation type's intrinsic spreading weight.
+                    let base_spread = if predicate_weights {
+                        base_spread * edge.relation_type.spreading_weight()
+                    } else {
+                        base_spread
+                    };
+
+                    // Ontological type penalty (same as bidirectional path)
+                    let spread_amount = if let Some(intent) = intent_ref {
+                        let mut penalty = 1.0_f32;
+                        if !intent.relation_types.is_empty()
+                            && !matches!(
+                                edge.relation_type,
+                                RelationType::CoOccurs
+                                    | RelationType::RelatedTo
+                                    | RelationType::CoRetrieved
+                            )
+                            && !intent.relation_types.contains(&edge.relation_type)
+                        {
+                            penalty *= ONTOLOGICAL_RELATION_PENALTY;
+                        }
+                        if !intent.expected_labels.is_empty() {
+                            let cached_labels =
+                                entity_label_cache.entry(target_uuid).or_insert_with(|| {
+                                    graph
+                                        .get_entity(&target_uuid)
+                                        .ok()
+                                        .flatten()
+                                        .map(|e| e.labels)
+                                });
+                            if let Some(labels) = cached_labels {
+                                let type_match = labels.iter().any(|l| {
+                                    intent
+                                        .expected_labels
+                                        .iter()
+                                        .any(|exp| l.matches_with_hierarchy(exp))
+                                });
+                                if !type_match {
+                                    penalty *= ONTOLOGICAL_ENTITY_PENALTY;
+                                }
+                            }
+                        }
+                        base_spread * penalty
+                    } else {
+                        base_spread
+                    };
 
                     let new_activation = activation_map.entry(target_uuid).or_insert(0.0);
                     *new_activation += spread_amount;
@@ -683,23 +1555,119 @@ pub fn spreading_activation_retrieve_with_stats(
         traversed_edges = edges_collected;
     }
 
+    // Reachability injection: the reachability diagnostic shows ~98% of gold is ≤2-hop
+    // reachable while spreading activation surfaces ~2% — threshold pruning / decay drop
+    // reachable-but-weak paths before they can rank. Re-derive a complete best-path
+    // activation for every entity within REACH_HOPS of a seed (NO threshold) and merge by
+    // max, so fusion can rank the reachable gold instead of never seeing it.
+    if reach_inject {
+        // Honor SHODH_GRAPH_PREDICATE_WEIGHTS here too — the other graph passes (PPR,
+        // spreading, traversal) all weight edges by predicate type when it's set;
+        // reachable injection used to hardcode `false`, silently dropping that signal.
+        let pred_w = std::env::var("SHODH_GRAPH_PREDICATE_WEIGHTS")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        match reachable_inject(graph, &seed_activations, intent_ref, pred_w) {
+            Ok(reach) => {
+                let before = activation_map.len();
+                for (u, a) in reach {
+                    let e = activation_map.entry(u).or_insert(0.0);
+                    if a > *e {
+                        *e = a;
+                    }
+                }
+                tracing::info!(
+                    "🧭 Reachability injection: {} → {} activated entities",
+                    before,
+                    activation_map.len()
+                );
+            }
+            Err(e) => tracing::warn!("Reachability injection failed: {e}"),
+        }
+    }
+
+    // SHODH_GRAPH_TRAVERSE: walk the reasoning. Beam-search the strongest intent-matching
+    // paths from the seeds and inject the reached endpoint entities (the composed multi-hop
+    // answer) with a strong boost, so the traversal answer dominates the diffuse activation
+    // pool. This is composition-by-traversal — what retrieval+ranking structurally cannot do.
+    let traverse = std::env::var("SHODH_GRAPH_TRAVERSE")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if traverse {
+        const TRAVERSE_BOOST: f32 = 5.0;
+        let pred_w = std::env::var("SHODH_GRAPH_PREDICATE_WEIGHTS")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        match traverse_beam(graph, &seed_activations, intent_ref, pred_w) {
+            Ok(answers) => {
+                let n = answers.len();
+                for (ent, score) in answers {
+                    let boosted = score * TRAVERSE_BOOST;
+                    let e = activation_map.entry(ent).or_insert(0.0);
+                    if boosted > *e {
+                        *e = boosted;
+                    }
+                }
+                tracing::info!("🧭 Traversal: {} path-answer entities injected", n);
+            }
+            Err(e) => tracing::warn!("Traversal failed: {e}"),
+        }
+    }
+
     stats.graph_time_us = graph_start.elapsed().as_micros() as u64;
     tracing::info!("📊 Final activated entities: {}", activation_map.len());
 
-    // Step 4: Retrieve episodic memories connected to activated entities
-    let mut activated_memories: HashMap<Uuid, (f32, EpisodicNode)> = HashMap::new();
+    // Step 4: Retrieve episodic memories connected to activated entities.
+    // Tracks (summed_activation, distinct_query_seeds_covered, episode) so G5
+    // can reward episodes activated by MULTIPLE query seeds.
+    let mut activated_memories: HashMap<Uuid, (f32, HashSet<Uuid>, EpisodicNode)> = HashMap::new();
 
-    for (entity_uuid, entity_activation) in &activation_map {
+    // Deterministic episode accumulation: an episode connected to several
+    // activated entities sums their activations via `current.0 +=` below.
+    // f32 addition is non-associative, so iterating `activation_map` in
+    // per-process-random HashMap order yields slightly different episode
+    // scores and flips near-tie graph-leg ranks between repeats. Sort the
+    // source entities by Uuid to pin the summation order. This is the
+    // dominant query-time residual: episode score IS the graph-leg ranking.
+    let mut activation_entries: Vec<(&Uuid, &f32)> = activation_map.iter().collect();
+    activation_entries.sort_unstable_by(|a, b| a.0.cmp(b.0));
+
+    for (entity_uuid, entity_activation) in activation_entries {
         let episodes = graph.get_episodes_by_entity(entity_uuid)?;
+        let is_seed = seed_set.contains(entity_uuid);
 
         for episode in episodes {
             // Accumulate activation for each episode (might be connected to multiple entities)
             let current = activated_memories
                 .entry(episode.uuid)
-                .or_insert((0.0, episode.clone()));
+                .or_insert_with(|| (0.0, HashSet::new(), episode.clone()));
 
             current.0 += entity_activation;
+            // G5: record which DISTINCT query seeds reach this episode.
+            if is_seed {
+                current.1.insert(*entity_uuid);
+            }
         }
+    }
+
+    // Unified PPR (HippoRAG 2): where a passage node carries stationary mass,
+    // it REPLACES the per-entity activation sum — mass-conserved, hub-safe
+    // ranking instead of the unnormalized SUM the spreading audit flagged.
+    // Episodes that missed the passage cap keep the summed fallback; G5 seed
+    // coverage still applies on top (orthogonal signal).
+    if !ppr_passage_map.is_empty() {
+        let mut replaced = 0usize;
+        for (uuid, entry) in activated_memories.iter_mut() {
+            if let Some(mass) = ppr_passage_map.get(uuid) {
+                entry.0 = *mass;
+                replaced += 1;
+            }
+        }
+        tracing::debug!(
+            "Unified PPR: passage mass replaced {} / {} episode scores",
+            replaced,
+            activated_memories.len()
+        );
     }
 
     stats.graph_candidates = activated_memories.len();
@@ -711,14 +1679,26 @@ pub fn spreading_activation_retrieve_with_stats(
     // Step 5: Convert episodes to memories and calculate scores using UNIFIED scoring
     let mut scored_memories = Vec::new();
 
-    // Generate query embedding once (for semantic scoring)
-    let embedding_start = Instant::now();
-    let query_embedding = embedder.encode(query_text)?;
-    stats.embedding_time_us = embedding_start.elapsed().as_micros() as u64;
+    // Use pre-computed embedding if available; otherwise encode fresh
+    let query_embedding = if let Some(emb) = pre_computed_embedding {
+        emb.to_vec()
+    } else {
+        let embedding_start = Instant::now();
+        let emb = embedder.encode_query(query_text)?;
+        stats.embedding_time_us = embedding_start.elapsed().as_micros() as u64;
+        emb
+    };
 
-    let now = chrono::Utc::now();
+    let now = crate::memory::scoring_now();
 
-    for (_episode_uuid, (graph_activation, episode)) in activated_memories {
+    for (_episode_uuid, (raw_activation, covered_seeds, episode)) in activated_memories {
+        // G5: scale activation by distinct query-seed coverage. An episode
+        // reached by 2 distinct query seeds (e.g. speaker AND topic) is the
+        // multi_hop signal; one reached by a single ubiquitous seed (a hub) is
+        // not. coverage==1 → ×1.0, so single-seed queries are unaffected.
+        let coverage = covered_seeds.len();
+        let graph_activation =
+            raw_activation * (1.0 + SEED_COVERAGE_BONUS * (coverage.saturating_sub(1) as f32));
         // Convert episode to memory
         if let Some(memory) = episode_to_memory_fn(&episode)? {
             // Calculate semantic similarity (still needed for ActivatedMemory debug fields)
@@ -778,7 +1758,12 @@ pub fn spreading_activation_retrieve_with_stats(
                 .map(|c| (c.source.credibility - 0.5).max(0.0) * 0.1)
                 .unwrap_or(0.0);
 
-            let final_score = hybrid_score + recency_boost + arousal_boost + credibility_boost;
+            // Type-aware activation dampening: noise types (CodeEdit, Command, etc.)
+            // get reduced activation scores so intentional memories rank higher.
+            // This is the read-time complement to write-time edge dampening.
+            let type_dampening = memory.experience.experience_type.activation_multiplier();
+            let final_score =
+                (hybrid_score + recency_boost + arousal_boost + credibility_boost) * type_dampening;
 
             scored_memories.push(ActivatedMemory {
                 memory,
@@ -793,8 +1778,37 @@ pub fn spreading_activation_retrieve_with_stats(
     // Step 6: Sort by final score (descending)
     scored_memories.sort_by(|a, b| b.final_score.total_cmp(&a.final_score));
 
-    // Step 7: Apply limit
-    scored_memories.truncate(query.max_results);
+    // Bound the candidate set before the O(n²) lateral-inhibition pass below. The caller
+    // keeps only the top ~200 graph candidates anyway, so this loses nothing — but without
+    // it, reachability injection's large candidate set makes lateral inhibition (pairwise
+    // cosine over every candidate) pathologically slow on real corpora (a hub maps hundreds
+    // of episodes into the pool). Latent O(n²) hazard that threshold-pruned spreading hid.
+    const GRAPH_CANDIDATE_CAP: usize = 200;
+    scored_memories.truncate(GRAPH_CANDIDATE_CAP);
+
+    // Step 6.5: Lateral inhibition — high-scoring memories suppress similar competitors
+    // Mimics cortical winner-take-all dynamics (Rumelhart & Zipser 1985)
+    if scored_memories.len() > 1 {
+        let penalties = calculate_lateral_inhibition(&scored_memories);
+        for (i, penalty) in penalties.iter().enumerate() {
+            scored_memories[i].final_score -= penalty;
+        }
+        // Re-sort after inhibition reweighting
+        scored_memories.sort_by(|a, b| b.final_score.total_cmp(&a.final_score));
+    }
+
+    // Step 7: Apply limit. Default = query.max_results, which makes the graph leg a
+    // ~10-candidate leg fused against ~100-candidate vector/BM25 legs — reachable gold
+    // ranked 11+ by the leg's internal scoring never reaches fusion at all (funnel:
+    // graph leg emits ~51% of 98%-reachable gold). SHODH_GRAPH_LEG_K widens the leg's
+    // exit gate without changing scoring (unlike reach_inject, which flooded the leg
+    // with threshold-free reachability and measured harmful). Default unset → unchanged.
+    let graph_leg_k = std::env::var("SHODH_GRAPH_LEG_K")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&k| k > 0)
+        .unwrap_or(query.max_results);
+    scored_memories.truncate(graph_leg_k);
 
     stats.retrieval_time_us = start_time.elapsed().as_micros() as u64;
 
@@ -802,6 +1816,20 @@ pub fn spreading_activation_retrieve_with_stats(
     traversed_edges.sort();
     traversed_edges.dedup();
     stats.traversed_edges = traversed_edges;
+
+    // Hebbian reinforcement: strengthen edges traversed during spreading activation
+    // Other traversal methods (traverse_from_entity, traverse_weighted, traverse_bidirectional)
+    // all call batch_strengthen_synapses — spreading activation should too.
+    // SHODH_RECALL_READONLY gate: this is a graph-leg mutation, so read-only
+    // recall (eval repeats) must skip it exactly like the access-count and
+    // coactivation writes in mod.rs do — the traversed-edge STATS are still
+    // collected above (`stats.traversed_edges`) so diagnostics are unaffected,
+    // only the persistent strength MUTATION is skipped.
+    if !stats.traversed_edges.is_empty() && !recall_readonly() {
+        if let Err(e) = graph.batch_strengthen_synapses(&stats.traversed_edges) {
+            tracing::debug!("Spreading activation edge strengthening failed: {}", e);
+        }
+    }
 
     tracing::info!(
         "🎯 Returning {} memories (top scores: {:?}), {} edges traversed",
@@ -860,6 +1888,50 @@ fn calculate_linguistic_match(memory: &Memory, analysis: &QueryAnalysis) -> f32 
     }
 }
 
+/// Calculate lateral inhibition penalties for scored memories.
+///
+/// Implements cortical winner-take-all dynamics: for each memory (starting from rank 2),
+/// compute inhibitory signal from all higher-ranked memories based on embedding similarity.
+/// If similarity exceeds threshold, the lower-ranked memory receives a penalty proportional
+/// to the higher-ranked memory's score.
+///
+/// Total penalty per memory is capped at 50% of its original score to prevent over-suppression.
+///
+/// Reference: Rumelhart & Zipser (1985) "Feature discovery by competitive learning"
+fn calculate_lateral_inhibition(scored: &[ActivatedMemory]) -> Vec<f32> {
+    use crate::constants::{GRAPH_LATERAL_INHIBITION_STRENGTH, GRAPH_LATERAL_INHIBITION_THRESHOLD};
+
+    let mut penalties = vec![0.0f32; scored.len()];
+
+    // For each memory, check similarity to all higher-ranked memories
+    for i in 1..scored.len() {
+        let emb_i = match &scored[i].memory.experience.embeddings {
+            Some(e) => e,
+            None => continue,
+        };
+
+        let mut total_penalty = 0.0f32;
+
+        for prev in &scored[..i] {
+            let emb_j = match &prev.memory.experience.embeddings {
+                Some(e) => e,
+                None => continue,
+            };
+
+            let sim = cosine_similarity(emb_i, emb_j);
+            if sim > GRAPH_LATERAL_INHIBITION_THRESHOLD {
+                // Higher-ranked memory suppresses this one proportional to similarity
+                total_penalty += prev.final_score * GRAPH_LATERAL_INHIBITION_STRENGTH * sim;
+            }
+        }
+
+        // Cap penalty at 50% of original score to prevent over-suppression
+        penalties[i] = total_penalty.min(scored[i].final_score * 0.5);
+    }
+
+    penalties
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -877,6 +1949,207 @@ mod tests {
         let a = vec![1.0, 1.0];
         let b = vec![1.0, 1.0];
         assert!((cosine_similarity(&a, &b) - 1.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn ppr_node_specificity_favors_rare_seed() {
+        // HippoRAG node specificity: a rare seed (low mention_count) should steer more
+        // restart mass into its subtree than a ubiquitous hub seed of equal raw
+        // activation. Build two disjoint one-hop subtrees — hub→target_h, rare→target_r
+        // — seed both roots equally, and compare the target masses with specificity
+        // off vs on. Off ⇒ symmetric (equal mass); on ⇒ target_r outranks target_h.
+        use crate::graph_memory::{
+            EdgeTier, EntityLabel, EntityNode, GraphMemory, LtpStatus, RelationType,
+            RelationshipEdge,
+        };
+        use chrono::Utc;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let graph = GraphMemory::new(temp_dir.path(), None).unwrap();
+
+        let mk_entity = |name: &str| EntityNode {
+            uuid: Uuid::new_v4(),
+            name: name.to_string(),
+            labels: vec![EntityLabel::Concept],
+            created_at: Utc::now(),
+            last_seen_at: Utc::now(),
+            mention_count: 1,
+            summary: String::new(),
+            attributes: std::collections::HashMap::new(),
+            name_embedding: None,
+            salience: 0.5,
+            is_proper_noun: false,
+            selectivity: None,
+            fine_type: None,
+        };
+
+        // add_entity forces mention_count=1 for a new entity and +1 on each re-add of
+        // the same name. Re-add "Hubword" five times → mention_count 5 (the frequent
+        // hub); "Rareword" once → mention_count 1 (the discriminative seed).
+        let mut hub = Uuid::nil();
+        for _ in 0..5 {
+            hub = graph.add_entity(mk_entity("Hubword")).unwrap();
+        }
+        let rare = graph.add_entity(mk_entity("Rareword")).unwrap();
+        let target_h = graph.add_entity(mk_entity("Targethub")).unwrap();
+        let target_r = graph.add_entity(mk_entity("Targetrare")).unwrap();
+        assert_eq!(graph.get_entity(&hub).unwrap().unwrap().mention_count, 5);
+        assert_eq!(graph.get_entity(&rare).unwrap().unwrap().mention_count, 1);
+
+        let mk_edge = |from: Uuid, to: Uuid| RelationshipEdge {
+            uuid: Uuid::new_v4(),
+            from_entity: from,
+            to_entity: to,
+            relation_type: RelationType::RelatedTo,
+            strength: 0.8,
+            created_at: Utc::now(),
+            valid_at: Utc::now(),
+            invalidated_at: None,
+            source_episode_id: None,
+            context: String::new(),
+            last_activated: Utc::now(),
+            activation_count: 1,
+            ltp_status: LtpStatus::None,
+            activation_timestamps: None,
+            tier: EdgeTier::L2Episodic,
+            entity_confidence: None,
+            forman_curvature: None,
+            endpoint_selectivity: None,
+            provenance: Vec::new(),
+        };
+        graph.add_relationship(mk_edge(hub, target_h)).unwrap();
+        graph.add_relationship(mk_edge(rare, target_r)).unwrap();
+
+        let mut seeds = HashMap::new();
+        seeds.insert(hub, 1.0_f32);
+        seeds.insert(rare, 1.0_f32);
+
+        let (off, _, _) = personalized_pagerank(&graph, &seeds, None, false, false, None).unwrap();
+        let (on, _, _) = personalized_pagerank(&graph, &seeds, None, false, true, None).unwrap();
+
+        let off_h = off.get(&target_h).copied().unwrap_or(0.0);
+        let off_r = off.get(&target_r).copied().unwrap_or(0.0);
+        let on_h = on.get(&target_h).copied().unwrap_or(0.0);
+        let on_r = on.get(&target_r).copied().unwrap_or(0.0);
+
+        // Without specificity the two symmetric subtrees receive equal mass.
+        assert!(
+            (off_h - off_r).abs() < 1e-6,
+            "no-specificity should be symmetric: target_h={off_h} target_r={off_r}"
+        );
+        // With specificity the rare seed's target outranks the hub seed's target, and
+        // gains mass relative to the unweighted baseline.
+        assert!(
+            on_r > on_h,
+            "specificity should favor the rare seed: target_r={on_r} target_h={on_h}"
+        );
+        assert!(
+            on_r > off_r,
+            "rare target should gain mass under specificity: on={on_r} off={off_r}"
+        );
+    }
+
+    #[test]
+    fn ppr_passage_nodes_rank_bridge_episode_first() {
+        // HippoRAG 2 unified phrase+passage PPR: an episode containing BOTH the
+        // seed entity and its relation neighbor (a bridge passage) must collect
+        // more stationary mass than an episode touching the seed alone, and
+        // entity→entity spreading must survive the added passage fan-out.
+        use crate::graph_memory::{
+            EdgeTier, EntityLabel, EntityNode, EpisodeSource, EpisodicNode, GraphMemory, LtpStatus,
+            RelationType, RelationshipEdge,
+        };
+        use chrono::Utc;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let graph = GraphMemory::new(temp_dir.path(), None).unwrap();
+
+        let mk_entity = |name: &str| EntityNode {
+            uuid: Uuid::new_v4(),
+            name: name.to_string(),
+            labels: vec![EntityLabel::Concept],
+            created_at: Utc::now(),
+            last_seen_at: Utc::now(),
+            mention_count: 1,
+            summary: String::new(),
+            attributes: std::collections::HashMap::new(),
+            name_embedding: None,
+            salience: 0.5,
+            is_proper_noun: false,
+            selectivity: None,
+            fine_type: None,
+        };
+        let a = graph.add_entity(mk_entity("Alphaword")).unwrap();
+        let b = graph.add_entity(mk_entity("Betaword")).unwrap();
+        graph
+            .add_relationship(RelationshipEdge {
+                uuid: Uuid::new_v4(),
+                from_entity: a,
+                to_entity: b,
+                relation_type: RelationType::RelatedTo,
+                strength: 0.8,
+                created_at: Utc::now(),
+                valid_at: Utc::now(),
+                invalidated_at: None,
+                source_episode_id: None,
+                context: String::new(),
+                last_activated: Utc::now(),
+                activation_count: 1,
+                ltp_status: LtpStatus::None,
+                activation_timestamps: None,
+                tier: EdgeTier::L2Episodic,
+                entity_confidence: None,
+                forman_curvature: None,
+                endpoint_selectivity: None,
+                provenance: Vec::new(),
+            })
+            .unwrap();
+
+        let mk_episode = |name: &str, refs: Vec<Uuid>| EpisodicNode {
+            uuid: Uuid::new_v4(),
+            name: name.to_string(),
+            content: format!("{name} content"),
+            valid_at: Utc::now(),
+            created_at: Utc::now(),
+            entity_refs: refs,
+            source: EpisodeSource::Message,
+            metadata: std::collections::HashMap::new(),
+        };
+        let ep_bridge = mk_episode("bridge", vec![a, b]);
+        let ep_solo = mk_episode("solo", vec![a]);
+        let bridge_id = ep_bridge.uuid;
+        let solo_id = ep_solo.uuid;
+        graph.add_episode(ep_bridge).unwrap();
+        graph.add_episode(ep_solo).unwrap();
+
+        let mut seeds = HashMap::new();
+        seeds.insert(a, 1.0_f32);
+
+        // Flag off: no passage map.
+        let (_, no_passages, _) =
+            personalized_pagerank(&graph, &seeds, None, false, false, None).unwrap();
+        assert!(no_passages.is_empty(), "passages off must return empty map");
+
+        let (entities, passages, _) =
+            personalized_pagerank(&graph, &seeds, None, false, false, Some(0.5)).unwrap();
+
+        let bridge_mass = passages.get(&bridge_id).copied().unwrap_or(0.0);
+        let solo_mass = passages.get(&solo_id).copied().unwrap_or(0.0);
+        assert!(
+            bridge_mass > solo_mass && solo_mass > 0.0,
+            "bridge episode (fed by both entities) must outrank the solo episode: \
+             bridge={bridge_mass} solo={solo_mass}"
+        );
+        // Max-normalization: the top passage is exactly 1.0.
+        assert!(
+            (bridge_mass - 1.0).abs() < 1e-6,
+            "top passage mass should be max-normalized to 1.0, got {bridge_mass}"
+        );
+        // Entity spreading survives the passage fan-out: B retains mass.
+        assert!(
+            entities.get(&b).copied().unwrap_or(0.0) > 0.0,
+            "entity→entity spreading must survive passage interning"
+        );
     }
 
     #[test]
@@ -1266,5 +2539,173 @@ mod tests {
         // Should be less than typical initial activation
         // (IC_NOUN * (1 + SALIENCE_BOOST_FACTOR) = 2.3 * 2 = 4.6 max)
         assert!(min_threshold < 1.0);
+    }
+
+    /// Process-global lock for tests that manipulate `SHODH_RECALL_READONLY`.
+    /// `env::set_var`/`remove_var` are not thread-safe against concurrent
+    /// readers on other test threads (same pattern as `auth.rs`'s `ENV_LOCK`).
+    static RECALL_READONLY_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Regression test for the measurement-integrity bug: spreading activation's
+    /// Hebbian reinforcement (`graph.batch_strengthen_synapses` on the traversed
+    /// edges) ran unconditionally, never checking `SHODH_RECALL_READONLY`. Every
+    /// "read-only" eval query still strengthened the edges it traversed, so
+    /// repeat N+1 of the same query saw different (stronger) edges than repeat
+    /// N purely from having been queried once already — a same-system A/B
+    /// confound the eval harness's read-only gate exists specifically to
+    /// prevent (see `recall_readonly()`'s doc comment in `memory/mod.rs`).
+    ///
+    /// Asserts: under the flag, two recall passes leave the traversed edge's
+    /// strength byte-identical; with the flag unset (production default), the
+    /// same edge strengthens, proving the feature itself is untouched.
+    #[test]
+    fn spreading_activation_readonly_gate_skips_hebbian_strengthening() {
+        use crate::graph_memory::{
+            EdgeTier, EntityLabel, EntityNode, GraphMemory, LtpStatus, RelationType,
+            RelationshipEdge,
+        };
+        use chrono::Utc;
+
+        let _env_guard = RECALL_READONLY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // Defensive reset (matches auth.rs's `clear_auth_env` idiom): don't
+        // trust a prior test's cleanup, since `recall_readonly()` re-reads the
+        // env on every call rather than caching it.
+        std::env::remove_var("SHODH_RECALL_READONLY");
+
+        struct StubEmbedder;
+        impl crate::embeddings::Embedder for StubEmbedder {
+            fn encode(&self, _text: &str) -> Result<Vec<f32>> {
+                Ok(vec![0.1, 0.2, 0.3, 0.4])
+            }
+            fn dimension(&self) -> usize {
+                4
+            }
+        }
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let graph = GraphMemory::new(temp_dir.path(), None).unwrap();
+
+        let mk_entity = |name: &str| EntityNode {
+            uuid: Uuid::new_v4(),
+            name: name.to_string(),
+            labels: vec![EntityLabel::Concept],
+            created_at: Utc::now(),
+            last_seen_at: Utc::now(),
+            mention_count: 1,
+            summary: String::new(),
+            attributes: HashMap::new(),
+            name_embedding: None,
+            salience: 1.0,
+            is_proper_noun: false,
+            selectivity: None,
+            fine_type: None,
+        };
+        let widget = graph.add_entity(mk_entity("widget")).unwrap();
+        let gadget = graph.add_entity(mk_entity("gadget")).unwrap();
+
+        let now = Utc::now();
+        // `add_relationship` overwrites `edge.uuid` with a fresh UUID on
+        // insert (graph_memory.rs) — capture the UUID it actually assigned
+        // rather than trusting the one passed in.
+        let edge_uuid = graph
+            .add_relationship(RelationshipEdge {
+                uuid: Uuid::new_v4(),
+                from_entity: widget,
+                to_entity: gadget,
+                relation_type: RelationType::RelatedTo,
+                strength: 0.5,
+                created_at: now,
+                valid_at: now,
+                invalidated_at: None,
+                source_episode_id: None,
+                context: String::new(),
+                last_activated: now,
+                activation_count: 1,
+                ltp_status: LtpStatus::None,
+                activation_timestamps: None,
+                tier: EdgeTier::L2Episodic,
+                entity_confidence: None,
+                forman_curvature: None,
+                endpoint_selectivity: None,
+                provenance: Vec::new(),
+            })
+            .unwrap();
+
+        let strength_of = |g: &GraphMemory| -> f32 {
+            g.get_relationship(&edge_uuid)
+                .unwrap()
+                .expect("edge must still exist")
+                .strength
+        };
+
+        let query = Query {
+            query_text: Some("widget".to_string()),
+            ..Query::default()
+        };
+        let embedder = StubEmbedder;
+        let episode_to_memory = |_ep: &EpisodicNode| -> Result<Option<SharedMemory>> { Ok(None) };
+
+        let run_recall = || {
+            spreading_activation_retrieve_with_stats(
+                "widget",
+                &query,
+                &graph,
+                &embedder,
+                None,
+                None,
+                None,
+                episode_to_memory,
+            )
+        };
+
+        // Sanity: the graph leg must actually traverse the widget->gadget edge,
+        // or the assertions below would hold vacuously (nothing to strengthen).
+        let (_, sanity_stats) = run_recall().expect("sanity recall");
+        assert!(
+            sanity_stats.traversed_edges.contains(&edge_uuid),
+            "spreading activation must traverse the seeded edge for this test \
+             to exercise the Hebbian-strengthening gate; traversed={:?}",
+            sanity_stats.traversed_edges
+        );
+
+        // --- SHODH_RECALL_READONLY=1: two passes, byte-identical strength ---
+        std::env::set_var("SHODH_RECALL_READONLY", "1");
+
+        let strength_ro_0 = strength_of(&graph);
+        run_recall().expect("recall #1 (read-only)");
+        let strength_ro_1 = strength_of(&graph);
+        run_recall().expect("recall #2 (read-only)");
+        let strength_ro_2 = strength_of(&graph);
+
+        assert_eq!(
+            strength_ro_0.to_bits(),
+            strength_ro_1.to_bits(),
+            "SHODH_RECALL_READONLY=1 must leave edge strength byte-identical \
+             after recall #1 (got {strength_ro_0} -> {strength_ro_1}) — this is \
+             the graph-leg Hebbian-strengthening leak this test guards against"
+        );
+        assert_eq!(
+            strength_ro_1.to_bits(),
+            strength_ro_2.to_bits(),
+            "SHODH_RECALL_READONLY=1 must leave edge strength byte-identical \
+             after recall #2 (got {strength_ro_1} -> {strength_ro_2})"
+        );
+
+        // --- production default (flag unset): strengthening still happens ---
+        std::env::remove_var("SHODH_RECALL_READONLY");
+
+        let strength_prod_0 = strength_of(&graph);
+        run_recall().expect("recall #3 (production default)");
+        let strength_prod_1 = strength_of(&graph);
+
+        assert!(
+            strength_prod_1 > strength_prod_0,
+            "flag unset (production default) must still strengthen the \
+             traversed edge (Hebbian learning), got {strength_prod_0} -> {strength_prod_1}"
+        );
+
+        std::env::remove_var("SHODH_RECALL_READONLY");
     }
 }

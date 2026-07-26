@@ -1,14 +1,14 @@
 [package]
 name = "shodh-memory"
-version = "0.1.81"
+version = "0.2.0"
 edition = "2021"
 authors = ["Shodh Team <29.varuns@gmail.com>"]
-description = "Persistent memory for AI agents and edge devices - 3-tier memory, Hebbian learning, knowledge graph. Single binary, runs offline."
+description = "Persistent cognitive memory for AI agents and robots — Hebbian learning, knowledge graph, spatial recall. Zenoh/ROS2 native. Single binary, runs offline."
 license = "Apache-2.0"
 repository = "https://github.com/varun29ankuS/shodh-memory"
 homepage = "https://github.com/varun29ankuS/shodh-memory"
 readme = "README-rust.md"
-keywords = ["memory", "ai", "llm", "embedding", "cognitive"]
+keywords = ["memory", "ai", "robotics", "zenoh", "cognitive"]
 categories = ["science", "database", "embedded"]
 exclude = [
     "mcp-server/",
@@ -28,6 +28,7 @@ exclude = [
     "*.py",
     "*.log",
     "*.json",
+    "!src/entity_type/entity-type-schema.json",
     "!Cargo.lock",
     "job_log.txt",
     "macos_log.txt",
@@ -62,14 +63,18 @@ exclude = [
     "pyproject.toml",
     "C*facts_out.json",
     "tui/",
-    "shodh-telegram/",
-    "shodh-todoist/",
-    "shodh-whatsapp/",
     "signature.JPG",
     "start_server.bat",
     "*.ts",
     "*.patch",
+    "*.diff",
+    "*.png",
+    "!src/**",
     "scripts/",
+    "clippy_output.txt",
+    "C*clippy_out.txt",
+    ".smithery/",
+    "drafts/",
 ]
 
 [lib]
@@ -85,9 +90,17 @@ path = "src/main.rs"
 
 [[bin]]
 name = "shodh"
-path = "src/mcp.rs"
+path = "src/cli.rs"
+
+[[bin]]
+name = "recall-eval"
+path = "src/bin/recall_eval.rs"
 
 [dependencies]
+# Vendored pure-Rust spaCy pipeline (dependency-head parser + POS + lemma) for
+# entity-resolution span-cleaning. Native, no external fetch. Model bundle loaded
+# at runtime from SHODH_SPACY_MODEL_PATH (asset not committed, like GLiNER/MiniLM).
+spacy-rusty = { path = "crates/spacy-rusty" }
 # MCP Protocol
 rmcp = { version = "0.12", features = ["server", "macros", "transport-io"] }
 clap = { version = "4.5", features = ["derive", "env"] }
@@ -102,6 +115,7 @@ dotenvy = "0.15"  # Load .env files
 # Async runtime & web server
 tokio = { version = "1.48", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["sync"] }  # SSE event streaming (sync for BroadcastStream)
+tokio-util = { version = "0.7", features = ["rt"] }  # TaskTracker for graceful shutdown of background tasks
 futures = "0.3"  # Stream utilities for SSE
 axum = { version = "0.8", features = ["json", "ws"] }
 tower = { version = "0.5", features = ["limit", "buffer", "load-shed"] }
@@ -110,9 +124,11 @@ tower_governor = { version = "0.8", features = ["axum"] }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+serde_json = { version = "1.0", features = ["raw_value"] }
+form_urlencoded = "1"
 
 # Storage
+postcard = { version = "1", features = ["alloc"] }
 bincode = { version = "2", features = ["serde"] }
 bincode1 = { package = "bincode", version = "1.3" }  # Legacy format support for pre-2.0 memories
 rmp-serde = "1.3"  # MessagePack - binary format that supports serde tagged enums
@@ -183,6 +199,7 @@ aes-gcm = "0.10"
 
 # External integrations (SHO-40)
 hmac = "0.12"
+subtle = "2.6"
 reqwest = { version = "0.12", default-features = false, features = ["json", "blocking", "rustls-tls"] }
 
 # Auto-download for models and ONNX runtime
@@ -195,6 +212,10 @@ tar = "0.4"
 # NOTE: pyo3 >= 0.24.1 required for RUSTSEC-2025-0020 (buffer overflow fix)
 pyo3 = { version = "0.24", features = ["extension-module", "abi3-py38"], optional = true }
 numpy = { version = "0.24", optional = true }
+
+# Zenoh transport for robotics (optional — pure Rust, zero C deps)
+# Enables pub/sub + request/reply integration with ROS2 via rmw_zenoh or zenoh-bridge-ros2dds
+zenoh = { version = "1.1", default-features = false, features = ["transport_tcp", "transport_udp"], optional = true }
 
 # LLM-based query parsing (optional - heavy dependency)
 
@@ -247,10 +268,6 @@ harness = false
 name = "hebbian_benchmarks"
 harness = false
 
-[[bench]]
-name = "softmax_benchmarks"
-harness = false
-
 [profile.release]
 opt-level = 3
 lto = true
@@ -276,6 +293,9 @@ python = ["pyo3", "numpy"]
 # Optional: LLM-based query parser (future: requires API key)
 llm-parser = []
 
+# Optional: Zenoh transport for robotics/ROS2 (pure Rust, cross-platform)
+zenoh = ["dep:zenoh"]
+
 # Optional: Distributed tracing for cloud/multi-node deployments (~200 extra packages)
 telemetry = [
     "tracing-opentelemetry",
@@ -296,6 +316,18 @@ rocksdb = { version = "0.24", default-features = false, features = ["lz4", "jema
 # Fundamental fix requires facebook/rocksdb#14403 (custom allocator C API for mimalloc).
 [target.'cfg(windows)'.dependencies]
 rocksdb = { version = "0.24", default-features = false, features = ["lz4"] }
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [workspace]
 # Standalone workspace - not part of parent kalki-v2
+members = ["crates/spacy-rusty"]

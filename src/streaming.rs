@@ -109,19 +109,15 @@ pub fn content_hash(content: &str) -> u64 {
 /// Stream processing modes - determines extraction behavior
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum StreamMode {
     /// Agent-user dialogue - extract semantic concepts, entities, decisions
+    #[default]
     Conversation,
     /// IoT/robotics sensor data - aggregate readings, detect anomalies
     Sensor,
     /// Discrete system events - logs, errors, state changes
     Event,
-}
-
-impl Default for StreamMode {
-    fn default() -> Self {
-        StreamMode::Conversation
-    }
 }
 
 /// Configuration for automatic memory extraction from streams
@@ -835,6 +831,15 @@ impl StreamingMemoryExtractor {
                 severity,
                 data,
             } => {
+                // Release the outer write guard before re-acquiring below.
+                // `tokio::sync::RwLock` is NOT reentrant, so holding the
+                // `sessions.write()` taken at the top of this method while this
+                // arm calls `sessions.read()`/`sessions.write()` again
+                // self-deadlocks (the Content/Flush/Close arms drop it for the
+                // same reason). `session.touch()` above already recorded
+                // activity; the buffer write below re-locks and re-fetches.
+                drop(sessions);
+
                 // Check if this event type triggers immediate extraction
                 let is_trigger = {
                     let sessions = self.sessions.read().await;
@@ -890,6 +895,11 @@ impl StreamingMemoryExtractor {
                 timestamp,
                 units,
             } => {
+                // Release the outer write guard before re-acquiring below — the
+                // non-reentrant RwLock would otherwise self-deadlock (see the
+                // Event arm). `session.touch()` above already recorded activity.
+                drop(sessions);
+
                 // Format sensor reading as content
                 let mut parts: Vec<String> = Vec::new();
                 for (key, value) in &values {
@@ -1295,7 +1305,13 @@ impl StreamingMemoryExtractor {
                     max_results,
                     ..Default::default()
                 };
-                let results = memory_guard.recall(&query).unwrap_or_default();
+                let results = match memory_guard.recall(&query) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        tracing::error!("Stream recall failed: {e}");
+                        return Vec::new();
+                    }
+                };
 
                 // Use scores from unified 5-layer pipeline (PIPE-9: feedback now in pipeline)
                 // Recall already applies: RRF fusion + hebbian + recency + feedback
@@ -1568,6 +1584,7 @@ mod tests {
             confidence: 0.95,
             start: 0,
             end: 9,
+            fine_label: None,
         };
 
         let detected = DetectedEntity::from(&ner_entity);

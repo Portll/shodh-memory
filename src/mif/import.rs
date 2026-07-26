@@ -261,6 +261,8 @@ pub fn import_graph_entities(kg: &MifKnowledgeGraph, graph: &GraphMemory) -> (us
             name_embedding: None,
             salience: 0.5,
             is_proper_noun: true,
+            selectivity: None,
+            fine_type: entity.fine_type.clone(),
         };
 
         match graph.add_entity(node) {
@@ -335,6 +337,9 @@ pub fn import_graph_relationships(
             tier,
             activation_timestamps: None,
             entity_confidence: rel.confidence,
+            forman_curvature: None,
+            endpoint_selectivity: None,
+            provenance: Vec::new(),
         };
 
         match graph.add_relationship(edge) {
@@ -447,6 +452,31 @@ fn parse_entity_label(s: &str) -> EntityLabel {
         "product" => EntityLabel::Product,
         "skill" => EntityLabel::Skill,
         "keyword" => EntityLabel::Keyword,
+        "project" => EntityLabel::Project,
+        "task" => EntityLabel::Task,
+        "document" => EntityLabel::Document,
+        "repository" => EntityLabel::Repository,
+        "service" => EntityLabel::Service,
+        "database" => EntityLabel::Database,
+        "metric" => EntityLabel::Metric,
+        "configuration" => EntityLabel::Configuration,
+        "environment" => EntityLabel::Environment,
+        "pipeline" => EntityLabel::Pipeline,
+        "team" => EntityLabel::Team,
+        "role" => EntityLabel::Role,
+        "module" => EntityLabel::Module,
+        "norp" => EntityLabel::Norp,
+        "gpe" => EntityLabel::Gpe,
+        "facility" => EntityLabel::Facility,
+        "vehicle" => EntityLabel::Vehicle,
+        "weapon" => EntityLabel::Weapon,
+        "work" => EntityLabel::Work,
+        "law" => EntityLabel::Law,
+        "title" => EntityLabel::Title,
+        "cyber" => EntityLabel::Cyber,
+        "money" => EntityLabel::Money,
+        "quantity" => EntityLabel::Quantity,
+        "time" => EntityLabel::Time,
         other => EntityLabel::Other(other.to_string()),
     }
 }
@@ -473,6 +503,21 @@ pub(crate) fn parse_relation_type(s: &str) -> RelationType {
         "associated_with" | "associatedwith" => RelationType::AssociatedWith,
         "co_retrieved" | "coretrieved" => RelationType::CoRetrieved,
         "co_occurs" | "cooccurs" => RelationType::CoOccurs,
+        "manages" => RelationType::Manages,
+        "depends_on" | "dependson" => RelationType::DependsOn,
+        "requires" => RelationType::Requires,
+        "configures" => RelationType::Configures,
+        "prefers" => RelationType::Prefers,
+        "recommends" => RelationType::Recommends,
+        "documents" => RelationType::Documents,
+        "implements" => RelationType::Implements,
+        "deploys_to" | "deploysto" => RelationType::DeploysTo,
+        "monitors" => RelationType::Monitors,
+        "triggers" => RelationType::Triggers,
+        "superseded_by" | "supersededby" => RelationType::SupersededBy,
+        "alternative_to" | "alternativeto" => RelationType::AlternativeTo,
+        "assigned_to" | "assignedto" => RelationType::AssignedTo,
+        "approves" => RelationType::Approves,
         other => RelationType::Custom(other.to_string()),
     }
 }

@@ -4,23 +4,30 @@
 
 <h1 align="center">Shodh-Memory</h1>
 
-<p align="center"><b>Your AI agent remembers what matters, forgets what doesn't, and gets smarter the more you use it.</b></p>
+<p align="center"><b>Persistent cognitive memory for AI agents and robots — with no LLM in the loop. Remembers what matters, forgets what doesn't, gets smarter with use.</b></p>
 
 <p align="center">
   <a href="https://github.com/varun29ankuS/shodh-memory/actions"><img src="https://github.com/varun29ankuS/shodh-memory/workflows/CI/badge.svg" alt="build"></a>
   <a href="https://registry.modelcontextprotocol.io/v0/servers?search=shodh"><img src="https://img.shields.io/badge/MCP-Registry-green" alt="MCP Registry"></a>
+  <a href="https://cursor.directory/plugins/shodh-memory-1"><img src="https://img.shields.io/badge/Cursor-Directory-black?logo=cursor" alt="Cursor Directory"></a>
   <a href="https://crates.io/crates/shodh-memory"><img src="https://img.shields.io/crates/v/shodh-memory.svg" alt="crates.io"></a>
   <a href="https://www.npmjs.com/package/@shodh/memory-mcp"><img src="https://img.shields.io/npm/v/@shodh/memory-mcp.svg?logo=npm" alt="npm"></a>
   <a href="https://pypi.org/project/shodh-memory/"><img src="https://img.shields.io/pypi/v/shodh-memory.svg" alt="PyPI"></a>
   <a href="https://hub.docker.com/r/varunshodh/shodh-memory"><img src="https://img.shields.io/docker/pulls/varunshodh/shodh-memory.svg?logo=docker" alt="Docker"></a>
+  <a href="#robotics--ros2"><img src="https://img.shields.io/badge/Zenoh%20%2F%20ROS2-ready-orange" alt="Zenoh/ROS2"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-blue.svg" alt="License"></a>
+  <a href="https://discord.gg/HrpzXqTtEp"><img src="https://img.shields.io/discord/1471830549818642432?logo=discord&label=Discord&color=5865F2" alt="Discord"></a>
 </p>
 
 ---
 
-AI agents forget everything between sessions. They repeat mistakes, lose context, and treat every conversation like the first one.
+<p align="center">
+  <img src="https://raw.githubusercontent.com/varun29ankuS/shodh-memory/main/assets/Shodh_preview.gif" width="800" alt="Shodh-Memory Demo — Claude Code with persistent memory and TUI dashboard">
+</p>
 
-Shodh-Memory fixes this. It's persistent memory that actually learns — memories you use often become easier to find, old irrelevant context fades automatically, and recalling one thing brings back related things. No API keys. No cloud. No external databases. One binary.
+AI agents forget everything between sessions. Robots lose context between missions. They repeat mistakes, miss patterns, and treat every interaction like the first one.
+
+Shodh-Memory fixes this. It's persistent memory that actually learns — memories you use often become easier to find, old irrelevant context fades automatically, and recalling one thing brings back related things. Works for chat agents (MCP/HTTP), robots (Zenoh/ROS2), and edge devices. No API keys. No cloud. No external databases. **No LLM in the loop.** One binary.
 
 ## Why Not Just Use mem0 / Cognee / Zep?
 
@@ -32,19 +39,50 @@ Shodh-Memory fixes this. It's persistent memory that actually learns — memorie
 | Learns from usage | **Yes** (Hebbian) | No | No | No |
 | Forgets irrelevant data | **Yes** (decay) | No | No | Temporal only |
 | Runs fully offline | **Yes** | No | No | No |
+| Robotics / ROS2 native | **Yes** (Zenoh) | No | No | No |
 | Binary size | **~17MB** | pip install + API keys | pip install + API keys + Neo4j | Cloud only |
 
-Every other memory system delegates intelligence to LLM API calls — that's why they're slow, expensive, and can't work offline. Shodh uses algorithmic intelligence: local embeddings, mathematical decay, learned associations. No LLM in the loop.
+Every other memory system delegates intelligence to LLM API calls — that's why they're slow, expensive, and can't work offline.
+
+## No LLM in the Loop
+
+Storing a memory makes **zero LLM calls**. Recalling makes **zero LLM calls**. Entity extraction, relation typing, knowledge-graph construction, causal tracing, ranking, decay, consolidation — all of it runs locally as algorithms, not API round-trips:
+
+- **Local embeddings** — MiniLM (22MB, INT8) via ONNX Runtime, on-device semantic search
+- **Local NER** — GLiNER bi-edge-v2 span typer (ONNX, schema-driven: 141 fine / 18 coarse entity types), auto-downloaded on first run from the pinned release, with a rule-based fallback
+- **Typed relation extraction without an LLM** — directed lexical cues + exemplar-matched semantic typing build a typed knowledge graph (`LocatedIn`, `WorksAt`, `Causes`…) from plain text
+- **Causal lineage** — "what was the root cause of X?" is answered by walking typed causal edges backward through the graph, not by asking a model
+- **Mathematical memory dynamics** — Hebbian strengthening, exponential→power-law decay, spreading activation, long-term potentiation
+
+What that buys you: **fully offline** operation, **millisecond** latency instead of multi-second API calls, **zero inference cost** at any scale, **deterministic, testable** behavior, and **data that never leaves the machine**. Your agent's LLM does the reasoning — its memory doesn't need one.
 
 ## Get Started
 
-### Claude Code (one command)
+### Unified CLI
 
 ```bash
-claude mcp add shodh-memory -- npx -y @shodh/memory-mcp
+# Download from GitHub Releases (or brew tap varun29ankuS/shodh-memory && brew install shodh-memory)
+shodh init          # First-time setup — creates config, generates API key, downloads AI model
+shodh server        # Start the memory server on :3030
+shodh setup-hooks   # Print instructions to set up Claude Code hooks
+shodh tui           # Launch the TUI dashboard
+shodh status        # Check server health
+shodh doctor        # Diagnose issues
 ```
 
-That's it. The MCP server auto-downloads the backend binary and starts it. No Docker, no API keys, no configuration. Claude now has persistent memory across sessions.
+One binary, all functionality. No Docker, no API keys, no external dependencies.
+
+### Claude Code
+
+```bash
+# 1. Add the MCP server (auto-downloads the backend binary)
+claude mcp add shodh-memory -- npx -y @shodh/memory-mcp
+
+# 2. Enable automatic memory capture (optional but recommended)
+npx @shodh/memory-mcp setup-hooks
+```
+
+Step 1 gives Claude persistent memory tools. Step 2 installs [Claude Code hooks](https://docs.anthropic.com/en/docs/claude-code/hooks) that automatically capture context from every session — memories surface without you having to ask.
 
 <details>
 <summary>Or with Docker (for production / shared servers)</summary>
@@ -56,6 +94,14 @@ docker run -d -p 3030:3030 -v shodh-data:/data varunshodh/shodh-memory
 # 2. Add to Claude Code
 claude mcp add shodh-memory -- npx -y @shodh/memory-mcp
 ```
+</details>
+
+<details>
+<summary>Direct server mode (systemd / MCP / REST)</summary>
+
+For Linux users who want the Rust HTTP server supervised separately from MCP
+clients, see [Direct server mode with systemd](docs/direct-server-systemd.md).
+
 </details>
 
 <details>
@@ -123,7 +169,7 @@ Under the hood, memories flow through three tiers:
 
 ```
 Working Memory ──overflow──▶ Session Memory ──importance──▶ Long-Term Memory
-   (100 items)                  (500 MB)                      (RocksDB)
+   (100 items)                  (100 MB)                      (RocksDB)
 ```
 
 This is based on [Cowan's working memory model](https://doi.org/10.1177/0963721409359277) and [Wixted's memory decay research](https://doi.org/10.1111/j.1467-9280.2004.00687.x). The neuroscience isn't a gimmick — it's why the system gets better with use instead of just accumulating data.
@@ -132,40 +178,35 @@ This is based on [Cowan's working memory model](https://doi.org/10.1177/09637214
 
 | Operation | Latency |
 |-----------|---------|
-| Store memory | 55-60ms |
+| Store memory (API response) | <200ms |
+| Store memory (core) | 55-60ms |
 | Semantic search | 34-58ms |
 | Tag search | ~1ms |
 | Entity lookup | 763ns |
 | Graph traversal (3-hop) | 30µs |
 
-Single 17MB binary. No GPU required. Runs on a $5 VPS.
+Single binary. No GPU required. Content-hash dedup ensures identical memories are never stored twice.
 
-## TUI Dashboard
-
-```bash
-shodh-tui
-```
-
-<p align="center">
-  <img src="https://raw.githubusercontent.com/varun29ankuS/shodh-memory/main/assets/dashboard.jpg" width="700" alt="Shodh Dashboard">
-</p>
-
-<p align="center"><i>Real-time activity feed, memory tiers, and detailed inspection</i></p>
-
-<p align="center">
-  <img src="https://raw.githubusercontent.com/varun29ankuS/shodh-memory/main/assets/graph-map.jpg" width="700" alt="Shodh Graph Map">
-</p>
-
-<p align="center"><i>Knowledge graph — entity connections strengthened through use</i></p>
-
-## 47 MCP Tools
+## 51 MCP Tools
 
 Full list of tools available to Claude, Cursor, and other MCP clients:
 
 <details>
 <summary>Memory</summary>
 
-`remember` · `recall` · `proactive_context` · `context_summary` · `list_memories` · `read_memory` · `forget` · `reinforce`
+`remember` · `recall` · `recall_by_tags` · `proactive_context` · `context_summary` · `list_memories` · `read_memory` · `forget`
+</details>
+
+<details>
+<summary>Search & Insight</summary>
+
+`quick_recall` · `query` · `topic` · `what_i_know` · `recent_memories` · `pending_work` · `count` · `memory_health` · `session_summary`
+</details>
+
+<details>
+<summary>Sessions & Facts</summary>
+
+`session_digest` · `session_history` · `fact_narratives` · `purge_facts`
 </details>
 
 <details>
@@ -216,6 +257,91 @@ curl -X POST http://localhost:3030/api/recall \
 ```
 </details>
 
+## Robotics & ROS2
+
+Shodh-Memory isn't just for chat agents. It's persistent memory for robots — Spot, drones, humanoids, any system running ROS2 or Zenoh. No cloud, survives power cycles, learns from rewards, speaks Zenoh natively.
+
+```bash
+# Enable Zenoh transport (compile with --features zenoh)
+SHODH_ZENOH_ENABLED=true SHODH_ZENOH_LISTEN=tcp/0.0.0.0:7447 shodh server
+
+# ROS2 robots connect via zenoh-bridge-ros2dds or rmw_zenoh — zero code changes
+ros2 run zenoh_bridge_ros2dds zenoh_bridge_ros2dds
+```
+
+See [Robotics Quickstart](docs/robotics-quickstart.md) for full setup and examples.
+
+**What robots can do over Zenoh:**
+
+| Operation | Key Expression | Description |
+|-----------|---------------|-------------|
+| Remember | `shodh/{user_id}/remember` | Store with GPS, local position, heading, sensor data, mission context |
+| Recall | `shodh/{user_id}/recall` | Spatial search (haversine), mission replay, action-outcome filtering |
+| Stream | `shodh/{user_id}/stream/sensor` | Auto-remember high-frequency sensor data via extraction pipeline |
+| Mission | `shodh/{user_id}/mission/start` | Track mission boundaries, searchable across missions |
+| Fleet | `shodh/fleet/**` | Automatic peer discovery via Zenoh liveliness tokens |
+
+Each robot uses its own `user_id` as the key segment (e.g., `shodh/spot-1/remember`). The `robot_id` is an optional payload field for fleet grouping.
+
+Every Experience carries 26 robotics-specific fields: `geo_location`, `local_position`, `heading`, `sensor_data`, `robot_id`, `mission_id`, `action_type`, `reward`, `terrain_type`, `nearby_agents`, `decision_context`, `action_params`, `outcome_type`, `confidence`, failure/anomaly tracking, recovery actions, and prediction learning.
+
+<details>
+<summary>Zenoh remember example (robot publishing a memory)</summary>
+
+```json
+{
+  "user_id": "spot-1",
+  "content": "Detected crack in concrete at waypoint alpha",
+  "robot_id": "spot_v2",
+  "mission_id": "building_inspection_2026",
+  "geo_location": [37.7749, -122.4194, 10.0],
+  "local_position": [12.5, 3.2, 0.0],
+  "heading": 90.0,
+  "sensor_data": {"battery": 72.5, "temperature": 28.3},
+  "action_type": "inspect",
+  "reward": 0.9,
+  "terrain_type": "indoor",
+  "tags": ["crack", "concrete", "structural"]
+}
+```
+</details>
+
+<details>
+<summary>Zenoh spatial recall example (robot querying nearby memories)</summary>
+
+```json
+{
+  "user_id": "spot-1",
+  "query": "structural damage near entrance",
+  "mode": "spatial",
+  "lat": 37.7749,
+  "lon": -122.4194,
+  "radius_meters": 50.0,
+  "mission_id": "building_inspection_2026"
+}
+```
+</details>
+
+<details>
+<summary>Environment variables</summary>
+
+```bash
+SHODH_ZENOH_ENABLED=true                # Enable Zenoh transport
+SHODH_ZENOH_MODE=peer                   # peer | client | router
+SHODH_ZENOH_LISTEN=tcp/0.0.0.0:7447    # Listen endpoints
+SHODH_ZENOH_CONNECT=tcp/1.2.3.4:7447   # Connect endpoints
+SHODH_ZENOH_PREFIX=shodh               # Key expression prefix
+
+# Auto-subscribe to ROS2 topics (via zenoh-bridge-ros2dds)
+SHODH_ZENOH_AUTO_TOPICS='[
+  {"key_expr": "rt/spot1/status", "user_id": "spot-1", "mode": "sensor"},
+  {"key_expr": "rt/nav/events", "user_id": "spot-1", "mode": "event"}
+]'
+```
+</details>
+
+Works with ROS2 Kilted (rmw_zenoh), PX4 drones, Boston Dynamics Spot, humanoids — anything that speaks Zenoh or ROS2 DDS.
+
 ## Platform Support
 
 Linux x86_64 · Linux ARM64 · macOS Apple Silicon · macOS Intel · Windows x86_64
@@ -231,11 +357,21 @@ SHODH_API_KEYS=key1,key2,key3     # Comma-separated API keys
 SHODH_HOST=127.0.0.1              # Bind address (default: localhost)
 SHODH_PORT=3030                   # Port (default: 3030)
 SHODH_MEMORY_PATH=/var/lib/shodh  # Data directory
+# SHODH_IPC_ENABLED=false         # Local IPC is enabled by default; false disables it
+# SHODH_IPC_ENDPOINT=/private/path/shodh-memory.sock  # Optional platform-specific override
+# SHODH_IPC_REQUIRED=true         # Fail closed instead of falling back to HTTP
 SHODH_REQUEST_TIMEOUT=60          # Request timeout in seconds
 SHODH_MAX_CONCURRENT=200          # Max concurrent requests
+SHODH_ROCKSDB_BLOCK_CACHE_MB=256  # Shared RocksDB block cache (MiB)
 SHODH_CORS_ORIGINS=https://app.example.com
 ```
 </details>
+
+The server enables authenticated local IPC by default and keeps HTTP available.
+Native `shodh serve` prefers the platform-default IPC endpoint and falls back to
+`SHODH_API_URL` unless fail-closed mode is enabled; the TypeScript MCP client uses IPC only when
+`SHODH_IPC_ENDPOINT` is set. See the [local IPC architecture](docs/architecture/07-local-ipc-transport.md)
+for platform defaults, security properties, and limitations.
 
 <details>
 <summary>Docker Compose with TLS</summary>
@@ -301,3 +437,5 @@ Apache 2.0
 <p align="center">
   <a href="https://registry.modelcontextprotocol.io/v0/servers?search=shodh">MCP Registry</a> · <a href="https://hub.docker.com/r/varunshodh/shodh-memory">Docker Hub</a> · <a href="https://pypi.org/project/shodh-memory/">PyPI</a> · <a href="https://www.npmjs.com/package/@shodh/memory-mcp">npm</a> · <a href="https://crates.io/crates/shodh-memory">crates.io</a> · <a href="https://www.shodh-memory.com">Docs</a>
 </p>
+
+<sub><i>Keywords: LLM-free memory · no LLM in the loop · local-first AI memory · offline agent memory · persistent memory for AI agents · long-term memory for LLM agents · MCP memory server · Claude Code memory · knowledge graph memory · hybrid vector + graph search · causal lineage · Hebbian learning · memory decay · edge AI memory · robotics memory · ROS2 / Zenoh robot memory · air-gapped RAG alternative</i></sub>

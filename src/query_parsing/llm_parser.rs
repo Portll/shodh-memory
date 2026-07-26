@@ -147,13 +147,15 @@ impl LlmParser {
             .map(|d| format!("Today's date: {}", d.format("%B %d, %Y")))
             .unwrap_or_else(|| "Today's date: unknown".to_string());
 
+        let safe_query = query.replace('"', "\\\"").replace('\n', " ");
+
         format!(
             r#"You are a query parser. Extract structured information from the query.
 Output ONLY valid JSON, no explanation or markdown.
 
 {date_context}
 
-Parse this query: "{query}"
+Parse this query: "{safe_query}"
 
 Output this exact JSON structure:
 {{"entities":[{{"text":"name","type":"person|place|thing|event|time","negated":false}}],"events":["verb"],"modifiers":["adjective"],"temporal":{{"has_temporal_intent":true,"intent":"when_question|specific_time|ordering|duration|none","relative_refs":[{{"text":"last year","resolved_date":"2024-01-01","direction":"past"}}],"resolved_dates":["2024-01-01"]}},"is_attribute_query":false,"attribute_entity":null,"attribute_name":null,"confidence":0.9}}"#
@@ -396,13 +398,16 @@ fn extract_json(output: &str) -> String {
     if let Some(start) = cleaned.find('{') {
         let mut depth = 0;
         let mut end = start;
-        for (i, c) in cleaned[start..].chars().enumerate() {
+        // Use char_indices so `i` is a BYTE offset. `chars().enumerate()` would
+        // yield a char COUNT, which is wrong for multi-byte UTF-8 — using it as
+        // a byte index can land mid-codepoint and panic the `[start..end]` slice.
+        for (i, c) in cleaned[start..].char_indices() {
             match c {
                 '{' => depth += 1,
                 '}' => {
                     depth -= 1;
                     if depth == 0 {
-                        end = start + i + 1;
+                        end = start + i + c.len_utf8();
                         break;
                     }
                 }
@@ -415,11 +420,16 @@ fn extract_json(output: &str) -> String {
     }
 }
 
-/// Simple stemming using rust_stemmers
+/// Simple stemming using rust_stemmers.
+///
+/// The `Stemmer` is cached per-thread — building one per call is avoidable work
+/// on the query-parsing path (`convert_llm_output` stems every entity/event).
 fn stem_word(word: &str) -> String {
     use rust_stemmers::{Algorithm, Stemmer};
-    let stemmer = Stemmer::create(Algorithm::English);
-    stemmer.stem(&word.to_lowercase()).to_string()
+    thread_local! {
+        static STEMMER: Stemmer = Stemmer::create(Algorithm::English);
+    }
+    STEMMER.with(|stemmer| stemmer.stem(&word.to_lowercase()).to_string())
 }
 
 /// Parse entity type string

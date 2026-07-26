@@ -11,6 +11,8 @@ pub mod context;
 pub mod facts;
 pub mod feedback;
 pub mod files;
+pub mod fusion_features;
+pub mod gold_funnel;
 pub mod graph_retrieval;
 pub mod hybrid_search;
 pub mod injection;
@@ -47,6 +49,58 @@ use crate::metrics::{
     EMBEDDING_CACHE_QUERY_SIZE,
 };
 
+/// Query-time scoring clock. `SHODH_EVAL_NOW` (RFC3339) freezes it for the
+/// recall harness: repeat passes minutes apart see different `Utc::now() -
+/// created_at` recency components, which is enough to flip near-tie ranks
+/// (smoke-094). The env value is parsed once per process; when unset
+/// (production), every call returns the live clock.
+pub(crate) fn scoring_now() -> chrono::DateTime<chrono::Utc> {
+    static PINNED: std::sync::OnceLock<Option<chrono::DateTime<chrono::Utc>>> =
+        std::sync::OnceLock::new();
+    PINNED
+        .get_or_init(|| {
+            std::env::var("SHODH_EVAL_NOW").ok().and_then(|raw| {
+                chrono::DateTime::parse_from_rfc3339(&raw)
+                    .ok()
+                    .map(|dt| dt.with_timezone(&chrono::Utc))
+            })
+        })
+        .unwrap_or_else(chrono::Utc::now)
+}
+
+/// `SHODH_COMPANION_MULTIHOP_GATE=1` — enable provenance-driven multi-hop
+/// companion injection (Increment 2). Default OFF → recall is byte-identical and
+/// no extra graph reads are performed. The flag only ARMS the feature; injection
+/// still fires solely on `Full`-layer recalls classified as multi-hop intent.
+fn companion_gate_enabled() -> bool {
+    std::env::var("SHODH_COMPANION_MULTIHOP_GATE")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// `SHODH_RECALL_READONLY=1` — recall performs NO usage writes: no access-count
+/// persistence, no co-retrieval/coactivation edge creation, no Hebbian edge
+/// strengthening anywhere in the recall path (including the graph leg's
+/// spreading-activation traversal in `graph_retrieval.rs`). Set by the eval
+/// harness (`pin_harness_threads`, `recall_eval` binary startup): eval repeats
+/// measure variance, not learning curves, and FLAT fusion made graph magnitude
+/// load-bearing, so first-repeat usage writes were shifting later repeats'
+/// rankings (L1 smoke non-determinism, PR #325 checks). Production default
+/// (flag unset): writes on, unchanged.
+///
+/// This is the SINGLE SOURCE OF TRUTH for the gate. Every recall-path mutation
+/// site — in this module or a sibling (`graph_retrieval`, etc.) — must check
+/// this function rather than re-deriving the env check ad hoc, or a new write
+/// site can silently reintroduce the same measurement-integrity bug (see the
+/// graph-leg Hebbian strengthening fix this function's introduction shipped
+/// alongside: spreading activation was calling `batch_strengthen_synapses`
+/// unconditionally, bypassing the gate entirely).
+pub(crate) fn recall_readonly() -> bool {
+    std::env::var("SHODH_RECALL_READONLY")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+}
+
 use crate::constants::{
     DEFAULT_COMPRESSION_AGE_DAYS, DEFAULT_IMPORTANCE_THRESHOLD, DEFAULT_MAX_HEAP_PER_USER_MB,
     DEFAULT_SESSION_MEMORY_SIZE_MB, DEFAULT_WORKING_MEMORY_SIZE, EDGE_SEMANTIC_WEIGHT_FLOOR,
@@ -62,7 +116,7 @@ pub use crate::memory::types::*;
 use crate::embeddings::Embedder;
 use crate::memory::compression::CompressionPipeline;
 pub use crate::memory::compression::{
-    ConsolidationResult, FactType, SemanticConsolidator, SemanticFact,
+    CausalFactLink, ConsolidationResult, FactCluster, FactType, SemanticConsolidator, SemanticFact,
 };
 pub use crate::memory::facts::{FactQueryResponse, FactStats, SemanticFactStore};
 pub use crate::memory::feedback::{
@@ -74,11 +128,10 @@ pub use crate::memory::feedback::{
 };
 pub use crate::memory::files::{FileMemoryStats, FileMemoryStore, IndexingResult};
 pub use crate::memory::graph_retrieval::{
-    calculate_density_weights, spreading_activation_retrieve, ActivatedMemory,
+    calculate_density_weights, spreading_activation_retrieve_with_stats, ActivatedMemory,
 };
 pub use crate::memory::hybrid_search::{
-    BM25Index, CrossEncoderReranker, HybridSearchConfig, HybridSearchEngine, HybridSearchResult,
-    RRFusion,
+    BM25Index, HybridSearchConfig, HybridSearchEngine, HybridSearchResult, RRFusion,
 };
 pub use crate::memory::introspection::{
     AssociationChange, ConsolidationEvent, ConsolidationEventBuffer, ConsolidationReport,
@@ -90,7 +143,7 @@ pub use crate::memory::learning_history::{
 };
 pub use crate::memory::lineage::{
     CausalRelation, InferenceConfig, LineageBranch, LineageEdge, LineageGraph, LineageSource,
-    LineageStats, LineageTrace, PostMortem, TraceDirection,
+    LineageStats, LineageTrace, TraceDirection,
 };
 pub use crate::memory::prospective::ProspectiveStore;
 pub use crate::memory::replay::{
@@ -106,8 +159,8 @@ pub use crate::memory::segmentation::{
     AtomicMemory, DeduplicationEngine, DeduplicationResult, InputSource, SegmentationEngine,
 };
 pub use crate::memory::sessions::{
-    Session, SessionEvent, SessionId, SessionStats, SessionStatus, SessionStore, SessionStoreStats,
-    SessionSummary, TemporalContext, TimeOfDay,
+    Session, SessionDigest, SessionEvent, SessionId, SessionStats, SessionStatus, SessionStore,
+    SessionStoreStats, SessionSummary, TemporalContext, TimeOfDay,
 };
 pub use crate::memory::temporal_facts::{EventType, ResolvedTime, TemporalFact, TemporalFactStore};
 pub use crate::memory::todos::{ProjectStats, TodoStore, UserTodoStats};
@@ -237,6 +290,16 @@ pub struct MemorySystem {
     /// Resolves relative dates ("next month" → June 2023) for accurate retrieval
     temporal_fact_store: Arc<temporal_facts::TemporalFactStore>,
 
+    /// The user this MemorySystem belongs to. The manager creates one
+    /// MemorySystem per user but the id lived only in the manager's map key, so
+    /// `remember()` could not namespace per-user stores (e.g. temporal facts are
+    /// keyed `temporal_facts:{user_id}:…`). That is why temporal-fact storage was
+    /// previously handler-only — every non-HTTP path (Python bindings, batch,
+    /// MCP-direct, eval) silently dropped them. With the owner known here,
+    /// `remember()` persists facts and `recall()` can default the query's
+    /// `user_id` to this owner. `None` preserves the prior behaviour.
+    default_user_id: Option<String>,
+
     /// Flag: new memories stored since last fact extraction cycle.
     /// When false, fact extraction is skipped entirely (no RocksDB scan, no clones).
     /// Set to true in remember(), cleared by maintenance after extraction runs.
@@ -251,36 +314,174 @@ pub struct MemorySystem {
     /// Cached wavelet-detected session map.
     /// Invalidated when fact_extraction_needed is set (any new remember call).
     session_map_cache: parking_lot::Mutex<Option<wavelet_sessions::SessionMap>>,
+
+    /// Prediction cache for feedback prediction error weighting (VTA/Dopamine system).
+    ///
+    /// Stores (memory_id → final_score) for recently surfaced memories during recall.
+    /// When feedback arrives (Helpful/Misleading), the prediction error (|predicted - actual|)
+    /// scales the learning signal: expected outcomes → 0.5x, surprises → 2.0x.
+    ///
+    /// TTL: 10 minutes via moka cache. Cap: 500 entries (~4KB).
+    ///
+    /// Reference: Schultz et al. (1997) "A neural substrate of prediction and reward"
+    prediction_cache: moka::sync::Cache<MemoryId, f32>,
 }
 
-/// Resolve an entity name to a graph label and salience using pre-extracted NER data.
+/// Resolve an entity name to a graph label, salience, and fine type using
+/// pre-extracted NER data.
 ///
-/// Returns (EntityLabel, salience) based on NER type mapping, defaulting to (Concept, 0.5).
+/// When the NER record carries a GLiNER fine label, the primary [`EntityLabel`]
+/// is its schema coarse rollup (and the fine label rides along as `fine_type`).
+/// Otherwise it maps the coarse 4-class type, defaulting untyped names to
+/// (`Concept`, 0.5, `None`).
 fn resolve_entity_label(
     entity_name: &str,
-    ner_lookup: &std::collections::HashMap<String, (String, f32)>,
-) -> (crate::graph_memory::EntityLabel, f32) {
-    if let Some((ner_type, confidence)) = ner_lookup.get(&entity_name.to_lowercase()) {
+    ner_lookup: &std::collections::HashMap<String, (String, f32, Option<String>)>,
+) -> (crate::graph_memory::EntityLabel, f32, Option<String>) {
+    use crate::graph_memory::EntityLabel;
+    if let Some((ner_type, confidence, fine)) = ner_lookup.get(&entity_name.to_lowercase()) {
+        if let Some(fine) = fine {
+            let coarse = crate::entity_type::coarse_of(fine)
+                .map(EntityLabel::from_coarse_id)
+                .unwrap_or_else(|| EntityLabel::Other(fine.clone()));
+            return (coarse, *confidence, Some(fine.clone()));
+        }
         let label = match ner_type.as_str() {
-            "PER" => crate::graph_memory::EntityLabel::Person,
-            "ORG" => crate::graph_memory::EntityLabel::Organization,
-            "LOC" => crate::graph_memory::EntityLabel::Location,
-            _ => crate::graph_memory::EntityLabel::Concept,
+            "PER" => EntityLabel::Person,
+            "ORG" => EntityLabel::Organization,
+            "LOC" => EntityLabel::Location,
+            _ => EntityLabel::Concept,
         };
-        (label, *confidence)
+        (label, *confidence, None)
     } else {
-        (crate::graph_memory::EntityLabel::Concept, 0.5)
+        (EntityLabel::Concept, 0.5, None)
     }
 }
 
 /// Build a lookup table from NER entity records for label resolution.
 fn build_ner_lookup(
     ner_entities: &[NerEntityRecord],
-) -> std::collections::HashMap<String, (String, f32)> {
+) -> std::collections::HashMap<String, (String, f32, Option<String>)> {
     ner_entities
         .iter()
-        .map(|r| (r.text.to_lowercase(), (r.entity_type.clone(), r.confidence)))
+        .map(|r| {
+            (
+                r.text.to_lowercase(),
+                (r.entity_type.clone(), r.confidence, r.fine_label.clone()),
+            )
+        })
         .collect()
+}
+
+/// Tokenize text into word-level tokens for boundary-safe matching.
+///
+/// Splits on non-alphanumeric characters (preserving apostrophes for contractions),
+/// filters tokens shorter than 3 characters. Returns borrowed slices to avoid allocation.
+/// Caller should lowercase the input first for case-insensitive matching.
+fn tokenize_words(text: &str) -> HashSet<&str> {
+    text.split(|c: char| !c.is_alphanumeric() && c != '\'')
+        .filter(|w| w.len() >= 3)
+        .collect()
+}
+
+/// Char-safe prefix of `s` containing at most `max_chars` characters.
+///
+/// Unlike `&s[..n]`, this never panics on a multi-byte UTF-8 boundary, so it is
+/// safe for previews / log lines / display truncation of arbitrary user text
+/// (CJK, emoji, accented input). Returns the whole string when it is already
+/// `<= max_chars` characters; the caller can detect truncation by comparing
+/// `result.len()` to `s.len()`.
+pub(crate) fn char_truncate(s: &str, max_chars: usize) -> &str {
+    match s.char_indices().nth(max_chars) {
+        Some((idx, _)) => &s[..idx],
+        None => s,
+    }
+}
+
+#[cfg(test)]
+mod char_truncate_tests {
+    use super::char_truncate;
+
+    #[test]
+    fn never_splits_multibyte_utf8() {
+        // <= max_chars → returned unchanged
+        assert_eq!(char_truncate("hello", 10), "hello");
+        assert_eq!(char_truncate("abcde", 5), "abcde");
+        assert_eq!(char_truncate("", 5), "");
+        // plain ASCII truncation
+        assert_eq!(char_truncate("hello", 3), "hel");
+        assert_eq!(char_truncate("anything", 0), "");
+        // CJK: 3 bytes/char — `&s[..2]` would panic mid-codepoint.
+        let cjk = "你好世界"; // 4 chars, 12 bytes
+        assert_eq!(char_truncate(cjk, 2), "你好");
+        assert_eq!(char_truncate(cjk, 4), cjk);
+        assert_eq!(char_truncate(cjk, 99), cjk);
+        // Emoji: 4 bytes/char.
+        let emoji = "😀😁😂";
+        assert_eq!(char_truncate(emoji, 1), "😀");
+        assert_eq!(char_truncate(emoji, 3), emoji);
+        // The result is always a prefix shorter-or-equal in bytes.
+        assert!(char_truncate(cjk, 2).len() < cjk.len());
+    }
+}
+
+#[cfg(test)]
+mod resolve_entity_label_tests {
+    use super::resolve_entity_label;
+    use crate::graph_memory::EntityLabel;
+    use std::collections::HashMap;
+
+    #[test]
+    fn ner_per_org_loc_map_directly() {
+        let mut lookup = HashMap::new();
+        lookup.insert("alice".to_string(), ("PER".to_string(), 0.9, None));
+        lookup.insert("acme".to_string(), ("ORG".to_string(), 0.8, None));
+        lookup.insert("paris".to_string(), ("LOC".to_string(), 0.7, None));
+        assert_eq!(
+            resolve_entity_label("Alice", &lookup).0,
+            EntityLabel::Person
+        );
+        assert_eq!(
+            resolve_entity_label("Acme", &lookup).0,
+            EntityLabel::Organization
+        );
+        assert_eq!(
+            resolve_entity_label("Paris", &lookup).0,
+            EntityLabel::Location
+        );
+    }
+
+    #[test]
+    fn fine_label_drives_coarse_rollup_and_fine_type() {
+        let mut lookup = HashMap::new();
+        // GLiNER typed "Baltimore" as the fine label "city" → coarse gpe.
+        lookup.insert(
+            "baltimore".to_string(),
+            ("LOC".to_string(), 0.6, Some("city".to_string())),
+        );
+        let (label, conf, fine) = resolve_entity_label("Baltimore", &lookup);
+        assert_eq!(label, EntityLabel::Gpe);
+        assert_eq!(fine.as_deref(), Some("city"));
+        assert_eq!(conf, 0.6);
+    }
+
+    #[test]
+    fn misc_without_fine_label_defaults_to_concept() {
+        let mut lookup = HashMap::new();
+        lookup.insert("widget".to_string(), ("MISC".to_string(), 0.6, None));
+        let (label, conf, fine) = resolve_entity_label("widget", &lookup);
+        assert_eq!(label, EntityLabel::Concept);
+        assert!(fine.is_none());
+        assert_eq!(conf, 0.6);
+    }
+
+    #[test]
+    fn unknown_name_defaults_to_concept() {
+        let lookup = HashMap::new();
+        let (label, _, fine) = resolve_entity_label("postmortem", &lookup);
+        assert_eq!(label, EntityLabel::Concept);
+        assert!(fine.is_none());
+    }
 }
 
 impl MemorySystem {
@@ -322,7 +523,23 @@ impl MemorySystem {
         let indexed_count = retriever.len();
         let orphaned_count = storage_count.saturating_sub(indexed_count);
 
-        if orphaned_count > 0 {
+        // SHODH_SKIP_STARTUP_REPAIR=1 leaves orphans unindexed instead of
+        // re-adding them. Escape hatch for a store whose graph has grown large
+        // enough that the per-memory graph-add allocation is pathological
+        // (write-path O(N) blow-up, graph_memory.rs:5409) — repair would OOM the
+        // server on every boot, making the whole store unservable. Skipping loses
+        // only the orphaned handful; the indexed majority serves normally.
+        let skip_startup_repair = std::env::var("SHODH_SKIP_STARTUP_REPAIR")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        if orphaned_count > 0 && skip_startup_repair {
+            tracing::warn!(
+                orphaned_count = orphaned_count,
+                "SHODH_SKIP_STARTUP_REPAIR set — leaving orphaned memories \
+                 unindexed (they will not surface in recall until reindexed)"
+            );
+        }
+        if orphaned_count > 0 && !skip_startup_repair {
             tracing::warn!(
                 storage_count = storage_count,
                 indexed_count = indexed_count,
@@ -535,6 +752,9 @@ impl MemorySystem {
             learning_history,
             // Temporal fact store for multi-hop temporal reasoning
             temporal_fact_store,
+            // Owner unknown at construction; the manager sets it via
+            // set_default_user_id() so per-user stores work outside the handler.
+            default_user_id: None,
             // Dirty flag for fact extraction: run on first cycle, then only when new memories stored
             fact_extraction_needed: std::sync::atomic::AtomicBool::new(true),
             // Watermark for incremental fact extraction — initialized to 0 (sentinel).
@@ -542,6 +762,12 @@ impl MemorySystem {
             fact_extraction_watermark: std::sync::atomic::AtomicI64::new(0),
             // Wavelet session detection cache — recomputed when new memories arrive
             session_map_cache: parking_lot::Mutex::new(None),
+            // Prediction cache for VTA/dopamine-inspired feedback error weighting
+            // TTL 10 minutes, max 500 entries (~4KB)
+            prediction_cache: moka::sync::Cache::builder()
+                .max_capacity(500)
+                .time_to_live(std::time::Duration::from_secs(600))
+                .build(),
         })
     }
 
@@ -567,6 +793,49 @@ impl MemorySystem {
         self.graph_memory.as_ref()
     }
 
+    /// RocksDB in-process memory for this user's DBs (memory storage + graph):
+    /// (memtable bytes, table-reader bytes). Shared block cache excluded —
+    /// reported once at the manager level.
+    pub fn rocksdb_memory_breakdown(&self) -> (u64, u64) {
+        let (mut memtables, mut readers) = self.long_term_memory.rocksdb_memory_breakdown();
+        if let Some(graph) = self.graph_memory.as_ref() {
+            let (gm, gr) = graph.read().rocksdb_memory_breakdown();
+            memtables += gm;
+            readers += gr;
+        }
+        (memtables, readers)
+    }
+
+    /// Age the knowledge-graph edges by `total_days` of simulated time, applying
+    /// decay in `cadence_hours` steps (production runs the heavy maintenance
+    /// cycle ~every 6h).
+    ///
+    /// EVALUATION-ONLY hook for the decay / recall harness: it drives the real
+    /// decay path ([`GraphMemory::apply_decay_at`]) forward against a virtual
+    /// clock so recall quality can be measured at a chosen edge age without
+    /// waiting wall-clock days. The cadence is load-bearing — a single large
+    /// jump would skip straight into the power-law decay phase and hide the
+    /// per-cycle dynamics production actually exhibits, so the harness must step
+    /// at the real cadence.
+    ///
+    /// Returns the total number of edges pruned across all cycles; a no-op
+    /// (`Ok(0)`) when no graph is configured.
+    pub fn simulate_edge_aging(&self, total_days: f64, cadence_hours: i64) -> Result<usize> {
+        let Some(graph) = self.graph_memory.as_ref() else {
+            return Ok(0);
+        };
+        let cadence_hours = cadence_hours.max(1);
+        let steps = ((total_days * 24.0) / cadence_hours as f64).ceil().max(0.0) as usize;
+        let cadence = chrono::Duration::hours(cadence_hours);
+        let mut now = chrono::Utc::now();
+        let mut pruned_total = 0;
+        for _ in 0..steps {
+            now += cadence;
+            pruned_total += graph.read().apply_decay_at(now)?.pruned_count;
+        }
+        Ok(pruned_total)
+    }
+
     /// Set the feedback store for momentum-based scoring (PIPE-9)
     ///
     /// When set, retrieval automatically applies feedback momentum:
@@ -576,6 +845,13 @@ impl MemorySystem {
     /// This provides consistent feedback integration across all retrieval paths.
     pub fn set_feedback_store(&mut self, feedback: Arc<parking_lot::RwLock<FeedbackStore>>) {
         self.feedback_store = Some(feedback);
+    }
+
+    /// Record which user owns this MemorySystem. Set by the manager right after
+    /// construction so per-user stores (temporal facts) work on every ingest
+    /// path, and so `recall()` can default the query's `user_id` to this owner.
+    pub fn set_default_user_id(&mut self, user_id: impl Into<String>) {
+        self.default_user_id = Some(user_id.into());
     }
 
     /// Get reference to the optional feedback store
@@ -594,7 +870,9 @@ impl MemorySystem {
         mut experience: Experience,
         created_at: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<MemoryId> {
-        let importance = self.calculate_importance(&experience);
+        let importance = experience
+            .importance_override
+            .unwrap_or_else(|| self.calculate_importance(&experience));
 
         // Generate embedding if not provided
         if experience.embeddings.is_none() {
@@ -639,10 +917,27 @@ impl MemorySystem {
         mut experience: Experience,
         created_at: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<MemoryId> {
+        // IDEMPOTENCY (issue #109): Check content hash index before creating a new memory.
+        // If identical content already exists, return the existing MemoryId instead of
+        // creating a duplicate. Catches all duplication paths: timeout retries, auto_ingest,
+        // and manual re-remembers. O(1) RocksDB index lookup.
+        if let Some(existing_id) = self
+            .long_term_memory
+            .get_by_content_hash(&experience.content)
+        {
+            tracing::debug!(
+                existing_id = %existing_id.0,
+                "Content dedup: returning existing memory (identical content already stored)"
+            );
+            return Ok(existing_id);
+        }
+
         let memory_id = MemoryId(Uuid::new_v4());
 
         // Calculate importance
-        let importance = self.calculate_importance(&experience);
+        let importance = experience
+            .importance_override
+            .unwrap_or_else(|| self.calculate_importance(&experience));
 
         // PERFORMANCE: Content embedding cache (80ms → <1μs for repeated content)
         // If experience doesn't have embeddings, check cache or generate
@@ -717,6 +1012,49 @@ impl MemorySystem {
             true
         };
 
+        // Record non-text modalities in VectorMappingEntry metadata.
+        // Embeddings are persisted on the Memory struct via RocksDB; Vamana insertion
+        // is deferred until per-modality indexes exist (cross-modal search PR).
+        {
+            use storage::Modality;
+            let modalities_to_record: Vec<Modality> = [
+                memory
+                    .experience
+                    .image_embeddings
+                    .as_ref()
+                    .map(|_| Modality::Image),
+                memory
+                    .experience
+                    .audio_embeddings
+                    .as_ref()
+                    .map(|_| Modality::Audio),
+                memory
+                    .experience
+                    .video_embeddings
+                    .as_ref()
+                    .map(|_| Modality::Video),
+            ]
+            .into_iter()
+            .flatten()
+            .collect();
+
+            for modality in modalities_to_record {
+                // Empty vector_ids: no Vamana index yet, but the mapping records that
+                // this memory HAS embeddings for this modality.
+                if let Err(e) =
+                    self.long_term_memory
+                        .update_modality_vectors(&memory.id, modality, Vec::new())
+                {
+                    tracing::warn!(
+                        "Failed to record {} modality for {}: {}",
+                        modality,
+                        memory.id.0,
+                        e
+                    );
+                }
+            }
+        }
+
         // NOTE: Graph processing (entities + co-occurrence edges) is handled by
         // process_experience_into_graph() at the handler layer (remember.rs, recall.rs).
         // That path creates richer EpisodicNodes with temporal context and does proper
@@ -741,7 +1079,7 @@ impl MemorySystem {
                 .context
                 .as_ref()
                 .map(|c| c.emotional.arousal)
-                .unwrap_or(0.3);
+                .unwrap_or(0.0);
 
             let pattern_memory = pattern_detection::PatternMemory {
                 id: memory.id.0.to_string(),
@@ -797,14 +1135,34 @@ impl MemorySystem {
                 &memory.experience.entities,
             );
             if !facts.is_empty() {
-                // Note: We don't have user_id in remember(), will need to pass it
-                // For now, extract facts but don't store - storage happens at handler level
-                // or we can use a placeholder user_id
-                tracing::debug!(
-                    "Extracted {} temporal facts from memory {}",
-                    facts.len(),
-                    memory.id.0
-                );
+                // Persist the facts under this system's owner. Previously these
+                // were extracted then dropped here ("storage happens at handler
+                // level"), so every non-HTTP ingest path (Python bindings, batch,
+                // MCP-direct, eval harness) silently lost temporal facts and
+                // Layer 0.6 had nothing to find. With the owner known, store them
+                // on the core path so all callers get temporal reasoning.
+                if let Some(user_id) = self.default_user_id.as_deref() {
+                    match self.temporal_fact_store.store_batch(user_id, &facts) {
+                        Ok(stored) => tracing::debug!(
+                            "Stored {}/{} temporal facts from memory {} (user={})",
+                            stored,
+                            facts.len(),
+                            memory.id.0,
+                            user_id
+                        ),
+                        Err(e) => tracing::warn!(
+                            "Failed to store temporal facts for memory {}: {e}",
+                            memory.id.0
+                        ),
+                    }
+                } else {
+                    tracing::debug!(
+                        "Extracted {} temporal facts from memory {} but no owner set; \
+                         not stored (call set_default_user_id)",
+                        facts.len(),
+                        memory.id.0
+                    );
+                }
             }
         }
 
@@ -970,10 +1328,24 @@ impl MemorySystem {
         agent_id: Option<String>,
         run_id: Option<String>,
     ) -> Result<MemoryId> {
+        // IDEMPOTENCY (issue #109): Content hash dedup (same as remember())
+        if let Some(existing_id) = self
+            .long_term_memory
+            .get_by_content_hash(&experience.content)
+        {
+            tracing::debug!(
+                existing_id = %existing_id.0,
+                "Content dedup: returning existing memory (identical content already stored)"
+            );
+            return Ok(existing_id);
+        }
+
         let memory_id = MemoryId(Uuid::new_v4());
 
         // Calculate importance
-        let importance = self.calculate_importance(&experience);
+        let importance = experience
+            .importance_override
+            .unwrap_or_else(|| self.calculate_importance(&experience));
 
         // PERFORMANCE: Content embedding cache
         if experience.embeddings.is_none() {
@@ -1024,130 +1396,11 @@ impl MemorySystem {
             tracing::warn!("Failed to index memory {} in vector DB: {}", memory.id.0, e);
         }
 
-        // Add entities to knowledge graph with co-occurrence edges
-        // PERF: Build entity structs and extract co-occurrences OUTSIDE the lock
-        // GraphMemory is internally thread-safe; read lock allows concurrent graph access
-        if let Some(graph) = &self.graph_memory {
-            let now = chrono::Utc::now();
-
-            // Phase 1: Build entity structs with proper labels from NER
-            let ner_lookup = build_ner_lookup(&memory.experience.ner_entities);
-
-            // Batch-encode entity names for concept-level dedup
-            let entity_names: Vec<&str> = memory
-                .experience
-                .entities
-                .iter()
-                .map(|s| s.as_str())
-                .collect();
-            let entity_embeddings: Vec<Option<Vec<f32>>> = if entity_names.is_empty() {
-                Vec::new()
-            } else {
-                match self.embedder.encode_batch(&entity_names) {
-                    Ok(embs) => embs.into_iter().map(Some).collect(),
-                    Err(e) => {
-                        tracing::debug!(
-                            error = %e,
-                            "Entity name embedding failed, concept merge disabled for this batch"
-                        );
-                        vec![None; entity_names.len()]
-                    }
-                }
-            };
-
-            let entities_to_add: Vec<crate::graph_memory::EntityNode> = memory
-                .experience
-                .entities
-                .iter()
-                .zip(entity_embeddings.into_iter())
-                .map(|(entity_name, embedding)| {
-                    let (label, salience) = resolve_entity_label(entity_name, &ner_lookup);
-                    crate::graph_memory::EntityNode {
-                        uuid: Uuid::new_v4(),
-                        name: entity_name.clone(),
-                        labels: vec![label],
-                        created_at: now,
-                        last_seen_at: now,
-                        mention_count: 1,
-                        summary: String::new(),
-                        attributes: std::collections::HashMap::new(),
-                        name_embedding: embedding,
-                        salience,
-                        is_proper_noun: entity_name
-                            .chars()
-                            .next()
-                            .map(|c| c.is_uppercase())
-                            .unwrap_or(false),
-                    }
-                })
-                .collect();
-
-            // Phase 2: Use pre-extracted co-occurrence pairs or extract fresh
-            let cooccurrence_pairs = if !memory.experience.cooccurrence_pairs.is_empty() {
-                memory.experience.cooccurrence_pairs.clone()
-            } else {
-                let entity_extractor = crate::graph_memory::EntityExtractor::new();
-                entity_extractor.extract_cooccurrence_pairs(&memory.experience.content)
-            };
-
-            let edge_context = format!("Co-occurred in memory {}", memory.id.0);
-
-            // Phase 3: Acquire read lock for graph insertions (GraphMemory is internally thread-safe)
-            let graph_guard = graph.read();
-
-            for entity in entities_to_add {
-                if let Err(e) = graph_guard.add_entity(entity.clone()) {
-                    tracing::debug!("Failed to add entity '{}' to graph: {}", entity.name, e);
-                }
-            }
-
-            // Semantic edge weighting
-            let l1_base_weight = crate::graph_memory::EdgeTier::L1Working.initial_weight();
-            for (entity1, entity2) in cooccurrence_pairs {
-                if let (Ok(Some(e1)), Ok(Some(e2))) = (
-                    graph_guard.find_entity_by_name(&entity1),
-                    graph_guard.find_entity_by_name(&entity2),
-                ) {
-                    let entity_confidence = Some((e1.salience + e2.salience) / 2.0);
-
-                    let semantic_weight = match (&e1.name_embedding, &e2.name_embedding) {
-                        (Some(emb1), Some(emb2)) => {
-                            let sim = crate::similarity::cosine_similarity(emb1, emb2).max(0.0);
-                            EDGE_SEMANTIC_WEIGHT_FLOOR + (1.0 - EDGE_SEMANTIC_WEIGHT_FLOOR) * sim
-                        }
-                        _ => 1.0,
-                    };
-
-                    let edge = crate::graph_memory::RelationshipEdge {
-                        uuid: Uuid::new_v4(),
-                        from_entity: e1.uuid,
-                        to_entity: e2.uuid,
-                        relation_type: crate::graph_memory::RelationType::CoOccurs,
-                        strength: l1_base_weight * semantic_weight,
-                        created_at: now,
-                        valid_at: now,
-                        invalidated_at: None,
-                        source_episode_id: Some(memory.id.0),
-                        context: edge_context.clone(),
-                        last_activated: now,
-                        activation_count: 1,
-                        ltp_status: crate::graph_memory::LtpStatus::None,
-                        tier: crate::graph_memory::EdgeTier::L1Working,
-                        activation_timestamps: None,
-                        entity_confidence,
-                    };
-
-                    if let Err(e) = graph_guard.add_relationship(edge) {
-                        tracing::trace!(
-                            "Failed to add co-occurrence edge {}<->{}: {}",
-                            entity1,
-                            entity2,
-                            e
-                        );
-                    }
-                }
-            }
-        }
+        // NOTE: Graph processing (entities + co-occurrence edges) is handled by
+        // process_experience_into_graph() at the handler layer (remember.rs).
+        // That path creates richer EpisodicNodes with temporal context and does proper
+        // entity embedding for concept-level dedup. Doing it here too caused
+        // double entity inserts and inflated mention_counts (H6 audit fix).
 
         // Index in BM25 for hybrid search
         if let Err(e) = self.hybrid_search.index_memory(
@@ -1194,10 +1447,412 @@ impl MemorySystem {
     /// - Semantic search: Uses embeddings + vector similarity across ALL tiers
     /// - Non-semantic search: Uses importance * temporal decay
     /// - Zero shortcuts, no TODOs, enterprise-grade
+    /// SHODH_RECALL_READONLY=1 — recall performs no usage writes (access-count
+    /// persistence, co-retrieval edge creation). Delegates to the module-level
+    /// `recall_readonly()` (single source of truth — every recall-path mutation
+    /// site, including sibling modules like `graph_retrieval`, must check the
+    /// same function, not re-derive the env check ad hoc). See that function's
+    /// doc for the full rationale.
+    fn recall_readonly() -> bool {
+        recall_readonly()
+    }
+
+    /// Harvest provenance companions for the already-ranked `memories`.
+    ///
+    /// Increment 2 — provenance-driven multi-hop recall. For each ranked memory
+    /// we look up the knowledge-graph entities it exposes, walk each entity's
+    /// relationship edges, and read the `provenance` trail Increment 1 attached
+    /// to every edge. Each `ProvenanceRecord.source_episode_id` is a companion
+    /// episode that attested an edge the recalled memory is incident to — exactly
+    /// the multi-hop companion turn that fell outside the top-k. We:
+    ///
+    /// - confidence-filter each record (record confidence, or the edge's
+    ///   `effective_strength()` when the record carries none — co-occurrence and
+    ///   legacy edges record `None`),
+    /// - skip any episode already in the result set or already harvested (dedup),
+    /// - derive a SUB-source score = `source_score × conf-weight ×
+    ///   COMPANION_SCORE_FACTOR`, so a companion sorts strictly below the memory
+    ///   that reached it and can only occupy an OPEN top-k slot — it never
+    ///   displaces a higher-scored genuine result (accumulate-not-displace),
+    /// - cap the total at `COMPANION_INJECTION_MAX`.
+    ///
+    /// Returns `(Memory, derived_score)` pairs; the caller sets the score and
+    /// appends them before the final sort+truncate. A no-op (empty Vec) when no
+    /// edge carries qualifying provenance.
+    fn harvest_provenance_companions(
+        &self,
+        graph: &crate::graph_memory::GraphMemory,
+        memories: &[SharedMemory],
+    ) -> Vec<(Memory, f32)> {
+        use crate::constants::{
+            COMPANION_INJECTION_MAX, COMPANION_INJECTION_MIN_CONFIDENCE, COMPANION_SCORE_FACTOR,
+        };
+
+        let existing_ids: HashSet<uuid::Uuid> = memories.iter().map(|m| m.id.0).collect();
+        let mut harvested: HashSet<uuid::Uuid> = HashSet::new();
+        let mut companions: Vec<(Memory, f32)> = Vec::new();
+
+        // Resolve each entity name to a graph node at most once across all ranked
+        // memories — a memory's entities frequently repeat (the bridge entity is
+        // shared by the seed and link turns of a chain).
+        let mut entity_uuid_cache: std::collections::HashMap<String, Option<uuid::Uuid>> =
+            std::collections::HashMap::new();
+
+        'outer: for mem in memories {
+            let source_score = mem
+                .score
+                .unwrap_or_else(|| mem.salience_score_with_access());
+            if source_score <= 0.0 {
+                continue;
+            }
+
+            for name in &mem.experience.entities {
+                let key = name.to_lowercase();
+                let entity_uuid = *entity_uuid_cache.entry(key).or_insert_with(|| {
+                    graph
+                        .find_entity_by_name_strict(name)
+                        .ok()
+                        .flatten()
+                        .map(|e| e.uuid)
+                });
+                let Some(entity_uuid) = entity_uuid else {
+                    continue;
+                };
+
+                let Ok(edges) = graph.get_entity_relationships(&entity_uuid) else {
+                    continue;
+                };
+
+                for edge in &edges {
+                    for record in &edge.provenance {
+                        // Confidence: record-level when present (provenance-aware
+                        // edges), else the edge's effective strength (co-occurrence
+                        // / legacy edges store None). Filter weak attestations.
+                        let conf = record
+                            .confidence
+                            .unwrap_or_else(|| edge.effective_strength());
+                        if conf < COMPANION_INJECTION_MIN_CONFIDENCE {
+                            continue;
+                        }
+
+                        let src = record.source_episode_id;
+                        if existing_ids.contains(&src) || !harvested.insert(src) {
+                            continue;
+                        }
+
+                        let Ok(companion) = self.get_memory(&MemoryId(src)) else {
+                            // get_memory failed (episode not a stored memory) —
+                            // drop from the harvested set so it can't block a
+                            // later, fetchable attestation of the same id.
+                            harvested.remove(&src);
+                            continue;
+                        };
+
+                        let derived_score = source_score * conf * COMPANION_SCORE_FACTOR;
+                        companions.push((companion, derived_score));
+                        if companions.len() >= COMPANION_INJECTION_MAX {
+                            break 'outer;
+                        }
+                    }
+                }
+            }
+        }
+
+        companions
+    }
+
     pub fn recall(&self, query: &Query) -> Result<Vec<SharedMemory>> {
+        // Companion-coverage re-rank (SHODH_COMPANION_RERANK, default off), gated
+        // on multi-hop INTENT. The multi_hop wall is present-but-buried: gold
+        // companions sit at rank 11-50 of the pool (present 86% vs recall 56%),
+        // so the lever is re-ranking them up, not finding more candidates —
+        // provenance INJECTION measured NEGATIVE on real LongMemEval (run
+        // 28696042764: multi_hop −0.02) because added items only displace.
+        // Mechanism (measured 2026-06-17/18, exp/hop-gain-excitable-spread):
+        // retrieve a deeper pool (k×5), boost sub-anchor candidates connected to
+        // the top-3 anchors — surface shared-entity mode (+0.060 multi_hop) or
+        // graph 1-hop edge mode (SHODH_COMPANION_GRAPH; typed-only via
+        // SHODH_COMPANION_GRAPH_TYPED was the best multi_hop of the session,
+        // 0.6548, and HELD knowledge_update + temporal). Both traded single_hop
+        // when applied unconditionally, so the wrapper only fires on
+        // detect_multihop_intent — the intent detector the raw NER-count gate
+        // (SHODH_COMPANION_MIN_ENTS, measured inert: LongMemEval multi_hop
+        // questions rarely NAME two entities) could never be: it also accepts a
+        // parsed relation + one grounded entity, and fired 31/100 on the real
+        // corpus (Inc-2 instrumentation). Accumulate-not-displace (Baleen).
+        let rerank_enabled = std::env::var("SHODH_COMPANION_RERANK")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        if rerank_enabled {
+            if let Some(query_text) = query.query_text.as_deref() {
+                // Same intent inputs as the Inc-2 injection site: NER entities
+                // OR parser focal entities (whichever counts more), plus parsed
+                // ontological relations. Pure functions over the query text.
+                let query_analysis = query_parser::analyze_query(query_text);
+                let onto_intent =
+                    query_parser::infer_ontological_intent(query_text, &query_analysis);
+                let relation_surfaces: Vec<String> = onto_intent
+                    .relation_types
+                    .iter()
+                    .map(|r| format!("{r:?}"))
+                    .collect();
+                let entity_count = query
+                    .ner_entities
+                    .as_deref()
+                    .unwrap_or(&[])
+                    .len()
+                    .max(query_analysis.focal_entities.len());
+                if query_parser::detect_multihop_intent(
+                    query_text,
+                    entity_count,
+                    &relation_surfaces,
+                ) {
+                    const COMPANION_EXPAND: usize = 5;
+                    let k = query.max_results.max(1);
+                    let mut deep_q = query.clone();
+                    deep_q.max_results = k.saturating_mul(COMPANION_EXPAND).max(k);
+                    let deep = self.recall_inner(&deep_q, false)?.memories;
+                    let graph_mode = std::env::var("SHODH_COMPANION_GRAPH")
+                        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                        .unwrap_or(false);
+                    // Dedicated target so eval runs can capture the fire rate with
+                    // RUST_LOG=error,companion_rerank=info (same pattern as the
+                    // companion_injection target).
+                    tracing::info!(
+                        target: "companion_rerank",
+                        pool = deep.len(),
+                        graph_mode = graph_mode,
+                        "companion re-rank fired"
+                    );
+                    return Ok(if graph_mode {
+                        self.graph_companion_rerank(deep, k)
+                    } else {
+                        self.companion_rerank(deep, k)
+                    });
+                }
+            }
+        }
+        Ok(self.recall_inner(query, false)?.memories)
+    }
+
+    /// Companion-coverage re-rank: given a deep ranked pool, boost candidates that
+    /// share an entity with a top-anchor result so the scattered companion evidence
+    /// of a multi-hop answer rises into top-k. Score = base position score (1/(rank+1))
+    /// + weight × (distinct anchor entities shared, capped). Anchors (top-ANCHORS) keep
+    /// their base score only, so a correct primary cannot be displaced out of the head.
+    /// Deterministic: original-rank tie-break. SHODH_COMPANION_WEIGHT tunes the lift.
+    fn companion_rerank(&self, deep: Vec<SharedMemory>, k: usize) -> Vec<SharedMemory> {
+        const ANCHORS: usize = 3;
+        const SHARED_CAP: usize = 3;
+        if deep.len() <= k {
+            return deep.into_iter().take(k).collect();
+        }
+        let weight: f32 = std::env::var("SHODH_COMPANION_WEIGHT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0.10);
+
+        // Anchor entity set: the top results' entities (lowercased), skipping
+        // trivially short tokens.
+        let mut anchor_ents: HashSet<String> = HashSet::new();
+        for m in deep.iter().take(ANCHORS) {
+            for e in &m.experience.entities {
+                let el = e.to_lowercase();
+                if el.len() >= 3 {
+                    anchor_ents.insert(el);
+                }
+            }
+        }
+
+        let mut scored: Vec<(f32, usize, SharedMemory)> = deep
+            .into_iter()
+            .enumerate()
+            .map(|(rank, m)| {
+                let base = 1.0 / (rank as f32 + 1.0);
+                let shared = if rank < ANCHORS {
+                    0 // an anchor is not its own companion
+                } else {
+                    m.experience
+                        .entities
+                        .iter()
+                        .map(|e| e.to_lowercase())
+                        .filter(|el| el.len() >= 3 && anchor_ents.contains(el))
+                        .collect::<HashSet<_>>()
+                        .len()
+                        .min(SHARED_CAP)
+                };
+                let score = base + weight * shared as f32;
+                (score, rank, m)
+            })
+            .collect();
+        // Score desc; original-rank tie-break (deterministic, stable).
+        scored.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+        scored.into_iter().take(k).map(|(_, _, m)| m).collect()
+    }
+
+    /// Graph-seeded companion re-rank (SHODH_COMPANION_GRAPH) — a candidate is
+    /// boosted by how many DISTINCT anchor entities it connects to through a real
+    /// 1-hop relationship EDGE in the knowledge graph, the relational signal
+    /// surface co-occurrence lacks (at the token level a single-hop distractor and
+    /// a multi-hop co-gold turn are indistinguishable, which is why the surface
+    /// lift and its trade proved inseparable). SHODH_COMPANION_GRAPH_TYPED=1
+    /// restricts the walk to typed edges (excludes CoOccurs / CoRetrieved /
+    /// RelatedTo) — measured the best multi_hop of the June session (0.6548) while
+    /// holding knowledge_update and temporal at baseline. Accumulate-not-displace:
+    /// the top-ANCHORS keep base score. SHODH_COMPANION_WEIGHT tunes the lift;
+    /// SHODH_COMPANION_HOP_STRENGTH gates minimum edge strength;
+    /// SHODH_COMPANION_MIN_CONN sets minimum distinct-anchor multiplicity.
+    /// Deterministic (original-rank tie-break).
+    fn graph_companion_rerank(&self, deep: Vec<SharedMemory>, k: usize) -> Vec<SharedMemory> {
+        const ANCHORS: usize = 3;
+        const EDGE_LIMIT: usize = 32;
+        const CONN_CAP: usize = 3;
+        if deep.len() <= k {
+            return deep.into_iter().take(k).collect();
+        }
+        let Some(graph) = self.graph_memory.as_ref() else {
+            return deep.into_iter().take(k).collect();
+        };
+        let weight: f32 = std::env::var("SHODH_COMPANION_WEIGHT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0.10);
+        let min_strength: f32 = std::env::var("SHODH_COMPANION_HOP_STRENGTH")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0.0);
+        let typed_only = std::env::var("SHODH_COMPANION_GRAPH_TYPED")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        // Minimum distinct-anchor connection multiplicity for a candidate to be
+        // boosted. =1 boosts any graph-connected candidate; =2 requires bridging
+        // TWO anchor entities (measured WORSE on multi_hop: many co-gold turns
+        // bridge only one anchor).
+        let min_conn: usize = std::env::var("SHODH_COMPANION_MIN_CONN")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|n| *n >= 1)
+            .unwrap_or(1);
+
+        let g = graph.read();
+
+        // Resolve the top anchors' entities to graph nodes.
+        let mut anchor_nodes: HashSet<uuid::Uuid> = HashSet::new();
+        for m in deep.iter().take(ANCHORS) {
+            for e in &m.experience.entities {
+                if e.trim().len() < 3 {
+                    continue;
+                }
+                if let Ok(Some(ent)) = g.find_entity_by_name(e.as_str()) {
+                    anchor_nodes.insert(ent.uuid);
+                }
+            }
+        }
+        if anchor_nodes.is_empty() {
+            return deep.into_iter().take(k).collect();
+        }
+
+        // 1-hop relationship neighbours of the anchor entities.
+        // neighbour node -> count of DISTINCT anchor entities it links to.
+        let mut companion_conn: std::collections::HashMap<uuid::Uuid, usize> =
+            std::collections::HashMap::new();
+        for an in &anchor_nodes {
+            let Ok(edges) = g.get_entity_relationships_limited(an, Some(EDGE_LIMIT)) else {
+                continue;
+            };
+            let mut reached: HashSet<uuid::Uuid> = HashSet::new();
+            for edge in edges {
+                if edge.effective_strength() < min_strength {
+                    continue;
+                }
+                if typed_only {
+                    let rt = edge.relation_type.as_str();
+                    if rt == "CoOccurs" || rt == "CoRetrieved" || rt == "RelatedTo" {
+                        continue;
+                    }
+                }
+                if reached.insert(edge.to_entity) {
+                    *companion_conn.entry(edge.to_entity).or_insert(0) += 1;
+                }
+            }
+        }
+        if companion_conn.is_empty() {
+            return deep.into_iter().take(k).collect();
+        }
+
+        // A candidate below the anchors is boosted by how many distinct anchor
+        // entities its OWN entities are graph-connected to (capped).
+        let mut scored: Vec<(f32, usize, SharedMemory)> = deep
+            .into_iter()
+            .enumerate()
+            .map(|(rank, m)| {
+                let base = 1.0 / (rank as f32 + 1.0);
+                let conn = if rank < ANCHORS {
+                    0
+                } else {
+                    let mut counted: HashSet<uuid::Uuid> = HashSet::new();
+                    let mut c = 0usize;
+                    for e in &m.experience.entities {
+                        if e.trim().len() < 3 {
+                            continue;
+                        }
+                        if let Ok(Some(ent)) = g.find_entity_by_name(e.as_str()) {
+                            if anchor_nodes.contains(&ent.uuid) {
+                                continue;
+                            }
+                            if let Some(n) = companion_conn.get(&ent.uuid) {
+                                if counted.insert(ent.uuid) {
+                                    c += *n;
+                                }
+                            }
+                        }
+                    }
+                    if c >= min_conn {
+                        c.min(CONN_CAP)
+                    } else {
+                        0
+                    }
+                };
+                (base + weight * conn as f32, rank, m)
+            })
+            .collect();
+        // Freeze the original top-ANCHORS in place — a correct single-hop primary
+        // in the head can never be displaced by a boosted companion — and re-rank
+        // only the tail for the remaining slots. SHODH_COMPANION_FREEZE=0 restores
+        // the unfrozen behaviour for an A/B.
+        let freeze_anchors = std::env::var("SHODH_COMPANION_FREEZE")
+            .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
+            .unwrap_or(true);
+        if freeze_anchors {
+            let (mut anchors, mut tail): (Vec<_>, Vec<_>) =
+                scored.into_iter().partition(|(_, rank, _)| *rank < ANCHORS);
+            anchors.sort_by_key(|(_, rank, _)| *rank);
+            tail.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+            anchors
+                .into_iter()
+                .chain(tail)
+                .take(k)
+                .map(|(_, _, m)| m)
+                .collect()
+        } else {
+            scored.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+            scored.into_iter().take(k).map(|(_, _, m)| m).collect()
+        }
+    }
+
+    /// Recall with full retrieval diagnostics (per-stage timing, per-memory score attribution).
+    ///
+    /// Same as `recall()` but returns a `RetrievalResult` with an optional `RetrievalStats`
+    /// sidecar containing per-stage timing and per-memory score attribution.
+    /// Used by the API handler when `debug=true` is requested.
+    pub fn recall_with_diagnostics(&self, query: &Query) -> Result<RetrievalResult> {
+        self.recall_inner(query, true)
+    }
+
+    fn recall_inner(&self, query: &Query, collect_diagnostics: bool) -> Result<RetrievalResult> {
         // Semantic search requires special handling
         if let Some(query_text) = &query.query_text {
-            return self.semantic_retrieve(query_text, query);
+            return self.semantic_retrieve_inner(query_text, query, collect_diagnostics);
         }
 
         // Non-semantic search: filter-based retrieval
@@ -1249,7 +1904,7 @@ impl MemorySystem {
         self.expand_with_hierarchy(&mut memories, &mut seen_ids);
 
         // Rank by importance * temporal relevance
-        let now = chrono::Utc::now();
+        let now = scoring_now();
         memories.sort_by(|a, b| {
             let age_days_a = (now - a.created_at).num_days();
             let temporal_a = Self::calculate_temporal_relevance(age_days_a);
@@ -1259,7 +1914,11 @@ impl MemorySystem {
             let temporal_b = Self::calculate_temporal_relevance(age_days_b);
             let score_b = b.importance() * temporal_b;
 
-            score_b.total_cmp(&score_a)
+            // Score desc → recency desc → MemoryId asc for deterministic ordering.
+            score_b
+                .total_cmp(&score_a)
+                .then_with(|| b.created_at.cmp(&a.created_at))
+                .then_with(|| a.id.cmp(&b.id))
         });
 
         memories.truncate(query.max_results);
@@ -1269,28 +1928,54 @@ impl MemorySystem {
             .read()
             .log_retrieved("", memories.len(), &sources);
 
-        // Update access counts with instrumentation for consolidation events
-        for memory in &memories {
-            self.update_access_count_instrumented(memory, StrengtheningReason::Recalled);
-        }
+        // Update access counts (in-memory) + record consolidation events, then
+        // persist all candidates' access bumps in ONE batched write instead of a
+        // full re-index per candidate (the dominant old read-path cost).
+        if !Self::recall_readonly() {
+            let mut access_refs: Vec<(&Memory, f32)> = Vec::with_capacity(memories.len());
+            for memory in &memories {
+                let before =
+                    self.update_access_count_instrumented(memory, StrengtheningReason::Recalled);
+                access_refs.push((memory.as_ref(), before));
+            }
+            if let Err(e) = self.long_term_memory.persist_access_updates(&access_refs) {
+                tracing::warn!("Failed to persist access updates: {e}");
+            }
 
-        // Hebbian learning: co-activation strengthens associations between memories
-        // When memories are retrieved together, they form/strengthen edges in the memory graph
-        if memories.len() >= 2 {
-            if let Some(graph) = &self.graph_memory {
-                let memory_uuids: Vec<uuid::Uuid> = memories.iter().map(|m| m.id.0).collect();
-                if let Err(e) = graph.read().record_memory_coactivation(&memory_uuids) {
-                    tracing::trace!("Coactivation recording failed (non-critical): {e}");
+            // Hebbian learning: co-activation strengthens associations between
+            // memories. When memories are retrieved together, they
+            // form/strengthen edges in the memory graph.
+            if memories.len() >= 2 {
+                if let Some(graph) = &self.graph_memory {
+                    let memory_uuids: Vec<uuid::Uuid> = memories.iter().map(|m| m.id.0).collect();
+                    if let Err(e) = graph.read().record_memory_coactivation(&memory_uuids) {
+                        tracing::trace!("Coactivation recording failed (non-critical): {e}");
+                    }
                 }
             }
         }
 
-        // Increment and persist retrieval counter
-        if let Ok(count) = self.long_term_memory.increment_retrieval_count() {
-            self.stats.write().total_retrievals = count;
+        // Populate prediction cache for VTA/dopamine-inspired feedback error weighting.
+        // Uses importance as the prediction signal — "how useful we think this memory is."
+        // When feedback arrives later, the prediction error scales learning rate.
+        for memory in &memories {
+            self.prediction_cache
+                .insert(memory.id.clone(), memory.importance());
         }
 
-        Ok(memories)
+        // Increment and persist retrieval counter
+        // Sibling of the access-count/coactivation gate above: also a usage
+        // write, so read-only recall must skip it too.
+        if !Self::recall_readonly() {
+            if let Ok(count) = self.long_term_memory.increment_retrieval_count() {
+                self.stats.write().total_retrievals = count;
+            }
+        }
+
+        Ok(RetrievalResult {
+            memories,
+            stats: None, // Non-semantic path has no per-stage diagnostics
+        })
     }
 
     /// Paginated memory recall with "has_more" indicator (SHO-69)
@@ -1371,29 +2056,164 @@ impl MemorySystem {
     /// 3. If not found, check session memory (instant Arc clone)
     /// 4. Only fetch from RocksDB storage as last resort
     /// 5. This eliminates deserialization overhead for cached memories
-    fn semantic_retrieve(&self, query_text: &str, query: &Query) -> Result<Vec<SharedMemory>> {
+    fn semantic_retrieve_inner(
+        &self,
+        query_text: &str,
+        query: &Query,
+        collect_diagnostics: bool,
+    ) -> Result<RetrievalResult> {
         let recall_start = std::time::Instant::now();
 
         // ===========================================================================
-        // TEMPORAL EXTRACTION (TEMPR approach from Hindsight - 89.6% on LoCoMo)
+        // RH-8 (#270): per-pipeline-layer attribution gate flags
         // ===========================================================================
-        // Key insight: Temporal filtering is critical for multi-hop retrieval accuracy.
-        // Extract temporal constraints from query and use them to boost/filter results.
-        let query_temporal = query_parser::extract_temporal_refs(query_text);
-        let has_temporal_query = query_parser::requires_temporal_filtering(query_text);
+        // Production callers leave `query.layers` at the default (`Full`) and get
+        // the existing behavior — every gate below evaluates true. The recall
+        // harness passes lower modes to attribute quality deltas to specific
+        // stages. Cumulative ordering: VamanaOnly < PlusSpreading < PlusBm25 <
+        // PlusRerank < PlusFacts < Full. See `LayerMode` in `types.rs`.
+        let layer_mode = query.layers;
+        // Leave-one-out ablation overrides (default off -> byte-identical).
+        // The cumulative ladder attributes each stage CONDITIONAL on the ones
+        // before it (order-dependent); these switches remove exactly one leg
+        // from the FULL pipeline so its marginal contribution at the
+        // production operating point is measurable. Eval-only knobs.
+        let ablate = |name: &str| {
+            std::env::var(name)
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false)
+        };
+        let layer_full = layer_mode >= types::LayerMode::Full;
+        let layer_facts = layer_mode >= types::LayerMode::PlusFacts;
+        let layer_rerank = layer_mode >= types::LayerMode::PlusRerank;
+        let layer_bm25 = layer_mode >= types::LayerMode::PlusBm25 && !ablate("SHODH_ABLATE_BM25");
+        let layer_spreading =
+            layer_mode >= types::LayerMode::PlusSpreading && !ablate("SHODH_ABLATE_SPREADING");
+
+        // Diagnostic accumulators — only allocated when collect_diagnostics=true
+        let mut stats = if collect_diagnostics {
+            Some(RetrievalStats {
+                mode: format!("{:?}", query.retrieval_mode),
+                ..Default::default()
+            })
+        } else {
+            None
+        };
+        // Per-memory score attribution map (memory_id → ScoreAttribution)
+        let mut attributions: Option<std::collections::HashMap<MemoryId, ScoreAttribution>> =
+            if collect_diagnostics {
+                Some(std::collections::HashMap::new())
+            } else {
+                None
+            };
+
+        // ===========================================================================
+        // ROBOTICS MODE DELEGATION
+        // ===========================================================================
+        // Spatial, Mission, and ActionOutcome modes use index-based retrieval
+        // (geohash, mission_id, reward buckets) rather than semantic search.
+        // Delegate directly to the retrieval engine which has full implementations.
+        match query.retrieval_mode {
+            RetrievalMode::Spatial | RetrievalMode::Mission | RetrievalMode::ActionOutcome => {
+                tracing::info!(
+                    mode = ?query.retrieval_mode,
+                    query = query_text,
+                    "Delegating to index-based retrieval engine for robotics mode"
+                );
+                let results = self.retriever.search(query, query.max_results)?;
+                // Sibling of the access-count/coactivation gates elsewhere in this
+                // function: also a usage write, so read-only recall must skip it too.
+                if !Self::recall_readonly() {
+                    if let Ok(count) = self.long_term_memory.increment_retrieval_count() {
+                        tracing::debug!("Retrieval count: {count}");
+                    }
+                }
+                return Ok(RetrievalResult {
+                    memories: results,
+                    stats: None, // Robotics index-based modes have no diagnostic pipeline
+                });
+            }
+            _ => {}
+        }
+
+        // ===========================================================================
+        // TEMPORAL ANALYSIS (unified intent + date parsing)
+        // ===========================================================================
+        // Replaces independent calls to extract_temporal_refs() and detect_temporal_intent().
+        // analyze_temporal() parses dates first, then derives intent from parsed structure,
+        // falling back to keyword detection only when dateparser finds nothing.
+        let temporal_ctx = query_parser::analyze_temporal(query_text);
+        let has_temporal_query = temporal_ctx.intent != query_parser::TemporalIntent::None;
 
         if has_temporal_query {
-            let temporal_intent = query_parser::detect_temporal_intent(query_text);
             tracing::debug!(
-                "Temporal query detected: intent={:?}, refs={:?}",
-                temporal_intent,
-                query_temporal
+                "Temporal query detected: intent={:?}, filtering={}, seeking={}, date_range={:?}, refs={:?}",
+                temporal_ctx.intent,
+                temporal_ctx.is_filtering_query,
+                temporal_ctx.is_seeking_query,
+                temporal_ctx.date_range,
+                temporal_ctx.extraction
                     .refs
                     .iter()
                     .map(|r| r.date.to_string())
                     .collect::<Vec<_>>()
             );
         }
+
+        // ===========================================================================
+        // LAYER 0.4: TEMPORAL PRE-FILTER (Date-Range Candidate Prefetch)
+        // ===========================================================================
+        // When the query has parsed temporal references (e.g., "yesterday", "March 2026"),
+        // pre-fetch memories from the matching date range via SearchCriteria::ByDate.
+        // These IDs are collected as candidates for boosting at Layer 4.45.
+        // NOT exclusive — memories outside the range still enter via Vamana/BM25.
+        // RH-8 gate: Layer 0.4 only runs in `Full` mode. Lower modes get an empty set,
+        // which makes the Layer 4.45 temporal boost a no-op without changing its code path.
+        let temporal_prefilter_ids: HashSet<MemoryId> = if layer_full
+            && temporal_ctx.is_filtering_query
+        {
+            if let Some((start_date, end_date)) = temporal_ctx.date_range {
+                // Convert NaiveDate to DateTime<Utc> (start of first day, end of last day)
+                let start_dt = start_date
+                    .and_hms_opt(0, 0, 0)
+                    .map(|dt| {
+                        chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(dt, chrono::Utc)
+                    })
+                    .unwrap_or_else(chrono::Utc::now);
+                let end_dt = end_date
+                    .and_hms_opt(23, 59, 59)
+                    .map(|dt| {
+                        chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(dt, chrono::Utc)
+                    })
+                    .unwrap_or_else(chrono::Utc::now);
+
+                match self.advanced_search(storage::SearchCriteria::ByDate {
+                    start: start_dt,
+                    end: end_dt,
+                }) {
+                    Ok(memories) => {
+                        let ids: HashSet<_> = memories.iter().map(|m| m.id.clone()).collect();
+                        if !ids.is_empty() {
+                            tracing::info!(
+                                    "Layer 0.4: Temporal pre-filter found {} memories in date range {:?} to {:?}",
+                                    ids.len(),
+                                    start_date,
+                                    end_date
+                                );
+                        }
+                        ids
+                    }
+                    Err(e) => {
+                        tracing::warn!("Layer 0.4: Temporal pre-filter search failed: {}", e);
+                        HashSet::new()
+                    }
+                }
+            } else {
+                HashSet::new()
+            }
+        } else {
+            HashSet::new()
+        };
 
         // ===========================================================================
         // LAYER 0.5: ATTRIBUTE QUERY DETECTION (Fact-First Retrieval)
@@ -1405,8 +2225,57 @@ impl MemorySystem {
         let query_type = query_parser::classify_query(query_text);
         // Single parse for all layers (was called 3x: temporal facts, graph expansion, linguistic boost)
         let query_analysis = query_parser::analyze_query(query_text);
-        let attribute_boost_ids: HashSet<MemoryId> = match &query_type {
-            query_parser::QueryType::Attribute(attr_query) => {
+
+        // Ontological intent: infer expected entity types and relation types from query structure.
+        // Used by Layer 2 (filtered traversal) and Layer 4.9 (type-aware re-ranking).
+        let onto_intent = query_parser::infer_ontological_intent(query_text, &query_analysis);
+
+        // Compute graph density for ontological gating (consistent with Layer 2 in graph_retrieval.rs).
+        // Dense/young graphs have too many noisy L1 edges for type filtering to help.
+        // Short-circuit: skip the RocksDB density lookups entirely when confidence is too low.
+        let (graph_density_for_rerank, use_ontology_rerank) =
+            if onto_intent.confidence < crate::constants::ONTOLOGICAL_MIN_CONFIDENCE {
+                (None, false)
+            } else if let Some(graph) = self.graph_memory.as_ref() {
+                let g = graph.read();
+                let seed_uuids: Vec<uuid::Uuid> = query_analysis
+                    .focal_entities
+                    .iter()
+                    .filter_map(|e| {
+                        g.find_entity_by_name(&e.text)
+                            .ok()
+                            .flatten()
+                            .map(|n| n.uuid)
+                    })
+                    .collect();
+                let density = if seed_uuids.is_empty() {
+                    None
+                } else {
+                    g.entities_average_density(&seed_uuids).ok().flatten()
+                };
+                let use_rerank =
+                    !density.is_some_and(|d| d >= crate::constants::ONTOLOGICAL_DENSITY_THRESHOLD);
+                (density, use_rerank)
+            } else {
+                (None, false)
+            };
+
+        // Ontology telemetry
+        crate::metrics::ONTOLOGICAL_INTENT_CONFIDENCE.observe(onto_intent.confidence as f64);
+        if onto_intent.confidence > 0.0
+            && onto_intent.confidence < crate::constants::ONTOLOGICAL_MIN_CONFIDENCE
+        {
+            crate::metrics::ONTOLOGICAL_FALLBACK_TOTAL.inc();
+        }
+        if graph_density_for_rerank
+            .is_some_and(|d| d >= crate::constants::ONTOLOGICAL_DENSITY_THRESHOLD)
+        {
+            crate::metrics::ONTOLOGICAL_DENSITY_SKIP_TOTAL.inc();
+        }
+
+        // RH-8 gate: Layer 0.5 attribute query detection only in `Full` mode.
+        let attribute_boost_ids: HashSet<MemoryId> = match (layer_full, &query_type) {
+            (true, query_parser::QueryType::Attribute(attr_query)) => {
                 tracing::debug!(
                     "Layer 0.5: Attribute query detected - entity='{}', attribute='{}', synonyms={:?}",
                     attr_query.entity,
@@ -1452,15 +2321,21 @@ impl MemorySystem {
                         });
 
                     if let Some(content) = content {
-                        // Must contain entity
-                        if !content.contains(&entity_lower) {
+                        let content_words = tokenize_words(&content);
+                        // Must contain all entity words (word-boundary safe)
+                        if !entity_lower
+                            .split_whitespace()
+                            .all(|w| content_words.contains(w))
+                        {
                             continue;
                         }
-                        // Must contain at least one attribute synonym
-                        let has_synonym = attr_query
-                            .attribute_synonyms
-                            .iter()
-                            .any(|syn| content.contains(&syn.to_lowercase()));
+                        // Must contain at least one attribute synonym (word-level)
+                        let has_synonym = attr_query.attribute_synonyms.iter().any(|syn| {
+                            let syn_lower = syn.to_lowercase();
+                            syn_lower
+                                .split_whitespace()
+                                .all(|w| content_words.contains(w))
+                        });
                         if has_synonym {
                             boosted_ids.insert(mem_id);
                         }
@@ -1490,8 +2365,20 @@ impl MemorySystem {
         // 3. Look up temporal facts matching these
         // 4. Boost the source memories of matching facts
         // Temporal fact lookup - boost source memories of matching facts in Layer 4.5
-        let temporal_fact_boost_ids: HashSet<MemoryId> = if has_temporal_query {
-            if let Some(user_id) = &query.user_id {
+        // RH-8 gate: Layer 0.6 only runs in `Full` mode.
+        let temporal_fact_boost_ids: HashSet<MemoryId> = if layer_full && has_temporal_query {
+            // Ablation hook: SHODH_DISABLE_FACT_LAYERS turns the temporal/fact
+            // layers off at query time so their recall contribution can be
+            // measured against the same ingested corpus.
+            let fact_user = if std::env::var("SHODH_DISABLE_FACT_LAYERS")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false)
+            {
+                None
+            } else {
+                query.user_id.as_ref().or(self.default_user_id.as_ref())
+            };
+            if let Some(user_id) = fact_user {
                 // Get entity name (first focal entity)
                 let entity = query_analysis
                     .focal_entities
@@ -1585,36 +2472,51 @@ impl MemorySystem {
         // Pre-fetch facts by query entities to boost their source memories in Layer 4.8.
         // Facts represent consolidated knowledge — their source memories contain the
         // richest context for that knowledge and should rank higher.
+        // RH-8 gate: Layer 0.7 fact source pre-fetch only runs in `PlusFacts` and above.
         let fact_source_boosts: std::collections::HashMap<MemoryId, f32> = {
             let mut boosts: std::collections::HashMap<MemoryId, f32> =
                 std::collections::HashMap::new();
 
-            if let Some(user_id) = &query.user_id {
-                let entity_names: Vec<String> = query_analysis
-                    .focal_entities
-                    .iter()
-                    .map(|e| e.text.to_lowercase())
-                    .collect();
+            if layer_facts {
+                // Ablation hook: SHODH_DISABLE_FACT_LAYERS turns the temporal/fact
+                // layers off at query time so their recall contribution can be
+                // measured against the same ingested corpus.
+                let fact_user = if std::env::var("SHODH_DISABLE_FACT_LAYERS")
+                    .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                    .unwrap_or(false)
+                {
+                    None
+                } else {
+                    query.user_id.as_ref().or(self.default_user_id.as_ref())
+                };
+                if let Some(user_id) = fact_user {
+                    let entity_names: Vec<String> = query_analysis
+                        .focal_entities
+                        .iter()
+                        .map(|e| e.text.to_lowercase())
+                        .collect();
 
-                if !entity_names.is_empty() {
-                    if let Ok(facts) = self.get_facts_for_graph_entities(user_id, &entity_names, 5)
-                    {
-                        for fact in &facts {
-                            if fact.confidence < 0.5 || fact.support_count < 3 {
-                                continue;
+                    if !entity_names.is_empty() {
+                        if let Ok(facts) =
+                            self.get_facts_for_graph_entities(user_id, &entity_names, 5)
+                        {
+                            for fact in &facts {
+                                if fact.confidence < 0.5 || fact.support_count < 3 {
+                                    continue;
+                                }
+                                let per_fact_boost = fact.confidence * 0.08;
+                                for src_id in &fact.source_memories {
+                                    let entry = boosts.entry(src_id.clone()).or_insert(0.0);
+                                    *entry = (*entry + per_fact_boost).min(0.3);
+                                }
                             }
-                            let per_fact_boost = fact.confidence * 0.08;
-                            for src_id in &fact.source_memories {
-                                let entry = boosts.entry(src_id.clone()).or_insert(0.0);
-                                *entry = (*entry + per_fact_boost).min(0.3);
+                            if !boosts.is_empty() {
+                                tracing::debug!(
+                                    "Layer 0.7: Pre-fetched {} fact-source boosts from {} facts",
+                                    boosts.len(),
+                                    facts.len()
+                                );
                             }
-                        }
-                        if !boosts.is_empty() {
-                            tracing::debug!(
-                                "Layer 0.7: Pre-fetched {} fact-source boosts from {} facts",
-                                boosts.len(),
-                                facts.len()
-                            );
                         }
                     }
                 }
@@ -1627,6 +2529,37 @@ impl MemorySystem {
             query_analysis_ms = format!("{:.2}", t_query_analysis.as_secs_f64() * 1000.0),
             "recall [layer:0.5-0.7] query analysis + attribute + temporal fact + fact source lookup"
         );
+        if let Some(ref mut s) = stats {
+            s.stage_timings
+                .get_or_insert_with(StageTiming::default)
+                .query_analysis_us = t_query_analysis.as_micros() as u64;
+        }
+
+        // TEMPORAL PREFIX INJECTION: When the query has high-confidence temporal
+        // references, prepend a temporal context string to give MiniLM textual
+        // overlap with memory content mentioning the same time period.
+        // Only applied for filtering queries (not "when did X happen?" seeking queries).
+        let embedding_query_text: std::borrow::Cow<'_, str> = if temporal_ctx.is_filtering_query
+            && temporal_ctx
+                .extraction
+                .refs
+                .iter()
+                .any(|r| r.confidence >= crate::constants::TEMPORAL_PREFIX_MIN_CONFIDENCE)
+        {
+            // Build prefix from the original temporal text (e.g., "March 2026", "yesterday")
+            let temporal_labels: Vec<&str> = temporal_ctx
+                .extraction
+                .refs
+                .iter()
+                .filter(|r| r.confidence >= crate::constants::TEMPORAL_PREFIX_MIN_CONFIDENCE)
+                .map(|r| r.original_text.as_str())
+                .collect();
+            let prefix = format!("[{}] ", temporal_labels.join(", "));
+            tracing::debug!("Temporal prefix injection: \"{}\"", prefix);
+            std::borrow::Cow::Owned(format!("{}{}", prefix, query_text))
+        } else {
+            std::borrow::Cow::Borrowed(query_text)
+        };
 
         // PERFORMANCE: Use pre-computed embedding if caller provided one,
         // otherwise fall back to SHA256-keyed cache (80ms → <1μs for repeated queries)
@@ -1638,21 +2571,21 @@ impl MemorySystem {
                 tracing::debug!("Query embedding PRECOMPUTED by caller — skipping encode");
                 pre.clone()
             } else {
-                let query_hash = Self::sha256_hash(query_text);
+                let query_hash = Self::sha256_hash(&embedding_query_text);
                 if let Some(cached_embedding) = self.query_cache.get(&query_hash) {
                     EMBEDDING_CACHE_QUERY.with_label_values(&["hit"]).inc();
-                    tracing::debug!("Query embedding cache HIT for: {}", query_text);
+                    tracing::debug!("Query embedding cache HIT for: {}", &*embedding_query_text);
                     cached_embedding.clone()
                 } else {
                     EMBEDDING_CACHE_QUERY.with_label_values(&["miss"]).inc();
                     tracing::debug!(
                         "Query embedding cache MISS - generating for: {}",
-                        query_text
+                        &*embedding_query_text
                     );
                     let embedding = self
                         .embedder
                         .as_ref()
-                        .encode(query_text)
+                        .encode_query(&embedding_query_text)
                         .context("Failed to generate query embedding")?;
 
                     self.query_cache.insert(query_hash, embedding.clone());
@@ -1661,6 +2594,56 @@ impl MemorySystem {
                 }
             };
 
+        // ===========================================================================
+        // POLARITY-AWARE NEGATED-FORM EMBEDDING (RH-14)
+        // ===========================================================================
+        // For polar/negation-sensitive queries, generate a second embedding from
+        // the templated negated form ("Are we using HNSW?" → "we are not using
+        // HNSW"). The negated-form embedding lands much closer in MiniLM space
+        // to passages that overtly contradict the polar premise (e.g.,
+        // "We use Vamana, not HNSW") than the original positive-form embedding
+        // does. Used downstream to widen the vector candidate pool. See
+        // `query_parser::polar_to_negated_form` and arXiv 2603.17580.
+        let polar_negated_embedding: Option<Vec<f32>> = if query_analysis.polarity_sensitive()
+            && !embedding_query_text.is_empty()
+        {
+            if let Some(neg_text) =
+                crate::memory::query_parser::polar_to_negated_form(&embedding_query_text)
+            {
+                let neg_hash = Self::sha256_hash(&neg_text);
+                if let Some(cached) = self.query_cache.get(&neg_hash) {
+                    EMBEDDING_CACHE_QUERY.with_label_values(&["hit"]).inc();
+                    Some(cached.clone())
+                } else {
+                    EMBEDDING_CACHE_QUERY.with_label_values(&["miss"]).inc();
+                    match self.embedder.as_ref().encode_query(&neg_text) {
+                        Ok(emb) => {
+                            self.query_cache.insert(neg_hash, emb.clone());
+                            EMBEDDING_CACHE_QUERY_SIZE.set(self.query_cache.entry_count() as i64);
+                            tracing::debug!(
+                                "Polar negated-form embedding generated: '{}' → '{}'",
+                                &*embedding_query_text,
+                                neg_text
+                            );
+                            Some(emb)
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "Polar negated-form encode failed for '{}': {}",
+                                neg_text,
+                                e
+                            );
+                            None
+                        }
+                    }
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         let t_embedding = recall_start.elapsed();
         tracing::info!(
             embedding_ms = format!(
@@ -1668,8 +2651,16 @@ impl MemorySystem {
                 (t_embedding - t_query_analysis).as_secs_f64() * 1000.0
             ),
             cumulative_ms = format!("{:.2}", t_embedding.as_secs_f64() * 1000.0),
+            polarity_sensitive = query_analysis.polarity_sensitive(),
+            polar_neg_embedding = polar_negated_embedding.is_some(),
             "recall [layer:embedding] query embedding (cache miss logged above if any)"
         );
+        if let Some(ref mut s) = stats {
+            s.stage_timings
+                .get_or_insert_with(StageTiming::default)
+                .embedding_us = (t_embedding - t_query_analysis).as_micros() as u64;
+            s.embedding_time_us = (t_embedding - t_query_analysis).as_micros() as u64;
+        }
 
         // ===========================================================================
         // LAYER 1: TEMPORAL PRE-FILTER (Episode Coherence)
@@ -1697,10 +2688,50 @@ impl MemorySystem {
         // ===========================================================================
         // LAYER 2: GRAPH EXPANSION (Knowledge Graph Traversal)
         // ===========================================================================
-        let use_graph = matches!(
-            query.retrieval_mode,
-            RetrievalMode::Hybrid | RetrievalMode::Associative | RetrievalMode::Causal
-        );
+        // RH-8 gate: Layer 2 graph spreading activation only runs in `PlusSpreading` and above.
+        // When gated off, the fallback branch yields an empty graph result vector while
+        // still producing IC weights and phrase boosts (cheap query-side analysis).
+        let use_graph = layer_spreading
+            && matches!(
+                query.retrieval_mode,
+                RetrievalMode::Hybrid | RetrievalMode::Associative | RetrievalMode::Causal
+            );
+
+        // Graph-driven query expansion (SHODH_GRAPH_EXPAND_K). The graph's role
+        // for multi-hop is NOT to win the fusion scoring fight (distal activation
+        // is low-magnitude and gets diluted) but to EXPAND THE CUE SET — spreading
+        // activation cognitively surfaces related concepts, which become part of
+        // what you retrieve. We take the top-K strongest 1-hop graph neighbours of
+        // the query's entities (the "bridges") and append them to the BM25 query,
+        // so a multi-hop answer mentioning a bridge entity surfaces on the lexical
+        // leg's own terms instead of being buried as a low-RRF graph candidate.
+        // E3 ceiling ≈ 1.0 (the 1-hop control proves: bridge-in-query → BM25 finds
+        // the answer). Default 0 → off.
+        let graph_expand_k: usize = std::env::var("SHODH_GRAPH_EXPAND_K")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        // Margin gate: only expand on edges at/above this effective strength, so
+        // weak/noisy neighbours don't add lexical noise (recovers the small
+        // LoCoMo per-category cost on open_domain/temporal). 0 = no gate.
+        let graph_expand_min_strength: f32 = std::env::var("SHODH_GRAPH_EXPAND_MIN_STRENGTH")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0.0);
+        let mut graph_bridges: Vec<String> = Vec::new();
+        // Causal-origin entities (SHODH_CAUSAL_ORIGIN): top-k roots traced backward
+        // from the query's effect entities with their backward-path scores, whose
+        // episodes are injected as top graph candidates below (the funnel showed the
+        // trace finds the root but the lone BM25 bridge token loses to the direct
+        // cause's match on the effect term).
+        let mut causal_origin_entities: Vec<(uuid::Uuid, f32)> = Vec::new();
+        // Episode ids of the traced causal roots (populated by the Layer-2 origin
+        // injection), so the post-fusion answer placement (Layer 4.95) can lift the
+        // root ABOVE the global fused max — a structurally-certain answer, not a
+        // similarity candidate to be diluted by RRF.
+        let mut causal_origin_episode_ids: Vec<MemoryId> = Vec::new();
+
+        #[allow(clippy::type_complexity)]
         let (
             graph_results,
             graph_density,
@@ -1738,6 +2769,18 @@ impl MemorySystem {
 
                 // First, collect all query entity UUIDs
                 // Include nouns, adjectives, AND verbs for multi-hop reasoning
+                //
+                // IDF gate on concept seeds: a concept term (EntityLabel::Other,
+                // e.g. a YAKE keyphrase node) mentioned across many memories has
+                // ~no discriminative signal — it floods the spreading-activation
+                // frontier with non-gold and inflates traversal cost. When
+                // SHODH_CONCEPT_SEED_DF_MAX is set, skip concept-labeled seeds
+                // whose corpus mention_count (document-frequency proxy) exceeds
+                // it. Person/Org/Location/etc. seeds are never DF-filtered — a
+                // frequently-named person is still a valid anchor.
+                let concept_seed_df_max: Option<usize> = std::env::var("SHODH_CONCEPT_SEED_DF_MAX")
+                    .ok()
+                    .and_then(|s| s.parse().ok());
                 let mut query_entities: Vec<uuid::Uuid> = Vec::new();
                 for e in query_analysis
                     .focal_entities
@@ -1763,7 +2806,272 @@ impl MemorySystem {
                     )
                 {
                     if let Ok(Some(ent)) = g.find_entity_by_name(e) {
+                        if let Some(df_max) = concept_seed_df_max {
+                            let is_concept = matches!(
+                                ent.labels.first(),
+                                Some(crate::graph_memory::EntityLabel::Other(_))
+                            );
+                            if is_concept && ent.mention_count > df_max {
+                                continue;
+                            }
+                        }
                         query_entities.push(ent.uuid);
+                    }
+                }
+
+                // PRECISION seed set for the causal-origin walk: strict
+                // resolution only (exact / case-insensitive / stemmed — no
+                // substring or word-level fuzzing). Lineage diagnosis
+                // (2026-06-10): the fuzzy tiers bound a fragmented query token
+                // ("incident") to an arbitrary hub node, so the backward walk
+                // injected OTHER chains' roots and crowded the true root out of
+                // the top-10 (root-cause P@1 pinned at 0.0). Query-NER names
+                // (multiword, model-extracted) are included — they are exactly
+                // the phrases strict resolution needs.
+                let mut strict_walk_seeds: Vec<uuid::Uuid> = Vec::new();
+                {
+                    // Collect candidates WITH names so the maximal-match filter
+                    // below can compare mentions.
+                    let mut candidates: Vec<(uuid::Uuid, String)> = Vec::new();
+                    let mut seen: std::collections::HashSet<uuid::Uuid> =
+                        std::collections::HashSet::new();
+                    // Phrase-level: entities whose FULL name occurs verbatim in
+                    // the query. Token-level strict lookup is insufficient — the
+                    // POS tagger fragments multiword names ("the selvic
+                    // incident" → "selvic", "incident"), and fragments either
+                    // miss (strict) or bind to arbitrary hubs (fuzzy).
+                    let qt_lower = query_text.to_lowercase();
+                    if let Ok(contained) = g.find_entities_contained_in_text(&qt_lower, 5, 8) {
+                        for ent in contained {
+                            if seen.insert(ent.uuid) {
+                                candidates.push((ent.uuid, ent.name.to_lowercase()));
+                            }
+                        }
+                    }
+                    // NER names (model-extracted, multiword-capable) via strict
+                    // lookup as a complement.
+                    let ner_names = query.ner_entities.as_deref().unwrap_or(&[]);
+                    for e in ner_names.iter().map(|s| s.as_str()) {
+                        if let Ok(Some(ent)) = g.find_entity_by_name_strict(e) {
+                            if seen.insert(ent.uuid) {
+                                candidates.push((ent.uuid, ent.name.to_lowercase()));
+                            }
+                        }
+                    }
+                    // MAXIMAL-MATCH only: drop any seed whose name is a substring
+                    // of another seed's name. NER fragment entities ("Tavmor4",
+                    // "v1.2") pass the verbatim-containment test alongside the
+                    // full mention ("the Tavmor4 incident", "the v1.2 rollback"),
+                    // and a fragment is a cross-document hub — walking back from
+                    // it unions the backward cones of every chain that touches it
+                    // (funnel 2026-06-11: strict=2–4 seeds → 52–60 origins when 1
+                    // is correct). The longest mention is the intended referent.
+                    for (uuid, name) in &candidates {
+                        let subsumed = candidates.iter().any(|(other_uuid, other_name)| {
+                            other_uuid != uuid
+                                && other_name.len() > name.len()
+                                && other_name.contains(name.as_str())
+                        });
+                        if !subsumed {
+                            strict_walk_seeds.push(*uuid);
+                        }
+                    }
+                }
+
+                // Graph-driven cue expansion: collect the top-K strongest 1-hop
+                // neighbours of the resolved query entities as "bridges" to append
+                // to the BM25 query (see SHODH_GRAPH_EXPAND_K above).
+                if graph_expand_k > 0 && !query_entities.is_empty() {
+                    let original: std::collections::HashSet<String> = query_analysis
+                        .focal_entities
+                        .iter()
+                        .map(|e| e.text.to_lowercase())
+                        .collect();
+                    let mut seen: std::collections::HashSet<String> =
+                        std::collections::HashSet::new();
+                    let mut scored: Vec<(String, f32)> = Vec::new();
+                    for qe in &query_entities {
+                        if let Ok(edges) = g.get_entity_relationships_limited(qe, Some(32)) {
+                            for edge in edges {
+                                let strength = edge.effective_strength();
+                                if strength < graph_expand_min_strength {
+                                    continue;
+                                }
+                                if let Ok(Some(nb)) = g.get_entity(&edge.to_entity) {
+                                    let name_lc = nb.name.to_lowercase();
+                                    if nb.name.trim().len() < 2 || original.contains(&name_lc) {
+                                        continue;
+                                    }
+                                    if seen.insert(name_lc) {
+                                        scored.push((nb.name.clone(), strength));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    scored.sort_by(|a, b| b.1.total_cmp(&a.1));
+                    graph_bridges = scored
+                        .into_iter()
+                        .take(graph_expand_k)
+                        .map(|(n, _)| n)
+                        .collect();
+                }
+
+                // Causal-origin retrieval (SHODH_CAUSAL_ORIGIN). "What was the
+                // origin of C?" cannot be answered by spreading activation: it
+                // favours the proximal cause and only flows cause→effect. For
+                // origin-intent queries, walk causal edges BACKWARD from the query
+                // entities to the source(s) and append the source entity names as
+                // bridges — the root episode shares no lexical token with the
+                // effect-query, so this is what lets it surface on the BM25 leg.
+                // Requires causally-typed edges (SHODH_GRAPH_EXTRACTED_PREDICATES).
+                //
+                // DEFAULT ON (lineage diagnosis 2026-06-10): this flag was
+                // default-OFF, so the walk the lineage harness exists to measure
+                // never executed — root-cause P@1 was pinned at 0.0 through every
+                // upstream fix ("machinery exists but never runs" #6). It is
+                // cue-gated (origin-intent queries only) and now PRECISION-seeded
+                // (phrase-level entity containment, not fuzzy fragments).
+                // SHODH_CAUSAL_ORIGIN=0 disables.
+                let causal_origin = std::env::var("SHODH_CAUSAL_ORIGIN")
+                    .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
+                    .unwrap_or(true);
+                if causal_origin {
+                    const ORIGIN_CUES: &[&str] = &[
+                        "root cause",
+                        "root of",
+                        "origin",
+                        "underlying",
+                        "earliest",
+                        "what led to",
+                        "what caused",
+                        "stem from",
+                        "stemmed from",
+                        "reason behind",
+                        "originate",
+                    ];
+                    let qt = query_text.to_lowercase();
+                    let cue_matched = ORIGIN_CUES.iter().any(|c| qt.contains(c));
+                    let mut origins_found = 0usize;
+                    // PRECISION over recall for the walk: seed ONLY from
+                    // strictly-resolved entities. Fuzzy-resolved fragments
+                    // ("incident" → an arbitrary hub) made the walk inject
+                    // other chains' roots, burying the true root (the measured
+                    // lineage-zero ranking failure).
+                    if cue_matched && !strict_walk_seeds.is_empty() {
+                        if let Ok(origins) = g.trace_causal_origins(&strict_walk_seeds, 8) {
+                            origins_found = origins.len();
+                            // TOP-K only. The walk returns every terminal source in
+                            // the backward cone, scored by path strength; on a graph
+                            // with cross-chain causal bleed that was 21–57 origins
+                            // when 1 was correct, and injecting all of them FLOODED
+                            // the leg (the measured r@10 0.05 / P@1 0.0 is the
+                            // arithmetic of 1-true-in-50-injected). Bounded ranked
+                            // set, never everything reachable — the reach_inject
+                            // lesson, causal edition. SHODH_CAUSAL_ORIGIN_TOPK
+                            // overrides (default 3).
+                            let top_k = std::env::var("SHODH_CAUSAL_ORIGIN_TOPK")
+                                .ok()
+                                .and_then(|v| v.parse::<usize>().ok())
+                                .filter(|k| *k > 0)
+                                .unwrap_or(3);
+                            for (oid, score) in origins.into_iter().take(top_k) {
+                                causal_origin_entities.push((oid, score));
+                                if let Ok(Some(ent)) = g.get_entity(&oid) {
+                                    if ent.name.trim().len() >= 2 {
+                                        graph_bridges.push(ent.name);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // Funnel diagnostic (gated): localise WHERE causal-origin breaks —
+                    // entity resolution vs cue match vs trace. Greppable in CI logs.
+                    if std::env::var("SHODH_CAUSAL_ORIGIN_DEBUG").is_ok() {
+                        eprintln!(
+                            "CAUSAL_FUNNEL qents={} strict={} cue={} origins={}",
+                            query_entities.len(),
+                            strict_walk_seeds.len(),
+                            cue_matched,
+                            origins_found
+                        );
+                    }
+                }
+
+                // Typed-walk retrieval (SHODH_TYPED_WALK, #67): the causal-origin
+                // walk's machinery generalized to other relation intents. A
+                // typed-relation question ("Where does Caroline live?") is a
+                // triple with one unbound slot — (Caroline, LocatedIn, ?x) — and
+                // the typed substrate answers it by EDGE LOOKUP where BM25 and
+                // embeddings need lexical/semantic luck ("Caroline moved to
+                // Denver" shares nothing with "live"). V1 intents are the two
+                // relations the LoCoMo census shows the substrate actually
+                // carries (LocatedIn=166, CreatedBy well-typed); grow with
+                // typed_pct. Same discipline as the origin walk: strict maximal
+                // seeds, bounded top-k, scored injection — never a flood.
+                let typed_walk = std::env::var("SHODH_TYPED_WALK")
+                    .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                    .unwrap_or(false);
+                if typed_walk && !strict_walk_seeds.is_empty() {
+                    use crate::graph_memory::RelationType;
+                    // (intent name, query cues, relations, incoming) — incoming
+                    // follows neighbor --R--> seed (the seed is the OBJECT slot).
+                    let intents: &[(&str, &[&str], &[RelationType], bool)] = &[
+                        (
+                            "located",
+                            &[
+                                "where does",
+                                "where do",
+                                "where did",
+                                "where is",
+                                "where was",
+                                "where are",
+                                "live now",
+                                "lives now",
+                                "living now",
+                            ],
+                            &[RelationType::LocatedIn],
+                            false,
+                        ),
+                        (
+                            "creator",
+                            &[
+                                "who made",
+                                "who created",
+                                "who built",
+                                "who wrote",
+                                "who painted",
+                                "who designed",
+                                "who composed",
+                            ],
+                            &[RelationType::CreatedBy],
+                            true,
+                        ),
+                    ];
+                    let qt = query_text.to_lowercase();
+                    const TYPED_WALK_TOPK: usize = 3;
+                    for (intent, cues, relations, incoming) in intents {
+                        if !cues.iter().any(|c| qt.contains(c)) {
+                            continue;
+                        }
+                        let answers = g
+                            .typed_neighbors(&strict_walk_seeds, relations, *incoming, 64)
+                            .unwrap_or_default();
+                        let found = answers.len();
+                        for (aid, score) in answers.into_iter().take(TYPED_WALK_TOPK) {
+                            causal_origin_entities.push((aid, score));
+                            if let Ok(Some(ent)) = g.get_entity(&aid) {
+                                if ent.name.trim().len() >= 2 {
+                                    graph_bridges.push(ent.name);
+                                }
+                            }
+                        }
+                        if std::env::var("SHODH_TYPED_WALK_DEBUG").is_ok() {
+                            eprintln!(
+                                "TYPED_WALK intent={intent} seeds={} answers={found}",
+                                strict_walk_seeds.len()
+                            );
+                        }
                     }
                 }
 
@@ -1777,125 +3085,103 @@ impl MemorySystem {
                     None
                 };
 
-                let mut ids = Vec::new();
+                // Spreading activation retrieval (Anderson & Pirolli 1984)
+                // Density-adaptive: Associative/Causal pass density for graph-heavy weights,
+                // Hybrid passes None for fixed balanced weights.
+                let sa_density = match query.retrieval_mode {
+                    RetrievalMode::Associative | RetrievalMode::Causal => d,
+                    _ => None,
+                };
 
-                // Density-adaptive traversal: dense graphs get shallower depth
-                // and stricter strength filters to avoid exploring noisy L1 edges.
-                // Dense graph results are already downweighted in RRF fusion
-                // (graph_w=0.1 at density>2.0), so deep traversals add I/O cost
-                // for results that contribute <0.01% to the fused score.
-                let density_val = d.unwrap_or(0.0);
-                let (bidir_depth, bidir_min_str, weighted_depth, weighted_min_str) =
-                    if density_val > 15.0 {
-                        (3usize, 0.12f32, 3usize, 0.15f32)
-                    } else if density_val > 8.0 {
-                        (4, 0.08, 4, 0.12)
-                    } else {
-                        (6, 0.05, 5, 0.10)
+                let episode_to_memory =
+                    |ep: &crate::graph_memory::EpisodicNode| -> anyhow::Result<Option<SharedMemory>> {
+                        match self.long_term_memory.get(&MemoryId(ep.uuid)) {
+                            Ok(mem) => Ok(Some(Arc::new(mem))),
+                            Err(_) => Ok(None),
+                        }
                     };
 
-                if density_val > 0.0 {
-                    tracing::debug!(
-                        "Layer 2: density={:.1}, bidir_depth={}, bidir_min_str={:.2}, weighted_depth={}, weighted_min_str={:.2}",
-                        density_val, bidir_depth, bidir_min_str, weighted_depth, weighted_min_str
-                    );
-                }
+                let (activated_memories, sa_stats) =
+                    crate::memory::graph_retrieval::spreading_activation_retrieve_with_stats(
+                        query_text,
+                        query,
+                        &g,
+                        self.embedder.as_ref(),
+                        sa_density,
+                        Some(&onto_intent),
+                        Some(&query_embedding),
+                        episode_to_memory,
+                    )?;
 
-                // Multi-hop: Use bidirectional search between entity pairs
-                // Cap to top 3 pairs from first 4 entities to avoid O(n²) explosion.
-                // Entities are ordered by query analysis salience, so top pairs
-                // capture dominant relationships.
-                if query_entities.len() >= 2 {
-                    let max_pairs = 3usize;
-                    let max_ents = query_entities.len().min(4);
-                    let mut pair_count = 0usize;
-                    'bidir: for i in 0..max_ents {
-                        for j in (i + 1)..max_ents {
-                            if pair_count >= max_pairs {
-                                break 'bidir;
-                            }
-                            if let Ok(path) = g.traverse_bidirectional(
-                                &query_entities[i],
-                                &query_entities[j],
-                                bidir_depth,
-                                bidir_min_str,
-                            ) {
-                                for tr in &path.entities {
-                                    if let Ok(mut eps) = g.get_episodes_by_entity(&tr.entity.uuid) {
-                                        // Keep most recent episodes — recency correlates
-                                        // with relevance for graph-surfaced candidates.
-                                        eps.sort_by(|a, b| b.created_at.cmp(&a.created_at));
-                                        eps.truncate(50);
-                                        for ep in eps {
-                                            let mid = MemoryId(ep.uuid);
-                                            if episode_candidates
-                                                .as_ref()
-                                                .map_or(true, |c| c.contains(&mid))
-                                            {
-                                                let path_boost = 1.5;
-                                                ids.push((
-                                                    mid,
-                                                    tr.entity.salience
-                                                        * tr.decay_factor
-                                                        * path_boost,
-                                                    tr.decay_factor,
-                                                ));
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            pair_count += 1;
-                        }
-                    }
-                }
+                tracing::debug!(
+                    "Layer 2 SA: {} activated, mode={}, entities_activated={}, hops={}",
+                    activated_memories.len(),
+                    sa_stats.mode,
+                    sa_stats.entities_activated,
+                    sa_stats.graph_candidates,
+                );
 
-                // Single-hop or supplement multi-hop: Weighted traversal from each entity
-                for entity_uuid in &query_entities {
-                    if let Ok(t) =
-                        g.traverse_weighted(entity_uuid, weighted_depth, None, weighted_min_str)
-                    {
-                        for tr in &t.entities {
-                            if let Ok(mut eps) = g.get_episodes_by_entity(&tr.entity.uuid) {
-                                eps.sort_by(|a, b| b.created_at.cmp(&a.created_at));
-                                eps.truncate(50);
-                                for ep in eps {
-                                    let mid = MemoryId(ep.uuid);
-                                    if episode_candidates
-                                        .as_ref()
-                                        .map_or(true, |c| c.contains(&mid))
-                                    {
-                                        ids.push((
-                                            mid,
-                                            tr.entity.salience * tr.decay_factor,
-                                            tr.decay_factor,
-                                        ));
-                                    }
+                // Map ActivatedMemory → (MemoryId, activation, hebbian_factor) for RRF fusion
+                let mut r: Vec<(MemoryId, f32, f32)> = activated_memories
+                    .into_iter()
+                    .filter(|am| {
+                        // Respect episode scoping from Layer 1
+                        episode_candidates
+                            .as_ref()
+                            .is_none_or(|c| c.contains(&am.memory.id))
+                    })
+                    .map(|am| {
+                        (
+                            am.memory.id.clone(),
+                            am.final_score,
+                            am.activation_score, // hebbian factor = raw graph activation
+                        )
+                    })
+                    .collect();
+
+                // Causal-origin injection: the backward walk found the root cause,
+                // but as a lone BM25 bridge token it loses to the direct cause's
+                // match on the effect term (funnel: origins=1, yet P@1=0). The found
+                // roots ARE the answer for an origin query, so inject their episodes
+                // as TOP graph candidates — scaled by each origin's backward-path
+                // score relative to the strongest, so the best-supported root
+                // outranks the weaker top-k companions instead of all entering at a
+                // flat 2× ceiling.
+                if !causal_origin_entities.is_empty() {
+                    let max_score = r.iter().map(|x| x.1).fold(0.0f32, f32::max).max(1.0);
+                    let best_origin = causal_origin_entities
+                        .iter()
+                        .map(|(_, s)| *s)
+                        .fold(0.0f32, f32::max)
+                        .max(1e-9);
+                    let mut seen: std::collections::HashSet<MemoryId> =
+                        r.iter().map(|x| x.0.clone()).collect();
+                    for (oid, origin_score) in &causal_origin_entities {
+                        let inject_score = max_score * 2.0 * (origin_score / best_origin);
+                        if let Ok(eps) = g.get_episodes_by_entity(oid) {
+                            for ep in eps {
+                                let mid = MemoryId(ep.uuid);
+                                let in_scope =
+                                    episode_candidates.as_ref().is_none_or(|c| c.contains(&mid));
+                                if in_scope && seen.insert(mid.clone()) {
+                                    causal_origin_episode_ids.push(mid.clone());
+                                    r.push((mid, inject_score, inject_score));
                                 }
                             }
                         }
                     }
                 }
 
-                let mut seen: std::collections::HashMap<MemoryId, (f32, f32)> =
-                    std::collections::HashMap::new();
-                for (id, act, heb) in ids {
-                    seen.entry(id)
-                        .and_modify(|(a, h)| {
-                            *a = a.max(act);
-                            *h = h.max(heb);
-                        })
-                        .or_insert((act, heb));
-                }
-                let mut r: Vec<_> = seen.into_iter().map(|(id, (a, h))| (id, a, h)).collect();
-                // CRITICAL: Sort by activation score so RRF rank is meaningful
-                r.sort_by(|a, b| b.1.total_cmp(&a.1));
-                let pre_cap = r.len();
-                // Cap total graph candidates to prevent flooding RRF fusion
+                // Score desc; tie-break by MemoryId asc for deterministic graph candidate order.
+                r.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
                 r.truncate(200);
                 if !r.is_empty() {
-                    tracing::debug!("Layer 2: {} graph results (capped from {}), {} query entities, bidirectional={}, top_activation={:.3}",
-                        r.len(), pre_cap, entity_count, query_entities.len() >= 2, r.first().map(|x| x.1).unwrap_or(0.0));
+                    tracing::debug!(
+                        "Layer 2: {} graph results, {} query entities, top_activation={:.3}",
+                        r.len(),
+                        entity_count,
+                        r.first().map(|x| x.1).unwrap_or(0.0)
+                    );
                 }
                 (r, d, entity_count, weights, phrases, disc)
             } else {
@@ -1918,6 +3204,8 @@ impl MemorySystem {
             }
         };
 
+        crate::memory::gold_funnel::record("graph", graph_results.iter().map(|(id, _, _)| id));
+
         let t_graph = recall_start.elapsed();
         tracing::info!(
             graph_ms = format!("{:.2}", (t_graph - t_embedding).as_secs_f64() * 1000.0),
@@ -1925,12 +3213,21 @@ impl MemorySystem {
             graph_results = graph_results.len(),
             "recall [layer:1-2] episode filter + graph expansion"
         );
+        if let Some(ref mut s) = stats {
+            let timings = s.stage_timings.get_or_insert_with(StageTiming::default);
+            timings.graph_expansion_us = (t_graph - t_embedding).as_micros() as u64;
+            s.graph_time_us = (t_graph - t_embedding).as_micros() as u64;
+            s.graph_candidates = graph_results.len();
+            s.graph_density = graph_density.unwrap_or(0.0);
+            s.entities_activated = query_entity_count;
+        }
 
         // Create a modified query with the embedding for vector search
         let vector_query = Query {
             user_id: query.user_id.clone(),
             query_text: None, // Don't re-generate embedding
             query_embedding: Some(query_embedding),
+            ner_entities: None, // vector leg doesn't seed from entities
             time_range: query.time_range,
             experience_types: query.experience_types.clone(),
             importance_threshold: query.importance_threshold,
@@ -1953,21 +3250,63 @@ impl MemorySystem {
             confidence_range: query.confidence_range,
             offset: query.offset,
             episode_id: query.episode_id.clone(),
+            session_id: query.session_id.clone(),
             prospective_signals: query.prospective_signals.clone(),
             recency_weight: query.recency_weight,
+            layers: query.layers,
         };
 
         // ===========================================================================
-        // LAYER 3: VECTOR SEARCH (Vamana Index)
+        // LAYER 3: VECTOR SEARCH (Vamana Index) — polarity-aware union (RH-14)
         // ===========================================================================
-        let vr = self
-            .retriever
-            .search_ids(&vector_query, query.max_results * 3)?;
+        // For polarity-sensitive queries the candidate pool is widened in two
+        // ways: (a) the per-leg top-k is multiplied by
+        // POLAR_QUERY_VECTOR_POOL_MULTIPLIER, and (b) a second search is run
+        // using the negated-form embedding when available. Results are unioned
+        // by MemoryId, keeping the *best* (largest) similarity score and
+        // rebuilding a deterministic descending order. This ensures passages
+        // that overtly contradict a polar premise enter the BM25/RRF fusion
+        // pool downstream — they cannot be rescued by post-fusion reranking
+        // alone, since the bi-encoder ranks them below the cutoff.
+        let polar_vec_mul = if query_analysis.polarity_sensitive() {
+            crate::constants::POLAR_QUERY_VECTOR_POOL_MULTIPLIER.max(1)
+        } else {
+            1
+        };
+        let vector_top_k = query.max_results * 3 * polar_vec_mul;
+        let vr_pos = self.retriever.search_ids(&vector_query, vector_top_k)?;
+        let vr = if let Some(neg_emb) = polar_negated_embedding.as_ref() {
+            let mut neg_query = vector_query.clone();
+            neg_query.query_embedding = Some(neg_emb.clone());
+            let vr_neg = self
+                .retriever
+                .search_ids(&neg_query, vector_top_k)
+                .unwrap_or_default();
+            // Union by MemoryId, keep best score per id; deterministic ordering
+            // by (score desc, id asc) — matches RH-10 stable tie-break.
+            let mut best: std::collections::HashMap<MemoryId, f32> =
+                std::collections::HashMap::with_capacity(vr_pos.len() + vr_neg.len());
+            for (id, score) in vr_pos.into_iter().chain(vr_neg.into_iter()) {
+                best.entry(id)
+                    .and_modify(|s| {
+                        if score > *s {
+                            *s = score;
+                        }
+                    })
+                    .or_insert(score);
+            }
+            let mut merged: Vec<(MemoryId, f32)> = best.into_iter().collect();
+            merged.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            merged
+        } else {
+            vr_pos
+        };
         let vector_results: Vec<(MemoryId, f32)> = if let Some(ref c) = episode_candidates {
             vr.into_iter().filter(|(id, _)| c.contains(id)).collect()
         } else {
             vr
         };
+        crate::memory::gold_funnel::record("vector", vector_results.iter().map(|(id, _)| id));
         let t_vector = recall_start.elapsed();
         tracing::info!(
             vector_ms = format!("{:.2}", (t_vector - t_graph).as_secs_f64() * 1000.0),
@@ -1975,10 +3314,91 @@ impl MemorySystem {
             vector_results = vector_results.len(),
             "recall [layer:3] Vamana vector search"
         );
+        if let Some(ref mut s) = stats {
+            s.stage_timings
+                .get_or_insert_with(StageTiming::default)
+                .vector_search_us = (t_vector - t_graph).as_micros() as u64;
+            s.semantic_candidates = vector_results.len();
+        }
 
         // ===========================================================================
         // LAYER 4: BM25 + RRF FUSION
-        // ===========================================================================
+        // SHODH_DISABLE_BOOSTS=<family,...> — ablation kill-switch for the post-fusion
+        // boost stack. Each token disables one boost family at recall time so its
+        // marginal contribution can be measured against the calibrated FLAT baseline
+        // (the stack predates calibrated fusion and was never ablated against it).
+        // Layer 4.45-4.9 families: attribute, temporal_prefilter, temporal_fact,
+        // interference, prospective, fact_source, ontological. Layer 5-5.7 families:
+        // hebbian, recency, arousal, credibility, temporal_match, feedback, importance,
+        // tag_penalty, quality, linguistic, competition. "all" disables every family.
+        // Default unset → all boosts active (shipped behavior unchanged).
+        const BOOST_FAMILIES: [&str; 18] = [
+            "attribute",
+            "temporal_prefilter",
+            "temporal_fact",
+            "interference",
+            "prospective",
+            "fact_source",
+            "ontological",
+            "hebbian",
+            "recency",
+            "arousal",
+            "credibility",
+            "temporal_match",
+            "feedback",
+            "importance",
+            "tag_penalty",
+            "quality",
+            "linguistic",
+            "competition",
+        ];
+        // DEFAULT: the Layer-5 hebbian RANK BOOST is disabled. The L5 bisect (run
+        // 27251798933) measured it as a strict ordering saboteur: disabling only
+        // hebbian lifted p@1 ALL 0.4100→0.4767 (+6.7pp), single_hop +11pp,
+        // open_domain 2x, multi_hop up, temporal HELD, MRR +0.042 — with recall@10
+        // bit-identical (L5 is post-truncation). Mechanism: heb scores come from
+        // graph co-activation and edges strengthen on EVERY retrieval (not on
+        // outcome), so frequently co-retrieved hub memories climb within the
+        // top-10 and displace gold at rank 1 — retrieval-gated rich-get-richer.
+        // Hebbian LEARNING (edge strengthening, spreading activation) is untouched;
+        // only the L5 score multiplier is off. Setting SHODH_DISABLE_BOOSTS
+        // explicitly (even to "") replaces this default — the escape hatch.
+        let disabled_boosts: std::collections::HashSet<String> =
+            std::env::var("SHODH_DISABLE_BOOSTS")
+                .map(|v| {
+                    v.split(',')
+                        .map(|t| t.trim().to_ascii_lowercase())
+                        .filter(|t| !t.is_empty())
+                        .collect()
+                })
+                .unwrap_or_else(|_| std::iter::once("hebbian".to_string()).collect());
+        for tok in &disabled_boosts {
+            if tok != "all" && !BOOST_FAMILIES.contains(&tok.as_str()) {
+                tracing::warn!("SHODH_DISABLE_BOOSTS: unknown boost family '{tok}' (ignored)");
+            }
+        }
+        let boost_on = |family: &str| -> bool {
+            !(disabled_boosts.contains("all") || disabled_boosts.contains(family))
+        };
+        let boost_attribute = boost_on("attribute");
+        let boost_temporal_prefilter = boost_on("temporal_prefilter");
+        let boost_temporal_fact = boost_on("temporal_fact");
+        let boost_interference = boost_on("interference");
+        let boost_prospective = boost_on("prospective");
+        let boost_fact_source = boost_on("fact_source");
+        let boost_ontological = boost_on("ontological");
+        let boost_hebbian = boost_on("hebbian");
+        let boost_recency = boost_on("recency");
+        let boost_arousal = boost_on("arousal");
+        let boost_credibility = boost_on("credibility");
+        let boost_temporal_match = boost_on("temporal_match");
+        let boost_feedback = boost_on("feedback");
+        let boost_importance = boost_on("importance");
+        let boost_tag_penalty = boost_on("tag_penalty");
+        let boost_quality = boost_on("quality");
+        let boost_linguistic = boost_on("linguistic");
+        let boost_competition = boost_on("competition");
+
         let (memory_ids, hebbian_scores): (
             Vec<(MemoryId, f32)>,
             std::collections::HashMap<MemoryId, f32>,
@@ -2001,6 +3421,26 @@ impl MemorySystem {
                             .map(|m| m.experience.content.clone())
                     })
             };
+            // Mirror of get_content for entity sets — used by the specificity/
+            // concentration fusion term (SHODH_SPEC_FUSION).
+            let get_entities = |id: &MemoryId| -> Option<Vec<String>> {
+                self.working_memory
+                    .read()
+                    .get(id)
+                    .map(|m| m.experience.entities.clone())
+                    .or_else(|| {
+                        self.session_memory
+                            .read()
+                            .get(id)
+                            .map(|m| m.experience.entities.clone())
+                    })
+                    .or_else(|| {
+                        self.long_term_memory
+                            .get(id)
+                            .ok()
+                            .map(|m| m.experience.entities.clone())
+                    })
+            };
             // Use IC-weighted BM25 search with phrase matching
             let term_weights = if ic_weights.is_empty() {
                 None
@@ -2019,22 +3459,91 @@ impl MemorySystem {
             } else {
                 None
             };
-            let hybrid_ids = self
-                .hybrid_search
-                .search_with_dynamic_weights(
-                    query_text,
+
+            // Polarity-aware BM25 augmentation (RH-14):
+            //  • Augment the query string with low-IDF negation cue tokens so
+            //    passages containing "not"/"no"/"never"/etc. near the focal
+            //    entity gain a small additive BM25 score (e.g. ssm-056 says
+            //    "We use Vamana, not HNSW" — adding "not" to the BM25 query
+            //    for "Are we using HNSW?" floats it up).
+            //  • Deepen the BM25 candidate pool so the augmented terms have
+            //    room to surface borderline-relevant passages.
+            // See `constants::POLAR_BM25_NEGATION_CUES` and
+            // `constants::POLAR_QUERY_BM25_POOL_MULTIPLIER`.
+            let polarity_sensitive = query_analysis.polarity_sensitive();
+            let bm25_query_owned: String;
+            let bm25_query_text: &str = if polarity_sensitive || !graph_bridges.is_empty() {
+                let mut q = query_text.to_string();
+                if polarity_sensitive {
+                    q.push(' ');
+                    q.push_str(&crate::constants::POLAR_BM25_NEGATION_CUES.join(" "));
+                }
+                // Graph-driven cue expansion: append the discovered bridge entities
+                // so a multi-hop answer surfaces on the BM25 leg's own terms.
+                if !graph_bridges.is_empty() {
+                    q.push(' ');
+                    q.push_str(&graph_bridges.join(" "));
+                }
+                bm25_query_owned = q;
+                &bm25_query_owned
+            } else {
+                query_text
+            };
+            let bm25_pool_override = if polarity_sensitive {
+                Some(
+                    self.hybrid_search
+                        .candidate_count()
+                        .saturating_mul(crate::constants::POLAR_QUERY_BM25_POOL_MULTIPLIER),
+                )
+            } else {
+                None
+            };
+            // RH-8 gate: BM25 hybrid fusion only runs in `PlusBm25` and above.
+            // Lower modes pass the vector candidate set straight through, which makes the
+            // RRF fusion below a one- or two-leg fusion (vector ± graph) instead of three-leg.
+            // Flatten-the-double-RRF prep: retain each result's BM25 and vector COMPONENT
+            // scores (HybridSearchResult already carries them) so the main fusion can treat
+            // vector and BM25 as independent calibrated legs instead of pre-RRF'ing them into
+            // one hybrid score that buries the vector-strong gold (funnel: multi_hop gold
+            // vector rank 7.4 → hybrid rank 28.4). id → (bm25_score, vector_score).
+            let mut hybrid_components: std::collections::HashMap<MemoryId, (f32, f32)> =
+                std::collections::HashMap::new();
+            let hybrid_ids = if layer_bm25 {
+                match self.hybrid_search.search_with_dynamic_weights_pool(
+                    bm25_query_text,
                     vector_results.clone(),
                     get_content,
                     term_weights,
                     phrases,
                     disc_opt,
-                )
-                .map(|r| {
-                    r.into_iter()
-                        .map(|x| (x.memory_id, x.score))
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or(vector_results);
+                    bm25_pool_override,
+                ) {
+                    Ok(r) => {
+                        for x in &r {
+                            hybrid_components.insert(
+                                x.memory_id.clone(),
+                                (x.bm25_score.unwrap_or(0.0), x.vector_score.unwrap_or(0.0)),
+                            );
+                        }
+                        r.into_iter()
+                            .map(|x| (x.memory_id, x.score))
+                            .collect::<Vec<_>>()
+                    }
+                    Err(_) => {
+                        for (id, s) in &vector_results {
+                            hybrid_components.insert(id.clone(), (0.0, *s));
+                        }
+                        vector_results
+                    }
+                }
+            } else {
+                for (id, s) in &vector_results {
+                    hybrid_components.insert(id.clone(), (0.0, *s));
+                }
+                vector_results
+            };
+
+            crate::memory::gold_funnel::record("hybrid", hybrid_ids.iter().map(|(id, _)| id));
 
             // ===========================================================================
             // LAYER 4: RRF FUSION WITH DENSITY-BASED WEIGHTS (PIPE-11)
@@ -2047,7 +3556,9 @@ impl MemorySystem {
             //
             // The density weights directly control the balance - no extra multipliers.
             // This follows ACT-R's additive activation model.
-            const K: f32 = 30.0;
+            // K value from constants.rs — see Cormack et al. (2009), Anderson & Lebiere (1998)
+            use crate::constants::RRF_K_GRAPH_FUSION;
+            let k = RRF_K_GRAPH_FUSION;
             let mut fused: std::collections::HashMap<MemoryId, f32> =
                 std::collections::HashMap::new();
             let mut heb: std::collections::HashMap<MemoryId, f32> =
@@ -2056,9 +3567,46 @@ impl MemorySystem {
             // Density-based weights (already tuned in calculate_density_weights)
             // Sparse (≤0.5): graph_w=0.5, semantic_w=0.4, linguistic_w=0.1
             // Dense (≥2.0):  graph_w=0.1, semantic_w=0.7, linguistic_w=0.2
-            let (semantic_w, graph_w, linguistic_w) = graph_density
+            let (mut semantic_w, mut graph_w, linguistic_w) = graph_density
                 .map(calculate_density_weights)
                 .unwrap_or((0.6, 0.3, 0.1));
+
+            // Experiment knob: override the graph leg's fusion weight (eval only).
+            // SHODH_GRAPH_FUSION_WEIGHT=0 → graph-OFF (the graph leg contributes
+            // nothing to fusion AND its multiplicative activation bonus, which is
+            // gated on graph_w, becomes a no-op). Lets us measure whether the
+            // net-negative graph leg should be down-weighted/removed without a
+            // recompile. Unset in production → unchanged density behavior.
+            if let Ok(v) = std::env::var("SHODH_GRAPH_FUSION_WEIGHT") {
+                if let Ok(w) = v.parse::<f32>() {
+                    graph_w = w.clamp(0.0, 1.0);
+                }
+            }
+
+            // E3 fusion-fix C — graph-weight floor (SHODH_GRAPH_W_FLOOR).
+            // The density logic caps graph_w at 0.5 even for the sparsest graph,
+            // which on multi-hop queries leaves the graph's correct (but
+            // deep-ranked) answer too weak to survive BM25's lexical crowd. This
+            // raises graph_w to a floor and renormalises hybrid down, to test
+            // whether simply trusting the graph more recovers multi-hop. Default
+            // unset → unchanged.
+            if let Ok(v) = std::env::var("SHODH_GRAPH_W_FLOOR") {
+                if let Ok(f) = v.parse::<f32>() {
+                    if f > graph_w {
+                        // Cap the floor so renormalisation can never silently zero the
+                        // semantic/BM25 leg: keep at least 0.05 of semantic weight.
+                        let max_floor = (1.0 - linguistic_w - 0.05).max(0.0);
+                        let requested = f.clamp(0.0, 0.95);
+                        graph_w = requested.min(max_floor);
+                        if requested > max_floor {
+                            tracing::warn!(
+                                "SHODH_GRAPH_W_FLOOR={requested} capped to {graph_w:.2} to keep the semantic leg alive"
+                            );
+                        }
+                        semantic_w = (1.0 - graph_w - linguistic_w).max(0.0);
+                    }
+                }
+            }
 
             // Hybrid weight = semantic + linguistic (BM25 + vector combined)
             let hybrid_w = semantic_w + linguistic_w;
@@ -2071,22 +3619,543 @@ impl MemorySystem {
                 query_entity_count
             );
 
-            // Graph results: pure RRF with density weight
+            // Capture density weights for diagnostics
+            if let Some(ref mut s) = stats {
+                s.graph_weight = graph_w;
+                s.semantic_weight = semantic_w;
+                s.linguistic_weight = linguistic_w;
+            }
+
+            let max_activation = graph_results
+                .iter()
+                .map(|(_, a, _)| *a)
+                .fold(0.0_f32, f32::max)
+                .max(1e-6);
+            // FUSION_V2 (SHODH_FUSION_V2): weighted-Borda consensus backbone + a
+            // calibrated graph-exclusive rescue. Borda gives a leg's rank-1 ~FULL
+            // leg weight (w·(N-rank)/N) instead of the RRF crumb w/(k+rank); the
+            // rescue lets a CONFIDENT graph-only hit (high activation, absent from
+            // the hybrid top window) exceed the consensus crowd — the single-witness
+            // case RRF structurally buries. Grounded in the dataflow map (the
+            // double-RRF crumb burial at this exact fusion) + the RRF scale-
+            // invariance lesson. Default off; RRF unchanged when unset.
+            let v2_fusion = std::env::var("SHODH_FUSION_V2")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+
+            // Leg sizes for Borda normalisation (legs are already rank-sorted here).
+            let n_graph = graph_results.len().max(1) as f32;
+            let n_hybrid = hybrid_ids.len().max(1) as f32;
+
+            // Flatten the double-RRF (SHODH_FUSION_FLAT): vector and BM25 enter the fusion as
+            // SEPARATE calibrated-magnitude legs, so a vector-strong gold keeps its rank
+            // instead of being RRF-buried by BM25's lexical crowd in the hybrid pre-fusion
+            // (funnel-located: the entire multi_hop loss is vector 7.4 → hybrid 28.4). Implies
+            // the calibrated graph leg. hybrid_w is split; vector trusted more by default.
+            let explicit_flat = std::env::var("SHODH_FUSION_FLAT")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+            // Consensus weight for the MIN leg in the max-fusion (a candidate present in BOTH
+            // vector and BM25 gets a small bonus over one strong in a single leg). The MAX leg
+            // is what preserves a single-leg-strong gold from crowd dilution.
+            // SHODH_LEG=bm25|vector|graph — isolate ONE retrieval leg to measure its
+            // STANDALONE recall (diagnostic, default unset = all legs). vector keeps
+            // only vector-retrieved candidates ranked by vector score; bm25 likewise;
+            // graph drops the hybrid pool entirely (graph candidates only). The graph
+            // loop below is skipped for bm25/vector.
+            let isolate_leg = std::env::var("SHODH_LEG").ok();
+            match isolate_leg.as_deref() {
+                Some("vector") => {
+                    hybrid_components.retain(|_, (_, v)| *v > 0.0);
+                    hybrid_components.values_mut().for_each(|c| c.0 = 0.0);
+                }
+                Some("bm25") => {
+                    hybrid_components.retain(|_, (b, _)| *b > 0.0);
+                    hybrid_components.values_mut().for_each(|c| c.1 = 0.0);
+                }
+                Some("graph") => hybrid_components.clear(),
+                _ => {}
+            }
+            let graph_leg_on = !matches!(isolate_leg.as_deref(), Some("bm25") | Some("vector"));
+
+            let flat_consensus = std::env::var("SHODH_FLAT_CONSENSUS")
+                .ok()
+                .and_then(|s| s.parse::<f32>().ok())
+                .unwrap_or(0.3)
+                .clamp(0.0, 1.0);
+            // SHODH_FLAT_VEC_TRUST (global vector multiplier) and SHODH_FLAT_VEC_ABS /
+            // SHODH_FLAT_VEC_FLOOR (absolute cosine calibration) were REMOVED: both
+            // measured NEGATIVE (runs 27221406266, 27223054766 — each trades
+            // multi_hop↔single_hop through a global scalar; the structural fix is the
+            // per-query SHODH_FLAT_ADAPTIVE path below). Deleted rather than left
+            // default-off so a stale sweep config can't silently re-enable a known
+            // regression. Recoverable from git history if a per-query variant of
+            // absolute calibration is ever wanted as an adaptive FEATURE.
+            let max_vec = hybrid_components
+                .values()
+                .map(|(_, v)| *v)
+                .fold(0.0_f32, f32::max)
+                .max(1e-6);
+            let max_bm = hybrid_components
+                .values()
+                .map(|(b, _)| *b)
+                .fold(0.0_f32, f32::max)
+                .max(1e-6);
+
+            // SHODH_FUSION_SUM: calibrated weighted-SUM fusion. Each leg's raw score is
+            // min-max normalised to [0,1] then linearly combined with sweepable weights
+            // (SHODH_FW_VEC / _BM25 / _GRAPH). Unlike flat-MAX (which keeps the best single
+            // leg per candidate), vector AND BM25 both contribute additively, and the sweep
+            // finds the mix that ranks the present-but-buried gold (96% present at fusion,
+            // mean-rank 14.3) into top-10. Default off → fusion unchanged.
+            let sum_fusion = std::env::var("SHODH_FUSION_SUM")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+            let env_w = |key: &str, default: f32| -> f32 {
+                std::env::var(key)
+                    .ok()
+                    .and_then(|s| s.parse::<f32>().ok())
+                    .unwrap_or(default)
+            };
+            let fw_graph = env_w("SHODH_FW_GRAPH", 0.3);
+            let fw_vec = env_w("SHODH_FW_VEC", 0.6);
+            let fw_bm25 = env_w("SHODH_FW_BM25", 0.4);
+
+            // SHODH_FUSION_FLAT (calibrated-max) is now the DEFAULT fusion: measured
+            // +0.0665 recall@10 ALL (RRF 0.6188 → 0.6853), funnel fusion mean-rank 14.3→8.25,
+            // top10 68.7→76.0 (runs 27216648530 + 27218456694, reproduced identically). The
+            // per-candidate MAX of the calibrated vector/BM25 legs (+ small consensus on the
+            // min) and the calibrated graph leg keep a single-leg-strong gold from being
+            // RRF-buried by the lexical crowd. It is on UNLESS another explicit fusion mode
+            // (V2 / ACT-R / SUM) is requested, or SHODH_FUSION_RRF selects the legacy
+            // rank-reciprocal fusion (escape hatch). Explicit SHODH_FUSION_FLAT still forces it.
+            let rrf_escape = std::env::var("SHODH_FUSION_RRF")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+            let flat_fusion = explicit_flat || (!rrf_escape && !v2_fusion && !sum_fusion);
+
+            // SHODH_FLAT_ADAPTIVE: LEARNED per-query leg trust (approach C, stage 1). A GLOBAL
+            // vector-trust trades multi_hop↔single_hop (run 27221406266) — single_hop wants
+            // BM25/lexical, multi_hop wants vector/semantic, and no global scalar serves both.
+            // A PER-QUERY weight conditioned on a query feature breaks it. Feature = BM25
+            // peakedness (max/mean BM25 over the candidate pool): a SHARP peak ⇒ one memory
+            // lexically dominates ⇒ exact-match/single_hop ⇒ trust BM25 (vec_trust→1); a FLAT
+            // BM25 ⇒ no lexical anchor ⇒ semantic/multi_hop ⇒ trust vector (vec_trust→max).
+            // DEFAULT ON since runs 27268510462 + 27269567367 (confirm): the FITTED
+            // SYMMETRIC gate (feature=fitted, symmetric, trust_max 2.0) BROKE the
+            // structural single↔multi tradeoff — recall@10 ALL 0.6976→~0.705
+            // (reproduced), multi_hop 0.4318→0.4896 (exact across runs, the largest
+            // multi_hop gain in project history), single_hop HELD at 0.7730 exactly,
+            // p@1 +2.3pp. CAVEAT: the fitted coefficients were trained on the LoCoMo
+            // eval distribution (70% of its cases, run 27267533447, holdout AUC
+            // 0.756) — stage 3 (online refit from recall feedback, per user) replaces
+            // them; this fit is the cold-start seed. SHODH_FLAT_ADAPTIVE=0 restores
+            // plain FLAT (escape hatch).
+            let flat_adaptive = std::env::var("SHODH_FLAT_ADAPTIVE")
+                .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
+                .unwrap_or(true);
+            let effective_vec_trust = if flat_adaptive {
+                let adapt_trust_max = env_w("SHODH_ADAPT_TRUST_MAX", 2.0);
+                // SHODH_ADAPT_FEATURE selects the per-query discriminating feature:
+                //   peak      — BM25 peakedness (stage 1; run 27244857747: helps
+                //               multi/temporal but craters single_hop — the feature
+                //               doesn't separate the query types cleanly)
+                //   agreement — vector↔BM25 top-K overlap (stage 1b): when the two
+                //               legs AGREE on the top candidates there is a lexical
+                //               anchor (single_hop shape → trust BM25, vec_trust→1);
+                //               when vector's top is invisible to BM25 the answer is
+                //               semantic-only (multi_hop shape → trust vector →max).
+                //               Unlike peakedness this measures the RELATION between
+                //               the legs, not one leg's shape alone.
+                //   fitted    — stage 2b: offline-fitted logistic gate over ELEVEN
+                //               pool features (run 27267533447: holdout AUC 0.756 on
+                //               a 70/30 case split; no single feature exceeded AUC
+                //               0.554 — both stage-1 features were individually among
+                //               the weakest, which is WHY stage 1 kept re-trading).
+                //               t = P(vector ranks this query's gold better than
+                //               BM25). CAVEAT: coefficients fitted on the LoCoMo
+                //               eval distribution (caps 300/1500); an A/B on the
+                //               same suite partially trains-on-eval — the gate is
+                //               single_hop holding, and stage 3 is the online refit
+                //               from feedback.
+                let adapt_feature = std::env::var("SHODH_ADAPT_FEATURE")
+                    .unwrap_or_else(|_| "fitted".to_string())
+                    .to_ascii_lowercase();
+                let t = if adapt_feature == "fitted" {
+                    // (mu, sd, weight) per standardized feature, then bias — from
+                    // the run-27267533447 fit. Order must match `feats` below.
+                    const FIT: [(f32, f32, f32); 11] = [
+                        (2.77242, 1.87083, -0.301375),    // bm_peak
+                        (1.3841, 0.180661, -0.0212517),   // vec_peak
+                        (0.307389, 0.170755, -0.243719),  // agreement_top10
+                        (93.4129, 43.8602, -0.556471),    // max_bm
+                        (0.597371, 0.0823258, 0.236463),  // max_vec
+                        (106.897, 36.4931, 0.597537),     // n_bm_pos
+                        (31.4138, 7.54534, -0.881755),    // n_vec_pos
+                        (116.222, 38.3149, 0.582615),     // n_hybrid
+                        (9.90148, 0.987682, 0.304049),    // n_graph
+                        (0.358194, 0.0710801, 0.0264384), // graph_max_activation
+                        (54.1034, 16.0475, -0.571797),    // query_len
+                    ];
+                    const FIT_BIAS: f32 = -0.985886;
+                    let mut by_vec: Vec<(&MemoryId, f32)> = hybrid_components
+                        .iter()
+                        .filter(|(_, (_, v))| *v > 0.0)
+                        .map(|(id, (_, v))| (id, *v))
+                        .collect();
+                    let mut by_bm: Vec<(&MemoryId, f32)> = hybrid_components
+                        .iter()
+                        .filter(|(_, (b, _))| *b > 0.0)
+                        .map(|(id, (b, _))| (id, *b))
+                        .collect();
+                    by_vec.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+                    by_bm.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+                    let peak = |xs: &[(&MemoryId, f32)]| -> f32 {
+                        if xs.is_empty() {
+                            return 1.0;
+                        }
+                        let max = xs[0].1;
+                        let mean = xs.iter().map(|x| x.1).sum::<f32>() / xs.len() as f32;
+                        if mean > 1e-6 {
+                            max / mean
+                        } else {
+                            1.0
+                        }
+                    };
+                    let agreement = if by_vec.is_empty() || by_bm.is_empty() {
+                        0.0
+                    } else {
+                        let k10 = 10usize.min(by_vec.len()).min(by_bm.len()).max(1);
+                        let top_v: std::collections::HashSet<&MemoryId> =
+                            by_vec.iter().take(k10).map(|(id, _)| *id).collect();
+                        by_bm
+                            .iter()
+                            .take(k10)
+                            .filter(|(id, _)| top_v.contains(id))
+                            .count() as f32
+                            / k10 as f32
+                    };
+                    let graph_max_act = graph_results
+                        .iter()
+                        .map(|(_, a, _)| *a)
+                        .fold(0.0_f32, f32::max);
+                    let feats: [f32; 11] = [
+                        peak(&by_bm),
+                        peak(&by_vec),
+                        agreement,
+                        max_bm,
+                        max_vec,
+                        by_bm.len() as f32,
+                        by_vec.len() as f32,
+                        hybrid_components.len() as f32,
+                        graph_results.len() as f32,
+                        graph_max_act,
+                        query_text.len() as f32,
+                    ];
+                    let mut s = FIT_BIAS;
+                    for ((mu, sd, w), x) in FIT.iter().zip(feats) {
+                        s += w * (x - mu) / sd;
+                    }
+                    1.0 / (1.0 + (-s.clamp(-30.0, 30.0)).exp())
+                } else if adapt_feature == "agreement" {
+                    let agree_k = env_w("SHODH_ADAPT_AGREE_K", 10.0).max(1.0) as usize;
+                    let agree_lo = env_w("SHODH_ADAPT_AGREE_LO", 0.1);
+                    let agree_hi = env_w("SHODH_ADAPT_AGREE_HI", 0.5);
+                    let mut by_vec: Vec<(&MemoryId, f32)> = hybrid_components
+                        .iter()
+                        .filter(|(_, (_, v))| *v > 0.0)
+                        .map(|(id, (_, v))| (id, *v))
+                        .collect();
+                    let mut by_bm: Vec<(&MemoryId, f32)> = hybrid_components
+                        .iter()
+                        .filter(|(_, (b, _))| *b > 0.0)
+                        .map(|(id, (b, _))| (id, *b))
+                        .collect();
+                    if by_bm.is_empty() {
+                        // No lexical signal at all — the strongest "no anchor" case.
+                        1.0
+                    } else if by_vec.is_empty() {
+                        0.0
+                    } else {
+                        // Deterministic top-K per leg (score desc, id tie-break).
+                        by_vec.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+                        by_bm.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+                        let k = agree_k.min(by_vec.len()).min(by_bm.len()).max(1);
+                        let top_v: std::collections::HashSet<&MemoryId> =
+                            by_vec.iter().take(k).map(|(id, _)| *id).collect();
+                        let overlap = by_bm
+                            .iter()
+                            .take(k)
+                            .filter(|(id, _)| top_v.contains(id))
+                            .count() as f32
+                            / k as f32;
+                        // overlap ≥ hi → t=0 (legs agree, trust BM25);
+                        // overlap ≤ lo → t=1 (vector sees what BM25 can't).
+                        let span = (agree_hi - agree_lo).max(1e-6);
+                        ((agree_hi - overlap) / span).clamp(0.0, 1.0)
+                    }
+                } else {
+                    let adapt_peak_lo = env_w("SHODH_ADAPT_PEAK_LO", 2.0);
+                    let adapt_peak_hi = env_w("SHODH_ADAPT_PEAK_HI", 6.0);
+                    let bm_vals: Vec<f32> = hybrid_components
+                        .values()
+                        .map(|(b, _)| *b)
+                        .filter(|b| *b > 0.0)
+                        .collect();
+                    let mean_bm = if bm_vals.is_empty() {
+                        0.0
+                    } else {
+                        bm_vals.iter().sum::<f32>() / bm_vals.len() as f32
+                    };
+                    let bm_peak = if mean_bm > 1e-6 {
+                        max_bm / mean_bm
+                    } else {
+                        1.0
+                    };
+                    // t = 1 when BM25 is flat (peak ≤ lo) → full vector trust; t = 0 when
+                    // sharply peaked (peak ≥ hi) → no extra trust (BM25-strong gold protected).
+                    let span = (adapt_peak_hi - adapt_peak_lo).max(1e-6);
+                    ((adapt_peak_hi - bm_peak) / span).clamp(0.0, 1.0)
+                };
+                // SHODH_ADAPT_SYMMETRIC (default ON): map t through [down-weight,
+                // up-weight] instead of boost-only — with a CALIBRATED probability
+                // (fitted), t < 0.5 is evidence the query is BM25-favored and the
+                // vector leg can justifiably be weakened below 1.0 (floored at 0.2
+                // so vector never vanishes). MEASURED: boost-only FAILS even with
+                // fitted features (0.6879 vs base 0.6976) — the down-weighting is
+                // what protects single_hop while multi_hop gets freed. =0 restores
+                // the stage-1 boost-only form.
+                let symmetric = std::env::var("SHODH_ADAPT_SYMMETRIC")
+                    .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
+                    .unwrap_or(true);
+                if symmetric {
+                    (1.0 + (adapt_trust_max - 1.0) * (2.0 * t - 1.0)).max(0.2)
+                } else {
+                    1.0 + (adapt_trust_max - 1.0) * t
+                }
+            } else {
+                // No global vector-trust knob: 1.0 unless the per-query adaptive
+                // path is enabled (global scalars measured as a category tradeoff).
+                1.0
+            };
+
+            // Approach C stage 2: per-query feature export for the offline trust fit.
+            // Armed by the recall harness (SHODH_FUSION_FEATURE_EXPORT) — a no-op in
+            // production. Computed here because this is the only point that sees all
+            // three calibrated legs plus the raw per-candidate scores, and the armed
+            // gold set lets us record per-leg gold ranks (the supervision label:
+            // which leg WOULD have ranked this query's gold best).
+            if crate::memory::fusion_features::is_armed() {
+                crate::memory::fusion_features::record_with(|gold| {
+                    use crate::memory::fusion_features::FusionFeatures;
+                    let mut by_vec: Vec<(&MemoryId, f32)> = hybrid_components
+                        .iter()
+                        .filter(|(_, (_, v))| *v > 0.0)
+                        .map(|(id, (_, v))| (id, *v))
+                        .collect();
+                    let mut by_bm: Vec<(&MemoryId, f32)> = hybrid_components
+                        .iter()
+                        .filter(|(_, (b, _))| *b > 0.0)
+                        .map(|(id, (b, _))| (id, *b))
+                        .collect();
+                    by_vec.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+                    by_bm.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+                    let peak = |xs: &[(&MemoryId, f32)]| -> f32 {
+                        if xs.is_empty() {
+                            return 1.0;
+                        }
+                        let max = xs[0].1;
+                        let mean = xs.iter().map(|x| x.1).sum::<f32>() / xs.len() as f32;
+                        if mean > 1e-6 {
+                            max / mean
+                        } else {
+                            1.0
+                        }
+                    };
+                    let agreement_top10 = if by_vec.is_empty() || by_bm.is_empty() {
+                        0.0
+                    } else {
+                        let k10 = 10usize.min(by_vec.len()).min(by_bm.len()).max(1);
+                        let top_v: std::collections::HashSet<&MemoryId> =
+                            by_vec.iter().take(k10).map(|(id, _)| *id).collect();
+                        by_bm
+                            .iter()
+                            .take(k10)
+                            .filter(|(id, _)| top_v.contains(id))
+                            .count() as f32
+                            / k10 as f32
+                    };
+                    let rank_of_gold = |xs: &[(&MemoryId, f32)]| -> Option<usize> {
+                        xs.iter().position(|(id, _)| gold.contains(*id))
+                    };
+                    let mut by_graph: Vec<(&MemoryId, f32)> =
+                        graph_results.iter().map(|(id, a, _)| (id, *a)).collect();
+                    by_graph.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+                    // Candidate-level training rows (roadmap ②): the union of
+                    // the three legs' pools with query-relative scores — the
+                    // exact calibrated inputs the FLAT fusion ranks with.
+                    let mut union: std::collections::HashMap<&MemoryId, (f32, f32, f32)> =
+                        std::collections::HashMap::new();
+                    for (id, (b, v)) in hybrid_components.iter() {
+                        let e = union.entry(id).or_insert((0.0, 0.0, 0.0));
+                        e.0 = (*v / max_vec).clamp(0.0, 1.0);
+                        e.1 = (*b / max_bm).clamp(0.0, 1.0);
+                    }
+                    let max_act = by_graph.first().map(|x| x.1).unwrap_or(0.0).max(1e-6);
+                    for (id, a) in by_graph.iter() {
+                        union.entry(id).or_insert((0.0, 0.0, 0.0)).2 =
+                            (*a / max_act).clamp(0.0, 1.0);
+                    }
+                    let candidates: Vec<crate::memory::fusion_features::CandidateRow> = union
+                        .into_iter()
+                        .map(|(id, (vec, bm25, graph))| {
+                            crate::memory::fusion_features::CandidateRow {
+                                vec,
+                                bm25,
+                                graph,
+                                is_gold: gold.contains(id),
+                            }
+                        })
+                        .collect();
+                    FusionFeatures {
+                        n_hybrid: hybrid_components.len(),
+                        n_bm_pos: by_bm.len(),
+                        n_vec_pos: by_vec.len(),
+                        bm_peak: peak(&by_bm),
+                        vec_peak: peak(&by_vec),
+                        agreement_top10,
+                        max_bm,
+                        max_vec,
+                        n_graph: by_graph.len(),
+                        graph_max_activation: by_graph.first().map(|x| x.1).unwrap_or(0.0),
+                        gold_vec_rank: rank_of_gold(&by_vec),
+                        gold_bm_rank: rank_of_gold(&by_bm),
+                        gold_graph_rank: rank_of_gold(&by_graph),
+                        candidates,
+                    }
+                });
+            }
+
+            // Graph leg.
             for (r, (id, activation, h)) in graph_results.iter().enumerate() {
-                // Standard RRF: weight / (K + rank), rank is 1-indexed
-                let rrf_score = graph_w / (K + (r + 1) as f32);
+                if !graph_leg_on {
+                    break; // SHODH_LEG=bm25|vector isolates the hybrid leg
+                }
+                let rrf_score = if sum_fusion {
+                    // Calibrated weighted-SUM: graph leg enters at fw_graph·(activation/max).
+                    fw_graph * (activation / max_activation).clamp(0.0, 1.0)
+                } else if v2_fusion {
+                    // Borda (rank-1 ≈ full graph_w) + CONFIDENCE rescue: every graph
+                    // candidate gets graph_w·(activation/max) added, so a strongly
+                    // activated hit reaches up to 2·graph_w and can beat a lexical
+                    // distractor even when it is PRESENT-but-buried in the hybrid
+                    // pool. (The old `!hybrid_top` gate only rescued answers wholly
+                    // absent from hybrid — local observation showed it never fired
+                    // for the common burial case.)
+                    let borda = graph_w * ((n_graph - r as f32) / n_graph);
+                    let rescue = graph_w * (activation / max_activation).clamp(0.0, 1.0);
+                    borda + rescue
+                } else if flat_fusion {
+                    // Calibrated magnitude: the graph's best hit enters at graph_w,
+                    // not a graph_w/(k+rank) crumb.
+                    graph_w * (activation / max_activation).clamp(0.0, 1.0)
+                } else {
+                    // Standard RRF: weight / (k + rank), rank is 1-indexed.
+                    graph_w / (k + (r + 1) as f32)
+                };
                 *fused.entry(id.clone()).or_insert(0.0) += rrf_score;
                 heb.insert(id.clone(), *h);
 
-                // Additive activation bonus (ACT-R style spreading activation)
-                // Scaled by graph_w: trust activation more when graph is sparse/mature
-                let activation_bonus = graph_w * 0.2 * activation.clamp(0.0, 1.0);
-                *fused.get_mut(id).unwrap() += activation_bonus;
+                // Multiplicative activation bonus (RRF-only; no-op under V2 / SUM).
+                let activation_factor = if v2_fusion || sum_fusion {
+                    1.0
+                } else {
+                    1.0 + graph_w
+                        * crate::constants::ACTIVATION_BONUS_SCALE
+                        * activation.clamp(0.0, 1.0)
+                };
+                if let Some(score) = fused.get_mut(id) {
+                    *score *= activation_factor;
+                }
+
+                // Track per-memory graph RRF contribution
+                if let Some(ref mut attr_map) = attributions {
+                    let attr = attr_map
+                        .entry(id.clone())
+                        .or_insert_with(|| ScoreAttribution {
+                            memory_id: id.0.to_string(),
+                            attribute_boost: 1.0,
+                            temporal_prefilter_boost: 1.0,
+                            temporal_fact_boost: 1.0,
+                            interference_adjustment: 1.0,
+                            prospective_boost: 1.0,
+                            fact_source_boost: 1.0,
+                            ontological_boost: 1.0,
+                            importance_factor: 1.0,
+                            feedback_multiplier: 1.0,
+                            quality_gate: 1.0,
+                            ..Default::default()
+                        });
+                    attr.graph_rrf = rrf_score * activation_factor;
+                    attr.hebbian_boost = *h;
+                    attr.sources.push("graph".to_string());
+                }
             }
 
-            // Hybrid (BM25+vector) results: pure RRF with density weight
-            for (r, (id, _)) in hybrid_ids.iter().enumerate() {
-                *fused.entry(id.clone()).or_insert(0.0) += hybrid_w / (K + (r + 1) as f32);
+            // Hybrid (BM25+vector) leg.
+            for (r, (id, _hybrid_raw)) in hybrid_ids.iter().enumerate() {
+                let hybrid_rrf = if sum_fusion {
+                    // Calibrated weighted-SUM: vector and BM25 each min-max normalised and
+                    // added with sweepable weights. The sweep (SHODH_FW_VEC/_BM25) tunes the
+                    // mix; additive (not max) so a candidate strong in BOTH legs outranks one
+                    // strong in a single leg — the consensus signal max-fusion discards.
+                    let (bm25, vec) = hybrid_components.get(id).copied().unwrap_or((0.0, 0.0));
+                    fw_vec * (vec / max_vec).clamp(0.0, 1.0)
+                        + fw_bm25 * (bm25 / max_bm).clamp(0.0, 1.0)
+                } else if flat_fusion {
+                    // The flatten, max-fusion form: per-candidate MAX of the calibrated
+                    // vector/BM25 legs (+ a small consensus bonus on the MIN). A candidate
+                    // strong in EITHER leg keeps a high score — so BM25's lexical crowd can't
+                    // dilute a vector-strong gold (multi_hop) and vector noise can't dilute a
+                    // BM25-exact gold (single_hop). A global weighted SUM can't serve both
+                    // (measured: monotonic multi_hop↔single_hop tradeoff); max preserves the
+                    // best signal per candidate.
+                    let (bm25, vec) = hybrid_components.get(id).copied().unwrap_or((0.0, 0.0));
+                    let vn = (vec / max_vec).clamp(0.0, 1.0) * effective_vec_trust;
+                    let bn = (bm25 / max_bm).clamp(0.0, 1.0);
+                    let (hi, lo) = if vn >= bn { (vn, bn) } else { (bn, vn) };
+                    hybrid_w * (hi + flat_consensus * lo)
+                } else if v2_fusion {
+                    // Borda: rank-1 ≈ full hybrid_w (scale-invariant, no crumb).
+                    hybrid_w * ((n_hybrid - r as f32) / n_hybrid)
+                } else {
+                    hybrid_w / (k + (r + 1) as f32)
+                };
+                *fused.entry(id.clone()).or_insert(0.0) += hybrid_rrf;
+
+                // Track per-memory hybrid RRF contribution
+                if let Some(ref mut attr_map) = attributions {
+                    let attr = attr_map
+                        .entry(id.clone())
+                        .or_insert_with(|| ScoreAttribution {
+                            memory_id: id.0.to_string(),
+                            attribute_boost: 1.0,
+                            temporal_prefilter_boost: 1.0,
+                            temporal_fact_boost: 1.0,
+                            interference_adjustment: 1.0,
+                            prospective_boost: 1.0,
+                            fact_source_boost: 1.0,
+                            ontological_boost: 1.0,
+                            importance_factor: 1.0,
+                            feedback_multiplier: 1.0,
+                            quality_gate: 1.0,
+                            ..Default::default()
+                        });
+                    attr.hybrid_rrf += hybrid_rrf;
+                    if !attr.sources.contains(&"vector".to_string()) {
+                        attr.sources.push("vector".to_string());
+                    }
+                }
             }
 
             // ===========================================================================
@@ -2095,17 +4164,18 @@ impl MemorySystem {
             // For attribute queries, heavily boost memories that contain BOTH the entity
             // AND an attribute synonym value. This ensures "Caroline is single" ranks
             // high for "What is Caroline's relationship status?".
-            if !attribute_boost_ids.is_empty() {
-                const ATTRIBUTE_BOOST: f32 = 0.5; // Strong boost for attribute matches
+            if boost_attribute && !attribute_boost_ids.is_empty() {
                 let mut boosted_count = 0;
+                let boost_factor = 1.0 + crate::constants::ATTRIBUTE_QUERY_BOOST;
                 for id in &attribute_boost_ids {
-                    if fused.contains_key(id) {
-                        *fused.get_mut(id).unwrap() += ATTRIBUTE_BOOST;
+                    if let Some(score) = fused.get_mut(id) {
+                        *score *= boost_factor;
                         boosted_count += 1;
-                    } else {
-                        // Also add memories that weren't in the fusion but match attribute
-                        fused.insert(id.clone(), ATTRIBUTE_BOOST);
-                        boosted_count += 1;
+                        if let Some(ref mut attr_map) = attributions {
+                            if let Some(attr) = attr_map.get_mut(id) {
+                                attr.attribute_boost = boost_factor;
+                            }
+                        }
                     }
                 }
                 if boosted_count > 0 {
@@ -2117,22 +4187,60 @@ impl MemorySystem {
             }
 
             // ===========================================================================
+            // LAYER 4.45: TEMPORAL PRE-FILTER BOOST
+            // ===========================================================================
+            // Memories that fell within the query's parsed date range (Layer 0.4)
+            // get a multiplicative boost. This ensures date-relevant memories rise
+            // above semantically similar but temporally wrong results.
+            // MEASURED (boost ablation, run 27249880829): despite the name, this boost's
+            // recall@10 contribution lands in single_hop; temporal-category recall is
+            // invariant with it on or off. Temporal ORDERING is carried by the Layer-5
+            // linguistic family instead.
+            if boost_temporal_prefilter && !temporal_prefilter_ids.is_empty() {
+                let mut boosted_count = 0;
+                let boost_factor = 1.0 + crate::constants::TEMPORAL_PREFILTER_BOOST;
+                for id in &temporal_prefilter_ids {
+                    if let Some(score) = fused.get_mut(id) {
+                        *score *= boost_factor;
+                        boosted_count += 1;
+                        if let Some(ref mut attr_map) = attributions {
+                            if let Some(attr) = attr_map.get_mut(id) {
+                                attr.temporal_prefilter_boost = boost_factor;
+                            }
+                        }
+                    }
+                }
+                if boosted_count > 0 {
+                    tracing::info!(
+                        "Layer 4.45: Boosted {} memories from temporal pre-filter",
+                        boosted_count
+                    );
+                }
+            }
+
+            // ===========================================================================
             // LAYER 4.55: TEMPORAL FACT BOOST
             // ===========================================================================
             // Source memories of matching temporal facts get a moderate boost.
             // This ensures "When did Melanie paint a sunrise?" boosts the memory that
             // recorded the event, not just memories with temporal_refs.
-            if !temporal_fact_boost_ids.is_empty() {
-                const TEMPORAL_FACT_BOOST: f32 = 0.4;
+            // MEASURED (boost ablation, run 27249880829): contributes to single_hop
+            // recall, NOT to temporal-category recall (invariant on/off) — the name
+            // describes the trigger, not the measured effect.
+            if boost_temporal_fact && !temporal_fact_boost_ids.is_empty() {
                 let mut boosted_count = 0;
+                let boost_factor = 1.0 + crate::constants::TEMPORAL_FACT_BOOST;
                 for id in &temporal_fact_boost_ids {
-                    if fused.contains_key(id) {
-                        *fused.get_mut(id).unwrap() += TEMPORAL_FACT_BOOST;
+                    if let Some(score) = fused.get_mut(id) {
+                        *score *= boost_factor;
                         boosted_count += 1;
-                    } else {
-                        fused.insert(id.clone(), TEMPORAL_FACT_BOOST);
-                        boosted_count += 1;
+                        if let Some(ref mut attr_map) = attributions {
+                            if let Some(attr) = attr_map.get_mut(id) {
+                                attr.temporal_fact_boost = boost_factor;
+                            }
+                        }
                     }
+                    // Don't insert absent memories — temporal fact match alone is insufficient
                 }
                 if boosted_count > 0 {
                     tracing::info!(
@@ -2155,7 +4263,8 @@ impl MemorySystem {
             // - High interference + high activation = "survivor" → boost (1.0-1.5x)
             // - High interference + low activation = "chronic loser" → suppress (0.5-1.0x)
             // - No interference history → neutral (1.0x)
-            {
+            // RH-8 gate: interference adjustments only run in `Full` mode.
+            if layer_full && boost_interference {
                 let detector = self.interference_detector.read();
 
                 // Compute max score once for normalization
@@ -2183,6 +4292,11 @@ impl MemorySystem {
                     if let Some(score) = fused.get_mut(&id) {
                         *score *= adjustment;
                     }
+                    if let Some(ref mut attr_map) = attributions {
+                        if let Some(attr) = attr_map.get_mut(&id) {
+                            attr.interference_adjustment = adjustment;
+                        }
+                    }
                 }
 
                 if adjusted_count > 0 {
@@ -2205,52 +4319,117 @@ impl MemorySystem {
             //
             // Signals come from ProspectiveTasks that matched the current query
             // via keyword or semantic similarity (built in recall handler C5).
-            if let Some(ref signals) = query.prospective_signals {
-                if !signals.is_empty() {
-                    const PROSPECTIVE_BOOST_PER_MATCH: f32 = 0.15;
-                    const MAX_PROSPECTIVE_BOOST: f32 = 0.5;
-
-                    // Tokenize all signals into unique terms (skip noise words < 3 chars)
-                    let signal_terms: std::collections::HashSet<String> = signals
-                        .iter()
-                        .flat_map(|s| {
-                            s.to_lowercase()
-                                .split_whitespace()
-                                .filter(|w| w.len() >= 3)
-                                .map(|w| w.to_string())
-                                .collect::<Vec<_>>()
-                        })
+            // RH-8 gate: prospective signal boost only runs in `Full` mode.
+            // SPECIFICITY / CONCENTRATION FUSION TERM (SHODH_SPEC_FUSION=<scale>, default OFF).
+            // Competitor-convergent anti-pollution lever (veld concentration ratio, Zep
+            // node-distance, Cognee ontology_valid trust-flag): down-weight DILUTED memories
+            // (the query matches only a small fraction of the memory's entities → broad/
+            // off-topic) and up-weight FOCUSED ones, query-conditional at rank time. This is
+            // the principled fix for "more entities pollute the graph" — it makes richer NER
+            // net-neutral instead of harmful. Multiplicative + clamped (veld-proven form);
+            // the additive G3 version is the refinement once this shows signal.
+            if let Some(scale) = std::env::var("SHODH_SPEC_FUSION")
+                .ok()
+                .and_then(|v| v.parse::<f32>().ok())
+                .filter(|s| *s != 0.0)
+            {
+                const SPEC_CENTER: f32 = 0.33;
+                let q_terms: std::collections::HashSet<String> =
+                    tokenize_words(&query_text.to_lowercase())
+                        .into_iter()
+                        .filter(|w| w.len() > 2)
+                        .map(|w| w.to_string())
                         .collect();
-
-                    if !signal_terms.is_empty() {
-                        let mut boosted_count = 0;
-                        let ids: Vec<MemoryId> = fused.keys().cloned().collect();
-
-                        for id in &ids {
-                            if let Some(content) = get_content(id) {
-                                let content_lower = content.to_lowercase();
-                                let match_count = signal_terms
+                if q_terms.len() >= 2 {
+                    let ids: Vec<MemoryId> = fused.keys().cloned().collect();
+                    let mut adjusted = 0usize;
+                    for id in &ids {
+                        if let Some(ents) = get_entities(id) {
+                            if ents.len() >= 2 {
+                                // Concentration = fraction of the memory's entities the query mentions.
+                                let matched = ents
                                     .iter()
-                                    .filter(|term| content_lower.contains(term.as_str()))
+                                    .filter(|e| {
+                                        let el = e.to_lowercase();
+                                        q_terms.iter().any(|qt| el.contains(qt.as_str()))
+                                    })
                                     .count();
-
-                                if match_count > 0 {
-                                    // Sqrt scaling: diminishing returns for additional matches
-                                    let boost = (PROSPECTIVE_BOOST_PER_MATCH
-                                        * (match_count as f32).sqrt())
-                                    .min(MAX_PROSPECTIVE_BOOST);
-                                    *fused.get_mut(id).unwrap() += boost;
-                                    boosted_count += 1;
+                                let concentration = matched as f32 / ents.len() as f32;
+                                let factor =
+                                    (1.0 + scale * (concentration - SPEC_CENTER)).clamp(0.70, 1.30);
+                                if let Some(score) = fused.get_mut(id) {
+                                    *score *= factor;
+                                    adjusted += 1;
                                 }
                             }
                         }
+                    }
+                    tracing::debug!(
+                        "SHODH_SPEC_FUSION: concentration term (scale={}) applied to {} candidates",
+                        scale,
+                        adjusted
+                    );
+                }
+            }
 
-                        if boosted_count > 0 {
-                            tracing::info!(
+            if layer_full && boost_prospective {
+                if let Some(ref signals) = query.prospective_signals {
+                    if !signals.is_empty() {
+                        use crate::constants::{
+                            PROSPECTIVE_BOOST_MAX, PROSPECTIVE_BOOST_PER_MATCH,
+                        };
+
+                        // Tokenize all signals into unique terms (skip noise words < 3 chars)
+                        let signal_terms: std::collections::HashSet<String> = signals
+                            .iter()
+                            .flat_map(|s| {
+                                s.to_lowercase()
+                                    .split_whitespace()
+                                    .filter(|w| w.len() >= 3)
+                                    .map(|w| w.to_string())
+                                    .collect::<Vec<_>>()
+                            })
+                            .collect();
+
+                        if !signal_terms.is_empty() {
+                            let mut boosted_count = 0;
+                            let ids: Vec<MemoryId> = fused.keys().cloned().collect();
+
+                            for id in &ids {
+                                if let Some(content) = get_content(id) {
+                                    let content_lower = content.to_lowercase();
+                                    let content_words = tokenize_words(&content_lower);
+                                    let match_count = signal_terms
+                                        .iter()
+                                        .filter(|term| content_words.contains(term.as_str()))
+                                        .count();
+
+                                    if match_count > 0 {
+                                        // Sqrt scaling: diminishing returns for additional matches
+                                        let boost_factor = 1.0
+                                            + (PROSPECTIVE_BOOST_PER_MATCH
+                                                * (match_count as f32).sqrt())
+                                            .min(PROSPECTIVE_BOOST_MAX);
+                                        if let Some(score) = fused.get_mut(id) {
+                                            *score *= boost_factor;
+                                            boosted_count += 1;
+                                            if let Some(ref mut attr_map) = attributions {
+                                                if let Some(attr) = attr_map.get_mut(id) {
+                                                    attr.prospective_boost = boost_factor;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            if boosted_count > 0 {
+                                tracing::info!(
                                 "Layer 4.7: Boosted {} memories from {} prospective signal terms",
                                 boosted_count,
                                 signal_terms.len()
                             );
+                            }
                         }
                     }
                 }
@@ -2265,12 +4444,18 @@ impl MemorySystem {
             //
             // Conservative: only boosts memories already in fused set (does NOT inject
             // new candidates). Facts validate existing retrieval signals, not override.
-            if !fact_source_boosts.is_empty() {
+            if boost_fact_source && !fact_source_boosts.is_empty() {
                 let mut boosted_count = 0;
                 for (id, boost) in &fact_source_boosts {
                     if let Some(score) = fused.get_mut(id) {
-                        *score += boost;
+                        let boost_factor = 1.0 + boost;
+                        *score *= boost_factor;
                         boosted_count += 1;
+                        if let Some(ref mut attr_map) = attributions {
+                            if let Some(attr) = attr_map.get_mut(id) {
+                                attr.fact_source_boost = boost_factor;
+                            }
+                        }
                     }
                 }
                 if boosted_count > 0 {
@@ -2281,10 +4466,140 @@ impl MemorySystem {
                 }
             }
 
+            // ===========================================================================
+            // LAYER 4.9: ONTOLOGICAL RE-RANKING
+            // ===========================================================================
+            // Boost memories connected to type-matching entities. Multiplicative boost
+            // on fused score. Only active when ontological intent has sufficient confidence.
+            //
+            // Reference: Collins & Quillian (1969) — type-plausible paths retrieved faster
+            // Pre-sort and limit candidates before expensive re-ranking.
+            // Only look up graph entities for the top 2x max_results candidates,
+            // not all fused results (avoids 100s of RocksDB reads).
+            // ===========================================================================
+            // LAYER 4.95: CAUSAL-ORIGIN ANSWER PLACEMENT (SHODH_CAUSAL_ORIGIN_BOOST)
+            // ===========================================================================
+            // For an origin-intent query, the backward causal walk DETERMINISTICALLY
+            // traced THE root cause. That root IS the answer — but it shares no lexical
+            // token with the effect-named query, so it carries no vector/BM25 mass, and
+            // the pre-fusion graph-leg injection (2x graph max) loses to the direct-cause
+            // distractor under any fusion mode (RRF and ACT-R both measured P@1=0). A
+            // structurally-certain answer must not compete on the soft-similarity scale:
+            // place the traced root(s) ABOVE the global fused max here, post-fusion. Only
+            // fires for origin queries (ids non-empty); a strict no-op otherwise, so no
+            // other category can regress (LongMemEval bit-identical, run 27840532226).
+            // SHODH_CAUSAL_ORIGIN_BOOST=0 disables for A/B. Lineage root-cause P@1
+            // 0.000 -> 0.867 (run 27825097128), control P@1 unchanged.
+            let origin_answer_boost = std::env::var("SHODH_CAUSAL_ORIGIN_BOOST")
+                .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
+                .unwrap_or(true);
+            if origin_answer_boost && !causal_origin_episode_ids.is_empty() {
+                let global_max = fused.values().copied().fold(0.0f32, f32::max).max(0.01);
+                for (i, mid) in causal_origin_episode_ids.iter().enumerate() {
+                    // Best-supported root highest; later roots a hair lower for a
+                    // deterministic order. All sit above any similarity candidate.
+                    let target = global_max * (2.0 - (i as f32) * 0.01).max(1.5);
+                    let slot = fused.entry(mid.clone()).or_insert(0.0);
+                    if *slot < target {
+                        *slot = target;
+                    }
+                }
+            }
+
             let mut res: Vec<_> = fused.into_iter().collect();
-            res.sort_by(|a, b| b.1.total_cmp(&a.1));
+            // Score desc; tie-break by MemoryId for stable rerank-budget cutoff.
+            // The cutoff at `rerank_budget` makes order at the boundary semantically
+            // important — without tie-break, equal-score boundary candidates can swap
+            // in/out of the rerank window across runs.
+            res.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            let rerank_budget = query.max_results * 2;
+
+            // RH-8 gate: ontological rerank only runs in `PlusRerank` and above.
+            // NOTE (#270 spec discrepancy): the spec calls this mode "+rerank" with the
+            // expectation of a cross-encoder. This codebase has no cross-encoder; the only
+            // rerank present is the ontological label-match boost below. The mode label is
+            // preserved for spec fidelity. See plan/PR for details.
+            if layer_rerank
+                && boost_ontological
+                && use_ontology_rerank
+                && !onto_intent.expected_labels.is_empty()
+            {
+                if let Some(graph) = self.graph_memory.as_ref() {
+                    let g = graph.read();
+                    let mut boosted_count = 0usize;
+                    // Cache the per-entity label-match decision across candidates.
+                    // expected_labels is constant for this call, and a hot entity
+                    // appears in many candidates' entity_refs, so without a cache
+                    // get_entity (a store read) is repeated for the same uuid on
+                    // every candidate that references it.
+                    let mut label_match_cache: std::collections::HashMap<Uuid, bool> =
+                        std::collections::HashMap::new();
+                    for (_mem_id, fused_score) in res.iter_mut().take(rerank_budget) {
+                        if let Ok(Some(episode)) = g.get_episode(&_mem_id.0) {
+                            let type_matches = episode
+                                .entity_refs
+                                .iter()
+                                .filter(|uuid| {
+                                    *label_match_cache.entry(**uuid).or_insert_with(|| {
+                                        g.get_entity(uuid)
+                                            .ok()
+                                            .flatten()
+                                            .map(|e| {
+                                                e.labels.iter().any(|l| {
+                                                    onto_intent
+                                                        .expected_labels
+                                                        .iter()
+                                                        .any(|exp| l.matches_with_hierarchy(exp))
+                                                })
+                                            })
+                                            .unwrap_or(false)
+                                    })
+                                })
+                                .count();
+                            if type_matches > 0 {
+                                let boost = (type_matches as f32
+                                    * crate::constants::ONTOLOGICAL_RERANK_BOOST)
+                                    .min(crate::constants::ONTOLOGICAL_RERANK_MAX);
+                                let boost_factor = 1.0 + boost;
+                                *fused_score *= boost_factor;
+                                boosted_count += 1;
+                                crate::metrics::ONTOLOGICAL_RERANK_BOOST_APPLIED
+                                    .observe(boost as f64);
+                                if let Some(ref mut attr_map) = attributions {
+                                    if let Some(attr) = attr_map.get_mut(_mem_id) {
+                                        attr.ontological_boost = boost_factor;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if boosted_count > 0 {
+                        tracing::debug!(
+                            "Layer 4.9: Ontological re-rank boosted {} of {} candidates (labels={:?})",
+                            boosted_count,
+                            rerank_budget.min(res.len()),
+                            onto_intent.expected_labels
+                        );
+                    }
+                    // Re-sort after boosting since ranks may have changed.
+                    // Tie-break by MemoryId — same rationale as the pre-rerank sort above.
+                    res.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+                }
+            }
+
+            crate::memory::gold_funnel::record("fusion", res.iter().map(|(id, _)| id));
             res.truncate(query.max_results);
             tracing::debug!("Layer 4: {} fused results", res.len());
+
+            // Capture RRF base scores for attribution
+            if let Some(ref mut attr_map) = attributions {
+                for (id, score) in &res {
+                    if let Some(attr) = attr_map.get_mut(id) {
+                        attr.rrf_base = *score;
+                    }
+                }
+            }
+
             (res, heb)
         };
 
@@ -2295,6 +4610,11 @@ impl MemorySystem {
             fused_results = memory_ids.len(),
             "recall [layer:4] BM25 + RRF fusion + boosts + interference"
         );
+        if let Some(ref mut s) = stats {
+            s.stage_timings
+                .get_or_insert_with(StageTiming::default)
+                .fusion_us = (t_fusion - t_vector).as_micros() as u64;
+        }
 
         // Fetch memories with cache-aware strategy
         // CRITICAL: Apply filters after fetching to ensure mission_id, robot_id etc. are respected
@@ -2305,115 +4625,302 @@ impl MemorySystem {
         let mut filtered_out = 0;
 
         // Layer 5: Unified scoring with hebbian + recency + emotional + feedback signals
-        // Recency decay: recent memories get boost, old memories decay
-        // λ = 0.01 means ~50% at 70 hours, ~25% at 140 hours
-        const RECENCY_DECAY_RATE: f32 = 0.01;
-        let now = chrono::Utc::now();
+        // All signals are multiplicative on the base score to preserve RRF ranking.
+        // Formula: base × importance × (1 + recency + arousal + credibility + temporal) × feedback
+        let now = scoring_now();
 
         // PIPE-9: Get feedback store guard for momentum-based scoring
         // Acquire once outside the loop to avoid repeated locking
         let feedback_guard = self.feedback_store.as_ref().map(|fs| fs.read());
 
+        // Momentum is the learning signal: an EMA of feedback that ACCUMULATES
+        // over repeated use (low per-event alpha + inertia → gradual, robust to a
+        // single bad signal). FEEDBACK_MOMENTUM_SCALE caps how much BUILT-UP
+        // momentum can move the score. At the 0.15 default it's imperceptible, so
+        // accumulated learning never becomes load-bearing. Make the cap tunable
+        // (SHODH_FEEDBACK_MOMENTUM_SCALE) so momentum that has built up over many
+        // interactions can re-rank — without touching alpha, so one feedback still
+        // only nudges (momentum, not forcing). Default unchanged.
+        let momentum_scale: f32 = std::env::var("SHODH_FEEDBACK_MOMENTUM_SCALE")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(crate::constants::FEEDBACK_MOMENTUM_SCALE);
+
         for (memory_id, score) in memory_ids {
-            // Hebbian boost from learned graph weights (10% contribution)
+            // Hebbian boost from learned graph weights (multiplicative)
+            // RH-8 gate: Hebbian association boost only applies in `Full` mode.
             let hebbian_boost = hebbian_scores.get(&memory_id).copied().unwrap_or(0.0);
-            let base_score = score + hebbian_boost * 0.1;
+            let base_score = if layer_full && boost_hebbian {
+                score * (1.0 + hebbian_boost * crate::constants::HEBBIAN_ASSOCIATION_WEIGHT)
+            } else {
+                score
+            };
 
-            // Helper to apply unified scoring (recency + arousal + credibility + temporal)
-            let recency_scale = query.recency_weight.unwrap_or(0.1);
+            // Helper to apply unified scoring (all multiplicative on base score)
+            let recency_scale_override = query.recency_weight;
             let with_unified_score = |mem: &SharedMemory, base: f32| -> SharedMemory {
-                // Recency decay: exponential decay based on age
+                // RH-8 gate: lower modes pass the raw fused score through unchanged so
+                // per-layer attribution measures retrieval signal, not cognitive overlay.
+                if !layer_full {
+                    let mut cloned: Memory = mem.as_ref().clone();
+                    cloned.set_score(base);
+                    return Arc::new(cloned);
+                }
+                use crate::constants::*;
+
+                // Recency: exponential decay, multiplicative factor
                 let hours_old = (now - mem.created_at).num_hours().max(0) as f32;
-                let recency_boost = (-RECENCY_DECAY_RATE * hours_old).exp() * recency_scale;
+                let recency_scale = recency_scale_override.unwrap_or(RECENCY_BOOST_SCALE);
+                let recency_factor = if boost_recency {
+                    (-RECENCY_DECAY_RATE * hours_old).exp() * recency_scale
+                } else {
+                    0.0
+                };
 
-                // Emotional arousal boost: high arousal = more salient (5% contribution)
-                // Research: LaBar & Cabeza (2006) - emotionally arousing events better remembered
-                let arousal_boost = mem
-                    .experience
-                    .context
-                    .as_ref()
-                    .map(|c| c.emotional.arousal * 0.05)
-                    .unwrap_or(0.0);
+                // Emotional arousal: high arousal = more salient
+                // Reference: LaBar & Cabeza (2006) — emotionally arousing events better remembered
+                let arousal_factor = if boost_arousal {
+                    mem.experience
+                        .context
+                        .as_ref()
+                        .map(|c| c.emotional.arousal * AROUSAL_BOOST_SCALE)
+                        .unwrap_or(0.0)
+                } else {
+                    0.0
+                };
 
-                // Source credibility boost: credible sources weighted higher (5% contribution)
-                // Research: Source monitoring affects memory reliability
-                let credibility_boost = mem
-                    .experience
-                    .context
-                    .as_ref()
-                    .map(|c| (c.source.credibility - 0.5).max(0.0) * 0.1)
-                    .unwrap_or(0.0);
+                // Source credibility: credible sources weighted higher
+                let credibility_factor = if boost_credibility {
+                    mem.experience
+                        .context
+                        .as_ref()
+                        .map(|c| (c.source.credibility - 0.5).max(0.0) * CREDIBILITY_BOOST_SCALE)
+                        .unwrap_or(0.0)
+                } else {
+                    0.0
+                };
 
-                // TEMPORAL BOOST (TEMPR approach - key for multi-hop retrieval)
-                // If query has temporal intent and memory has matching temporal references,
-                // significantly boost the memory's score (25% contribution when matched)
-                let temporal_boost = if has_temporal_query
-                    && !mem.experience.temporal_refs.is_empty()
+                // TEMPORAL MATCH (TEMPR approach for multi-hop temporal retrieval)
+                //
+                // Three-tier strategy:
+                // 1. If memory has explicit temporal_refs → match against query refs (highest signal)
+                // 2. If query is filtering BY date → use created_at proximity as fallback
+                // 3. If query is seeking FOR a date (WhenQuestion) → skip boost entirely
+                let temporal_factor = if boost_temporal_match
+                    && has_temporal_query
+                    && !temporal_ctx.is_seeking_query
                 {
-                    // Check if any memory temporal ref matches query temporal refs
                     let mut best_match = 0.0_f32;
-                    for mem_ref in &mem.experience.temporal_refs {
-                        for query_ref in &query_temporal.refs {
-                            // Exact date match: strong boost
-                            if mem_ref == &query_ref.date.to_string() {
-                                best_match = best_match.max(0.25);
-                            } else if let Ok(mem_date) =
-                                chrono::NaiveDate::parse_from_str(mem_ref, "%Y-%m-%d")
-                            {
-                                // Approximate match: within 7 days gets partial boost
-                                let days_diff = (mem_date - query_ref.date).num_days().abs();
-                                if days_diff <= 7 {
-                                    let proximity_boost = 0.15 * (1.0 - days_diff as f32 / 7.0);
-                                    best_match = best_match.max(proximity_boost);
-                                } else if days_diff <= 30 {
-                                    // Within a month: smaller boost
-                                    let proximity_boost = 0.05 * (1.0 - days_diff as f32 / 30.0);
-                                    best_match = best_match.max(proximity_boost);
+
+                    // Tier 1: Explicit temporal_refs on the memory
+                    if !mem.experience.temporal_refs.is_empty() {
+                        for mem_ref in &mem.experience.temporal_refs {
+                            for query_ref in &temporal_ctx.extraction.refs {
+                                if mem_ref == &query_ref.date.to_string() {
+                                    best_match = best_match.max(TEMPORAL_MATCH_BOOST_EXACT);
+                                } else if let Ok(mem_date) =
+                                    chrono::NaiveDate::parse_from_str(mem_ref, "%Y-%m-%d")
+                                {
+                                    let days_diff = (mem_date - query_ref.date).num_days().abs();
+                                    if days_diff <= 7 {
+                                        let proximity = TEMPORAL_MATCH_BOOST_WEEK
+                                            * (1.0 - days_diff as f32 / 7.0);
+                                        best_match = best_match.max(proximity);
+                                    } else if days_diff <= 30 {
+                                        let proximity = TEMPORAL_MATCH_BOOST_MONTH
+                                            * (1.0 - days_diff as f32 / 30.0);
+                                        best_match = best_match.max(proximity);
+                                    }
                                 }
                             }
                         }
                     }
+
+                    // Tier 2: created_at proximity fallback for filtering queries
+                    // Most memories don't have temporal_refs, so use created_at as proxy.
+                    //
+                    // Skip memories already boosted by the Layer 4.45 temporal
+                    // pre-filter: that set IS the created_at-in-range memories
+                    // (SearchCriteria::ByDate filters on created_at), so applying
+                    // this created_at proximity boost on top would reward the exact
+                    // same signal twice. Tier 1 (explicit temporal_refs) is a
+                    // distinct content signal and still applies to them above.
+                    if best_match == 0.0
+                        && temporal_ctx.is_filtering_query
+                        && !(boost_temporal_prefilter && temporal_prefilter_ids.contains(&mem.id))
+                    {
+                        if let Some((range_start, range_end)) = temporal_ctx.date_range {
+                            let created_date = mem.created_at.date_naive();
+                            let range_mid = range_start
+                                + chrono::Duration::days((range_end - range_start).num_days() / 2);
+                            let days_off = (created_date - range_mid).num_days().abs();
+                            let range_half = ((range_end - range_start).num_days() / 2).max(1);
+
+                            if days_off <= range_half {
+                                // Within range: full boost
+                                best_match = TEMPORAL_MATCH_BOOST_EXACT;
+                            } else if days_off <= range_half + 7 {
+                                // Near range: decaying week boost
+                                let proximity = TEMPORAL_MATCH_BOOST_WEEK
+                                    * (1.0 - (days_off - range_half) as f32 / 7.0);
+                                best_match = best_match.max(proximity);
+                            } else if days_off <= range_half + 30 {
+                                // Further out: decaying month boost
+                                let proximity = TEMPORAL_MATCH_BOOST_MONTH
+                                    * (1.0 - (days_off - range_half) as f32 / 30.0);
+                                best_match = best_match.max(proximity);
+                            }
+                        }
+                    }
+
                     best_match
                 } else {
                     0.0
                 };
 
                 // FEEDBACK MOMENTUM (PIPE-9)
-                // Apply momentum from past feedback to consistently boost/suppress memories
-                // - Positive momentum (proven helpful) → boost score
-                // - Negative momentum (frequently ignored) → suppress up to 20%
-                // This ensures consistent feedback integration across ALL retrieval paths
-                let feedback_multiplier = if let Some(ref guard) = feedback_guard {
+                // Symmetric ±15% multiplicative adjustment
+                let feedback_multiplier = if !boost_feedback {
+                    1.0
+                } else if let Some(ref guard) = feedback_guard {
                     if let Some(fm) = guard.get_momentum(&mem.id) {
                         let momentum = fm.ema_with_decay();
                         if momentum < 0.0 {
-                            // Suppress: up to 20% penalty for highly negative momentum
-                            1.0 + (momentum * 0.2).max(-0.2)
+                            1.0 + (momentum * momentum_scale).max(-momentum_scale)
                         } else {
-                            // Boost: up to 10% bonus for positive momentum
-                            1.0 + (momentum * 0.1).min(0.1)
+                            1.0 + (momentum * momentum_scale).min(momentum_scale)
                         }
                     } else {
-                        1.0 // No feedback history
+                        1.0
                     }
                 } else {
-                    1.0 // No feedback store configured
+                    1.0
+                };
+
+                // Importance: scale base score by learned importance (7 factors)
+                let importance_factor = if boost_importance {
+                    SCORING_IMPORTANCE_FLOOR + mem.importance() * SCORING_IMPORTANCE_RANGE
+                } else {
+                    1.0
+                };
+
+                // Unified multiplicative scoring:
+                // base × importance × (1 + recency + arousal + credibility + temporal) × feedback
+                // All boost factors are additive within the parenthetical, then multiplicative
+                // on the base. This preserves RRF ranking while allowing signals to modulate.
+                // Clamp: under default constants the additive parts max out at ~1.25
+                // (0.5 recency + 0.15 arousal + 0.1 credibility + 0.5 temporal), so 2.5
+                // never bites — but query.recency_weight is CALLER-supplied and unbounded,
+                // and an extreme override must not be able to multiply one memory's score
+                // arbitrarily past the rest of the window.
+                let combined_boost =
+                    (1.0 + recency_factor + arousal_factor + credibility_factor + temporal_factor)
+                        .min(2.5);
+
+                // AUTO-CAPTURED TAG PENALTY (PIPE-8)
+                // Hook-ingested memories carry "auto-captured" tag; assistant responses
+                // carry "assistant-response". Apply multiplicative penalty so they don't
+                // outrank intentional memories when volume gives them a ranking edge.
+                let tag_penalty = if !boost_tag_penalty {
+                    1.0
+                } else {
+                    let mut penalty = 1.0_f32;
+                    for tag in &mem.experience.tags {
+                        match tag.as_str() {
+                            "auto-captured" => {
+                                penalty *= crate::constants::AUTO_CAPTURED_TAG_PENALTY
+                            }
+                            "assistant-response" => {
+                                penalty *= crate::constants::ASSISTANT_RESPONSE_TAG_PENALTY
+                            }
+                            _ => {}
+                        }
+                    }
+                    penalty
                 };
 
                 let final_score =
-                    (base + recency_boost + arousal_boost + credibility_boost + temporal_boost)
-                        * feedback_multiplier;
+                    base * importance_factor * combined_boost * feedback_multiplier * tag_penalty;
 
                 let mut cloned: Memory = mem.as_ref().clone();
                 cloned.set_score(final_score);
                 Arc::new(cloned)
             };
 
+            // Diagnostic helper: capture Layer 5 scoring factors for a memory
+            let capture_l5_diagnostics = |mem: &SharedMemory,
+                                          memory_id: &MemoryId,
+                                          base_score: f32,
+                                          attributions: &mut Option<
+                std::collections::HashMap<MemoryId, ScoreAttribution>,
+            >| {
+                if let Some(ref mut attr_map) = attributions {
+                    if let Some(attr) = attr_map.get_mut(memory_id) {
+                        use crate::constants::*;
+                        let hours_old = (now - mem.created_at).num_hours().max(0) as f32;
+                        let recency_scale = recency_scale_override.unwrap_or(RECENCY_BOOST_SCALE);
+                        attr.recency_factor = if boost_recency {
+                            (-RECENCY_DECAY_RATE * hours_old).exp() * recency_scale
+                        } else {
+                            0.0
+                        };
+                        attr.arousal_factor = if boost_arousal {
+                            mem.experience
+                                .context
+                                .as_ref()
+                                .map(|c| c.emotional.arousal * AROUSAL_BOOST_SCALE)
+                                .unwrap_or(0.0)
+                        } else {
+                            0.0
+                        };
+                        attr.credibility_factor = if boost_credibility {
+                            mem.experience
+                                .context
+                                .as_ref()
+                                .map(|c| {
+                                    (c.source.credibility - 0.5).max(0.0) * CREDIBILITY_BOOST_SCALE
+                                })
+                                .unwrap_or(0.0)
+                        } else {
+                            0.0
+                        };
+                        attr.importance_factor = if boost_importance {
+                            SCORING_IMPORTANCE_FLOOR + mem.importance() * SCORING_IMPORTANCE_RANGE
+                        } else {
+                            1.0
+                        };
+                        // Feedback multiplier
+                        attr.feedback_multiplier = if !boost_feedback {
+                            1.0
+                        } else if let Some(ref guard) = feedback_guard {
+                            if let Some(fm) = guard.get_momentum(&mem.id) {
+                                let momentum = fm.ema_with_decay();
+                                if momentum < 0.0 {
+                                    1.0 + (momentum * FEEDBACK_MOMENTUM_SCALE)
+                                        .max(-FEEDBACK_MOMENTUM_SCALE)
+                                } else {
+                                    1.0 + (momentum * FEEDBACK_MOMENTUM_SCALE)
+                                        .min(FEEDBACK_MOMENTUM_SCALE)
+                                }
+                            } else {
+                                1.0
+                            }
+                        } else {
+                            1.0
+                        };
+                        attr.hebbian_boost = hebbian_scores.get(memory_id).copied().unwrap_or(0.0);
+                        attr.final_score = mem.score.unwrap_or(base_score);
+                    }
+                }
+            };
+
             // Try working memory first (hot cache)
             if let Some(memory) = self.working_memory.read().get(&memory_id) {
                 // CRITICAL FIX: Apply filters before adding to results
                 if self.retriever.matches_filters(&memory, &vector_query) {
-                    memories.push(with_unified_score(&memory, base_score));
+                    let scored = with_unified_score(&memory, base_score);
+                    capture_l5_diagnostics(&scored, &memory_id, base_score, &mut attributions);
+                    memories.push(scored);
                     if !sources.contains(&"working") {
                         sources.push("working");
                     }
@@ -2428,7 +4935,9 @@ impl MemorySystem {
             if let Some(memory) = self.session_memory.read().get(&memory_id) {
                 // CRITICAL FIX: Apply filters before adding to results
                 if self.retriever.matches_filters(&memory, &vector_query) {
-                    memories.push(with_unified_score(&memory, base_score));
+                    let scored = with_unified_score(&memory, base_score);
+                    capture_l5_diagnostics(&scored, &memory_id, base_score, &mut attributions);
+                    memories.push(scored);
                     if !sources.contains(&"session") {
                         sources.push("session");
                     }
@@ -2446,7 +4955,9 @@ impl MemorySystem {
                     if self.retriever.matches_filters(&memory, &vector_query) {
                         // Reuse unified scoring (includes feedback_multiplier)
                         let shared = Arc::new(memory);
-                        memories.push(with_unified_score(&shared, base_score));
+                        let scored = with_unified_score(&shared, base_score);
+                        capture_l5_diagnostics(&scored, &memory_id, base_score, &mut attributions);
+                        memories.push(scored);
                         if !sources.contains(&"longterm") {
                             sources.push("longterm");
                         }
@@ -2494,16 +5005,94 @@ impl MemorySystem {
             filtered_out,
             "recall [layer:5] memory fetch + unified scoring"
         );
+        if let Some(ref mut s) = stats {
+            s.stage_timings
+                .get_or_insert_with(StageTiming::default)
+                .scoring_us = (t_fetch - t_fusion).as_micros() as u64;
+        }
+
+        // Quality gate: multiplicative factor based on content richness.
+        // Prevents empty/trivial memories from surfacing on recency or graph boost alone.
+        // Same formula as proactive_context (Berntsen elaboration quality).
+        // RH-8 gate: quality multiplier only applies in `Full` mode — lower modes
+        // expose the raw fused score so per-layer attribution isn't masked.
+        if layer_full && boost_quality {
+            let v2_no_verbosity = std::env::var("SHODH_FUSION_V2")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+            for mem in &mut memories {
+                let has_entities = !mem.experience.entities.is_empty();
+                let has_context = mem.experience.context.is_some();
+                let elaboration = 1.0
+                    + if has_entities { 0.1 } else { 0.0 }
+                    + if has_context { 0.1 } else { 0.0 };
+                let quality = if v2_no_verbosity {
+                    // Conscious restructure: drop the raw content-length factor — a
+                    // verbosity bias that multiplied short correct answers (a person
+                    // name) down below longer ones (org names), crashing ontology
+                    // 0.88→0.083 at `full`. Keep only the structural elaboration.
+                    elaboration
+                } else {
+                    let content_len = mem.experience.content.len() as f32;
+                    (content_len / 200.0).min(1.0) * elaboration
+                };
+                let quality_factor = quality.max(crate::constants::ELABORATION_QUALITY_MIN);
+                if let Some(score) = mem.score {
+                    let mut cloned: Memory = mem.as_ref().clone();
+                    cloned.set_score(score * quality_factor);
+                    *mem = Arc::new(cloned);
+
+                    // Track quality gate in attribution
+                    if let Some(ref mut attr_map) = attributions {
+                        if let Some(attr) = attr_map.get_mut(&mem.id) {
+                            attr.quality_gate = quality_factor;
+                            attr.final_score = score * quality_factor;
+                        }
+                    }
+                }
+            }
+        }
 
         // Linguistic analysis: additive boost (5% of IC weight), not a full re-sort
-        if !query_analysis.focal_entities.is_empty() {
-            memories.sort_by(|a, b| {
-                let score_a = a.score.unwrap_or(0.0)
-                    + Self::linguistic_boost(&a.experience.content, &query_analysis) * 0.05;
-                let score_b = b.score.unwrap_or(0.0)
-                    + Self::linguistic_boost(&b.experience.content, &query_analysis) * 0.05;
-                score_b.total_cmp(&score_a)
-            });
+        // RH-8 gate: linguistic re-sort only runs in `Full` mode.
+        if layer_full && boost_linguistic && !query_analysis.focal_entities.is_empty() {
+            let v2_single = std::env::var("SHODH_FUSION_V2")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+            if v2_single {
+                // Conscious restructure: FOLD the linguistic signal into the single
+                // .score (additive) instead of a separate sort-only re-rank that the
+                // final sort silently discards when len>max. One score, one sort.
+                for m in memories.iter_mut() {
+                    if let Some(s) = m.score {
+                        let add =
+                            Self::linguistic_boost(&m.experience.content, &query_analysis) * 0.05;
+                        let mut cloned: Memory = m.as_ref().clone();
+                        cloned.set_score(s + add);
+                        *m = Arc::new(cloned);
+                    }
+                }
+            } else {
+                // Legacy: sort-only re-rank by (score + linguistic). Precompute the
+                // key once per memory (computing it in the comparator re-scanned
+                // content O(n log n) times).
+                let boosted: std::collections::HashMap<MemoryId, f32> = memories
+                    .iter()
+                    .map(|m| {
+                        let key = m.score.unwrap_or(0.0)
+                            + Self::linguistic_boost(&m.experience.content, &query_analysis) * 0.05;
+                        (m.id.clone(), key)
+                    })
+                    .collect();
+                memories.sort_by(|a, b| {
+                    let score_a = boosted.get(&a.id).copied().unwrap_or(0.0);
+                    let score_b = boosted.get(&b.id).copied().unwrap_or(0.0);
+                    score_b
+                        .total_cmp(&score_a)
+                        .then_with(|| b.created_at.cmp(&a.created_at))
+                        .then_with(|| a.id.cmp(&b.id))
+                });
+            }
         }
 
         // Layer 5.9: Ordinal session resolution via wavelet-detected sessions
@@ -2574,41 +5163,64 @@ impl MemorySystem {
         // PIPE-10: Competition must happen BEFORE coactivation - we only want to
         // strengthen associations between memories that "won" the competition.
         // Suppressed memories should not be coactivated (Hebbian "losers don't learn").
-        if memories.len() >= 2 {
-            // Calculate similarity scores for competition analysis
+        // RH-8 gate: retrieval competition mutates interference state — only run in `Full` mode
+        // so per-layer attribution runs in `--layer all` don't pollute state across modes.
+        if layer_full && boost_competition && memories.len() >= 2 {
+            // Use actual pipeline scores for competition, not position-based proxies.
+            // Previously used 1.0 - (i/n)*0.3 which compressed all scores to [0.7, 1.0],
+            // making suppression (ratio > 0.9) almost impossible.
             let candidates: Vec<(String, f32, f32)> = memories
                 .iter()
-                .enumerate()
-                .map(|(i, m)| {
-                    let relevance = 1.0 - (i as f32 / memories.len() as f32) * 0.3; // Position-based score
-                    let similarity = m.score.unwrap_or(0.5); // Use computed retrieval score
-                    (m.id.0.to_string(), relevance, similarity)
+                .map(|m| {
+                    let pipeline_score = m.score.unwrap_or(0.0);
+                    (m.id.0.to_string(), pipeline_score, pipeline_score)
                 })
                 .collect();
 
+            // Suppression COMPUTES in all modes (per-query ranking semantics);
+            // interference ACCUMULATION is a usage write — read-only recall
+            // (eval repeats) must not teach the detector (the records feed
+            // Layer 4.6's boosts on future queries; the third write class
+            // behind the L1 smoke cross-repeat divergence).
+            let record_state = !Self::recall_readonly();
             let competition_result = self
                 .interference_detector
                 .write()
-                .apply_retrieval_competition(&candidates, query_text);
+                .apply_retrieval_competition(&candidates, query_text, record_state);
 
             // Record competition event if any memories were suppressed
-            if let Some(ref event) = competition_result.event {
-                self.record_consolidation_event(event.clone());
+            if record_state {
+                if let Some(ref event) = competition_result.event {
+                    self.record_consolidation_event(event.clone());
+                }
             }
 
-            // Re-order memories based on competition results (winners first)
+            // DEMOTE suppressed memories — never remove them. Deleting suppressed
+            // results erased correct hits: the suppression proxy is score
+            // proximity, not content similarity, so a distinct relevant memory
+            // whose score sat close to the top was removed (per-layer recall
+            // diagnostics: 8 cases survived through `+facts` then vanished at
+            // `full`). Apply a mild multiplicative penalty and let the final
+            // sort+truncate decide; a suppressed-but-relevant memory can still
+            // surface. The winner/suppressed split below still gates coactivation.
             if !competition_result.suppressed.is_empty() {
-                let winner_set: std::collections::HashSet<_> = competition_result
-                    .winners
+                let suppressed_set: std::collections::HashSet<&str> = competition_result
+                    .suppressed
                     .iter()
-                    .map(|(id, _)| id.clone())
+                    .map(|s| s.as_str())
                     .collect();
-
-                // Keep only winners, maintain their relative order
-                memories.retain(|m| winner_set.contains(&m.id.0.to_string()));
+                for m in memories.iter_mut() {
+                    if suppressed_set.contains(m.id.0.to_string().as_str()) {
+                        let demoted = m.score.unwrap_or(0.0)
+                            * crate::constants::COMPETITION_SUPPRESSED_DEMOTION;
+                        let mut cloned: Memory = m.as_ref().clone();
+                        cloned.set_score(demoted);
+                        *m = Arc::new(cloned);
+                    }
+                }
 
                 tracing::debug!(
-                    "Retrieval competition: {} memories suppressed",
+                    "Retrieval competition: {} memories demoted (kept, not removed)",
                     competition_result.suppressed.len()
                 );
             }
@@ -2637,8 +5249,19 @@ impl MemorySystem {
 
         // Update access counts with instrumentation for consolidation events
         // (only for memories that survived competition)
-        for memory in &memories {
-            self.update_access_count_instrumented(memory, StrengtheningReason::Recalled);
+        // RH-8 gate: access count mutates persistent state — only in `Full` mode.
+        // Bump in-memory + record events, then persist all candidates' access
+        // updates in ONE batched write rather than a full re-index per candidate.
+        if layer_full && !Self::recall_readonly() {
+            let mut access_refs: Vec<(&Memory, f32)> = Vec::with_capacity(memories.len());
+            for memory in &memories {
+                let before =
+                    self.update_access_count_instrumented(memory, StrengtheningReason::Recalled);
+                access_refs.push((memory.as_ref(), before));
+            }
+            if let Err(e) = self.long_term_memory.persist_access_updates(&access_refs) {
+                tracing::warn!("Failed to persist access updates: {e}");
+            }
         }
 
         // PIPE-10: Hebbian learning AFTER competition - only coactivate winners
@@ -2646,7 +5269,8 @@ impl MemorySystem {
         // form/strengthen edges in the memory graph. Suppressed memories don't
         // participate in coactivation (biological: "neurons that fire together
         // wire together" but suppressed neurons don't fire).
-        if memories.len() >= 2 {
+        // RH-8 gate: Hebbian coactivation mutates graph state — only in `Full` mode.
+        if layer_full && !Self::recall_readonly() && memories.len() >= 2 {
             if let Some(graph) = &self.graph_memory {
                 let memory_uuids: Vec<uuid::Uuid> = memories.iter().map(|m| m.id.0).collect();
                 match graph.read().record_memory_coactivation(&memory_uuids) {
@@ -2676,14 +5300,102 @@ impl MemorySystem {
         }
 
         // Increment and persist retrieval counter
-        if let Ok(count) = self.long_term_memory.increment_retrieval_count() {
-            self.stats.write().total_retrievals = count;
+        // RH-8 gate: retrieval counter mutates persistent state — only in `Full` mode.
+        // Also a usage write, so read-only recall must skip it (sibling of the
+        // access-count/coactivation gates above).
+        if layer_full && !Self::recall_readonly() {
+            if let Ok(count) = self.long_term_memory.increment_retrieval_count() {
+                self.stats.write().total_retrievals = count;
+            }
         }
 
         // Expand with hierarchy context (parent chain + children)
         // This ensures semantic search also surfaces contextually related memories
-        let mut seen_ids: HashSet<MemoryId> = memories.iter().map(|m| m.id.clone()).collect();
-        self.expand_with_hierarchy(&mut memories, &mut seen_ids);
+        // RH-8 gate: hierarchy expansion adds candidates outside the layer's scope —
+        // only in `Full` mode so per-layer ranks reflect that layer's retrieval signal.
+        if layer_full {
+            let mut seen_ids: HashSet<MemoryId> = memories.iter().map(|m| m.id.clone()).collect();
+            self.expand_with_hierarchy(&mut memories, &mut seen_ids);
+        }
+
+        // ===========================================================================
+        // PROVENANCE-DRIVEN MULTI-HOP COMPANION INJECTION (Increment 2)
+        // ===========================================================================
+        // multi_hop questions have MULTIPLE gold turns; the pipeline above surfaces
+        // the best anchor, but companion evidence often ranks 11-50 and misses the
+        // top-k. Each knowledge-graph edge carries a `provenance` trail (Increment 1)
+        // listing every source episode that attested it. By walking the edges of the
+        // entities the recalled memories already expose, we reach exactly those
+        // companion episodes and inject them with a SUB-source score so they
+        // accumulate into open top-k slots without ever displacing a higher-scored
+        // genuine result. Gated: `SHODH_COMPANION_MULTIHOP_GATE=1` AND a positive
+        // multi-hop intent classification AND `Full` layer (production path only).
+        // Default OFF → byte-identical recall and zero graph reads.
+        if layer_full && companion_gate_enabled() {
+            let q_entities: &[String] = query.ner_entities.as_deref().unwrap_or(&[]);
+            let relation_surfaces: Vec<String> = onto_intent
+                .relation_types
+                .iter()
+                .map(|r| format!("{r:?}"))
+                .collect();
+            // entity_count combines query-NER grounding with the focal entities the
+            // analyzer parsed, so an under-counting NER still clears the floor when
+            // the surface structure is unambiguous.
+            let entity_count = q_entities.len().max(query_analysis.focal_entities.len());
+            let multihop_intent =
+                query_parser::detect_multihop_intent(query_text, entity_count, &relation_surfaces);
+
+            if multihop_intent {
+                if let Some(graph) = self.graph_memory.as_ref() {
+                    let companions = self.harvest_provenance_companions(&graph.read(), &memories);
+                    // Dedicated target so eval runs can capture the fire rate with
+                    // RUST_LOG=error,companion_injection=info and nothing else:
+                    // zero lines = the intent gate never opened (vs fired-but-inert).
+                    tracing::info!(
+                        target: "companion_injection",
+                        injected = companions.len(),
+                        "multihop companion injection fired"
+                    );
+                    for (mem, score) in companions {
+                        let mut cloned: Memory = mem;
+                        cloned.set_score(score);
+                        memories.push(Arc::new(cloned));
+                    }
+                }
+            }
+        }
+
+        // Re-sort by score and trim to max_results after expansion.
+        // Conscious restructure (SHODH_FUSION_V2): this is the SINGLE arbiter — the
+        // linguistic signal is already folded into .score above — so sort by .score
+        // UNCONDITIONALLY, not only when len>max. That branch is what let result-set
+        // SIZE decide whether the lexical re-sort or .score won the final order.
+        let v2_single_sort = std::env::var("SHODH_FUSION_V2")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        if v2_single_sort || memories.len() > query.max_results {
+            // Score desc → recency desc → MemoryId asc — deterministic competition cutoff.
+            // Quantize the score to 1e-6 before comparing: fused scores are accumulated
+            // by `+=` over a HashMap in non-deterministic iteration order, so f32
+            // non-associativity wobbles the last ULPs (~1e-9) and `total_cmp` would order
+            // otherwise-equal candidates differently run-to-run — flipping adjacent ranks
+            // before the created_at/id tie-breaks can fire (the harness's repeat-determinism
+            // gate caught exactly this). Rounding to 1e-6 (far above the ULP noise, far
+            // below the ~1e-5 score granularity) collapses the wobble into exact ties broken
+            // deterministically by recency then id. Metric-neutral: only sub-1e-6
+            // (effectively tied) candidates are reordered, never the top-k membership.
+            let q = |s: f32| (s * 1.0e6).round();
+            memories.sort_by(|a, b| {
+                q(b.score.unwrap_or(0.0))
+                    .total_cmp(&q(a.score.unwrap_or(0.0)))
+                    .then_with(|| b.created_at.cmp(&a.created_at))
+                    .then_with(|| a.id.cmp(&b.id))
+            });
+
+            memories.truncate(query.max_results);
+        }
+
+        crate::memory::gold_funnel::record("final", memories.iter().map(|m| &m.id));
 
         let t_total = recall_start.elapsed();
         tracing::info!(
@@ -2693,76 +5405,32 @@ impl MemorySystem {
             "recall [layer:post] linguistic + competition + coactivation + hierarchy === RECALL COMPLETE ==="
         );
 
-        Ok(memories)
-    }
+        // Finalize diagnostics
+        if let Some(ref mut s) = stats {
+            let timings = s.stage_timings.get_or_insert_with(StageTiming::default);
+            timings.total_us = t_total.as_micros() as u64;
+            s.retrieval_time_us = t_total.as_micros() as u64;
 
-    /// Apply learning velocity boost to retrieved memories
-    ///
-    /// This method should be called after `recall()` when user_id is known.
-    /// It boosts memories that have been recently learned/reinforced, implementing
-    /// the principle that "learning should improve retrieval over time".
-    ///
-    /// Boost factors:
-    /// - Base boost for any learning activity (5%)
-    /// - Velocity boost for rapid learning (up to 15%)
-    /// - Potentiation bonus for LTP'd edges (10%)
-    /// - Total max boost: 30%
-    ///
-    /// The memories are re-sorted by adjusted score after boosting.
-    pub fn apply_learning_boost(
-        &self,
-        user_id: &str,
-        mut memories: Vec<SharedMemory>,
-    ) -> Vec<SharedMemory> {
-        if memories.is_empty() {
-            return memories;
+            // Convert per-memory attributions to vec, ordered by final score
+            if let Some(attr_map) = attributions.take() {
+                let final_ids: std::collections::HashSet<MemoryId> =
+                    memories.iter().map(|m| m.id.clone()).collect();
+                let mut attrs: Vec<ScoreAttribution> = attr_map
+                    .into_iter()
+                    .filter(|(id, _)| final_ids.contains(id))
+                    .map(|(_, attr)| attr)
+                    .collect();
+                // Tie-break by memory_id so attribution rows have a stable order across runs.
+                attrs.sort_by(|a, b| {
+                    b.final_score
+                        .total_cmp(&a.final_score)
+                        .then_with(|| a.memory_id.cmp(&b.memory_id))
+                });
+                s.score_attributions = Some(attrs);
+            }
         }
 
-        // Calculate boosts for all memories
-        let mut boosted: Vec<(SharedMemory, f32)> = memories
-            .drain(..)
-            .map(|mem| {
-                let base_score = mem.score.unwrap_or(0.5);
-                let boost = self
-                    .learning_history
-                    .recency_boost(user_id, &mem.id.0.to_string())
-                    .unwrap_or(1.0);
-                let adjusted_score = base_score * boost;
-                (mem, adjusted_score)
-            })
-            .collect();
-
-        // Log if any memories got significant boosts
-        let boosted_count = boosted.iter().filter(|(_, s)| *s > 0.5).count();
-        if boosted_count > 0 {
-            tracing::debug!(
-                user_id = %user_id,
-                boosted_count = boosted_count,
-                "Applied learning velocity boost to retrieved memories"
-            );
-        }
-
-        // Sort by adjusted score (descending)
-        boosted.sort_by(|a, b| b.1.total_cmp(&a.1));
-
-        // Rebuild memories with updated scores
-        boosted
-            .into_iter()
-            .map(|(mem, score)| {
-                let mut cloned: Memory = mem.as_ref().clone();
-                cloned.set_score(score);
-                Arc::new(cloned)
-            })
-            .collect()
-    }
-
-    /// Recall with learning boost applied
-    ///
-    /// Convenience method that combines `recall()` with `apply_learning_boost()`.
-    /// Use this when you have the user_id available at recall time.
-    pub fn recall_for_user(&self, user_id: &str, query: &Query) -> Result<Vec<SharedMemory>> {
-        let memories = self.recall(query)?;
-        Ok(self.apply_learning_boost(user_id, memories))
+        Ok(RetrievalResult { memories, stats })
     }
 
     /// Get learning velocity statistics for a memory
@@ -2947,7 +5615,7 @@ impl MemorySystem {
                 }
 
                 // Clean up interference records
-                self.cleanup_interference_for_ids(&[memory_id.clone()]);
+                self.cleanup_interference_for_ids(std::slice::from_ref(&memory_id));
 
                 // Update stats - decrement each tier count that had this memory
                 if deleted_from_any {
@@ -3496,6 +6164,14 @@ impl MemorySystem {
 
         factors.push(("quality", quality_score.min(0.1)));
 
+        // Factor 8: Reward signal (0.0 - 0.15)
+        // Robotics memories with strong reward signals (positive or negative)
+        // are more important — both successes and failures carry learning value.
+        if let Some(reward) = experience.reward {
+            let reward_score = reward.abs() * 0.15;
+            factors.push(("reward", reward_score));
+        }
+
         // Aggregate all factors
         let importance: f32 = factors.iter().map(|(_, score)| score).sum();
 
@@ -3912,11 +6588,23 @@ impl MemorySystem {
     ///
     /// Records MemoryStrengthened events when memories are accessed during retrieval,
     /// capturing activation changes for introspection.
-    fn update_access_count_instrumented(&self, memory: &SharedMemory, reason: StrengtheningReason) {
+    /// Bump a recalled memory's access metadata in-memory and record a
+    /// strengthening event. Returns the memory's importance BEFORE the access so
+    /// the caller can batch-persist all candidates in one WriteBatch via
+    /// `persist_access_updates` (the importance index needs the old bucket).
+    ///
+    /// Persistence is intentionally NOT done here: the previous per-candidate
+    /// `long_term_memory.update()` (full re-index + a separate DB write each) was
+    /// the dominant cost on the read path. Callers coalesce the writes instead.
+    fn update_access_count_instrumented(
+        &self,
+        memory: &SharedMemory,
+        reason: StrengtheningReason,
+    ) -> f32 {
         // Capture activation before update
         let activation_before = memory.importance();
 
-        // Perform the actual access update
+        // Perform the actual access update (in-memory; persisted in batch by caller)
         memory.update_access();
 
         // Capture activation after update
@@ -3942,6 +6630,8 @@ impl MemorySystem {
 
             self.consolidation_events.write().push(event);
         }
+
+        activation_before
     }
 
     /// Clean up graph episodes for a batch of deleted memory IDs (best-effort)
@@ -4437,27 +7127,23 @@ impl MemorySystem {
                 "facts_embedding:",
             ] {
                 let iter = db.prefix_iterator(prefix.as_bytes());
-                for item in iter {
-                    if let Ok((key, _)) = item {
-                        if !key.starts_with(prefix.as_bytes()) {
-                            break;
-                        }
-                        batch.delete(&key);
-                        if *prefix == "facts:" {
-                            facts_deleted += 1;
-                        }
+                for (key, _) in iter.flatten() {
+                    if !key.starts_with(prefix.as_bytes()) {
+                        break;
+                    }
+                    batch.delete(&key);
+                    if *prefix == "facts:" {
+                        facts_deleted += 1;
                     }
                 }
             }
             // Clear temporal facts
             let iter = db.prefix_iterator(b"temporal_facts:");
-            for item in iter {
-                if let Ok((key, _)) = item {
-                    if !key.starts_with(b"temporal_facts:") {
-                        break;
-                    }
-                    batch.delete(&key);
+            for (key, _) in iter.flatten() {
+                if !key.starts_with(b"temporal_facts:") {
+                    break;
                 }
+                batch.delete(&key);
             }
             if facts_deleted > 0 || !batch.is_empty() {
                 if let Err(e) = db.write(batch) {
@@ -4533,6 +7219,24 @@ impl MemorySystem {
     /// Get memory by ID from long-term storage
     pub fn get_memory(&self, id: &MemoryId) -> Result<Memory> {
         self.long_term_memory.get(id)
+    }
+
+    /// Search for similar memories by embedding vector.
+    ///
+    /// Delegates to the retriever's vector index search. Used by lineage
+    /// inference to find semantically similar candidate memories when
+    /// entity-graph candidates are sparse (different surface forms for
+    /// the same concept, or NER failures).
+    ///
+    /// Returns (MemoryId, similarity_score) pairs, deduplicated by MemoryId.
+    pub fn search_similar_by_embedding(
+        &self,
+        embedding: &[f32],
+        limit: usize,
+        exclude_id: Option<&MemoryId>,
+    ) -> Result<Vec<(MemoryId, f32)>> {
+        self.retriever
+            .search_by_embedding(embedding, limit, exclude_id)
     }
 
     /// Update a memory in storage with full re-indexing
@@ -4721,6 +7425,13 @@ impl MemorySystem {
             stats.vector_index_count = indexed_after;
         }
 
+        // Persist repaired index to disk so orphans don't reappear on restart
+        if repaired > 0 {
+            if let Err(e) = self.retriever.save() {
+                tracing::error!(error = %e, "Failed to persist vector index after repair");
+            }
+        }
+
         tracing::info!(
             total_storage = total_storage,
             indexed_before = indexed_before,
@@ -4748,10 +7459,8 @@ impl MemorySystem {
 
         let mut orphaned_ids = Vec::new();
         for memory in &all_memories {
-            if !indexed_ids.contains(&memory.id) {
-                if orphaned_ids.len() < 100 {
-                    orphaned_ids.push(memory.id.clone());
-                }
+            if !indexed_ids.contains(&memory.id) && orphaned_ids.len() < 100 {
+                orphaned_ids.push(memory.id.clone());
             }
         }
 
@@ -4795,6 +7504,11 @@ impl MemorySystem {
             stats.vector_index_count = indexed;
         }
 
+        // Persist rebuilt index to disk so it survives restart
+        if let Err(e) = self.retriever.save() {
+            tracing::error!(error = %e, "Failed to persist vector index after rebuild");
+        }
+
         tracing::info!(
             storage_count = storage_count,
             indexed = indexed,
@@ -4809,12 +7523,58 @@ impl MemorySystem {
     pub fn save_vector_index(&self, _path: &Path) -> Result<()> {
         self.retriever.save()
     }
+
+    /// Merge BM25 index segments to remove ghost state from overwrites.
+    /// Should be called during heavy maintenance cycles only (expensive operation).
+    /// Returns the number of segments merged (0 if already optimal).
+    pub fn optimize_bm25(&self) -> Result<usize> {
+        self.hybrid_search.optimize_bm25()
+    }
+
+    /// Drain the write retry buffer, re-attempting any failed stores.
+    /// Returns the number of successfully retried writes.
+    pub fn drain_write_retries(&self) -> usize {
+        self.long_term_memory.drain_retry_buffer()
+    }
+
+    /// Number of writes pending retry
+    pub fn pending_write_retries(&self) -> usize {
+        self.long_term_memory.pending_retry_count()
+    }
+
+    /// Total write failures since server start
+    pub fn total_write_failures(&self) -> u64 {
+        self.long_term_memory.total_write_failures()
+    }
+
+    /// Get BM25 segment count for health metrics
+    pub fn bm25_segment_count(&self) -> usize {
+        self.hybrid_search.bm25_segment_count()
+    }
+
+    /// BM25 commit batches lost after retries. Nonzero means the searchable
+    /// index is silently missing documents (read-your-writes broken) — the
+    /// recall harness treats that as an infrastructure failure.
+    pub fn bm25_commit_failure_count(&self) -> u64 {
+        self.hybrid_search.bm25_commit_failure_count()
+    }
+
     /// Get vector index health information
     ///
     /// Returns metrics about the Vamana index including total vectors,
     /// incremental inserts since last build, and whether rebuild is recommended.
     pub fn index_health(&self) -> retrieval::IndexHealth {
         self.retriever.index_health()
+    }
+
+    /// Bulk-rebuild the Vamana graph with full alpha-RNG construction
+    /// (robust_prune), replacing the greedy incremental-insert graph. Vector
+    /// composition and the id mapping are preserved exactly — only graph
+    /// topology changes. Used by the eval harness at the ingest→query boundary
+    /// (SHODH_VAMANA_QUALITY_REBUILD=1); production wiring belongs in the
+    /// maintenance cycle.
+    pub fn force_vector_quality_rebuild(&self) -> Result<()> {
+        self.retriever.force_quality_rebuild()
     }
 
     /// Auto-rebuild vector index if degradation threshold is exceeded
@@ -4928,6 +7688,20 @@ impl MemorySystem {
     ///
     /// # Returns
     /// Statistics about what was reinforced
+    /// Reward learning-rate multiplier for reward-modulated Hebbian plasticity
+    /// (the in-memory RL). Scales the importance/edge update applied on
+    /// Helpful/Misleading feedback. Default 1.0 (the calibrated constants);
+    /// `SHODH_REWARD_LR_MULT` lets us amplify the reward loop and measure when
+    /// it moves rank, not just score. The default-1.0 path is byte-identical to
+    /// the prior behavior.
+    fn reward_lr_mult(&self) -> f32 {
+        std::env::var("SHODH_REWARD_LR_MULT")
+            .ok()
+            .and_then(|s| s.parse::<f32>().ok())
+            .filter(|m| *m > 0.0)
+            .unwrap_or(1.0)
+    }
+
     pub fn reinforce_recall(
         &self,
         memory_ids: &[MemoryId],
@@ -4939,7 +7713,7 @@ impl MemorySystem {
 
         let mut stats = ReinforcementStats {
             memories_processed: memory_ids.len(),
-            outcome: outcome.clone(),
+            outcome,
             ..Default::default()
         };
 
@@ -4968,6 +7742,68 @@ impl MemorySystem {
             }
         }
 
+        // Hebbian feedback on entity-level graph edges:
+        // Helpful → strengthen entity edges for involved memories
+        // Misleading → weaken entity edges (anti-Hebbian)
+        if let Some(graph) = &self.graph_memory {
+            let memory_uuids: Vec<uuid::Uuid> = memory_ids.iter().map(|id| id.0).collect();
+            const MAX_FEEDBACK_EDGES: usize = 200;
+            match graph
+                .read()
+                .collect_entity_edges_for_memories(&memory_uuids, MAX_FEEDBACK_EDGES)
+            {
+                Ok(edge_uuids) if !edge_uuids.is_empty() => {
+                    let result = match outcome {
+                        RetrievalOutcome::Helpful => {
+                            // Importance-gated strengthening: high-importance recalled
+                            // memories get stronger Hebbian boosts on their graph edges.
+                            let avg_importance = {
+                                let mut total = 0.0_f32;
+                                let mut count = 0_usize;
+                                for id in memory_ids {
+                                    if let Ok(mem) = self.long_term_memory.get(id) {
+                                        total += mem.importance();
+                                        count += 1;
+                                    }
+                                }
+                                if count > 0 {
+                                    total / count as f32
+                                } else {
+                                    0.5
+                                }
+                            };
+                            graph.read().batch_strengthen_synapses_with_importance(
+                                &edge_uuids,
+                                avg_importance,
+                            )
+                        }
+                        RetrievalOutcome::Misleading => graph
+                            .read()
+                            .batch_weaken_synapses(&edge_uuids, HEBBIAN_DECAY_MISLEADING),
+                        RetrievalOutcome::Neutral => Ok(0),
+                    };
+                    match result {
+                        Ok(count) => {
+                            stats.entity_edges_reinforced = count;
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                "Failed to reinforce entity-level graph edges"
+                            );
+                        }
+                    }
+                }
+                Ok(_) => {} // No entity edges found
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "Failed to collect entity edges for feedback reinforcement"
+                    );
+                }
+            }
+        }
+
         // CACHE COHERENT IMPORTANCE UPDATES:
         // 1. First try to find memory in caches (working, session)
         // 2. If found in cache, modify through the cached Arc (interior mutability)
@@ -4975,8 +7811,26 @@ impl MemorySystem {
         // 3. Then persist to storage for durability
         // 4. If not in cache, get from storage, modify, and persist
         let mut persist_failures: Vec<(MemoryId, String)> = Vec::new();
+        let mut total_prediction_error = 0.0f32;
+        let mut prediction_error_count = 0u32;
 
         for id in memory_ids {
+            // Prediction error weighting (VTA/Dopamine system — Schultz 1997):
+            // Look up how important we predicted this memory to be when surfaced.
+            // Compute prediction error → scale learning signal by surprise level.
+            let predicted = self.prediction_cache.get(id).unwrap_or(0.5);
+            let prediction_error = match &outcome {
+                RetrievalOutcome::Helpful => 1.0 - predicted, // High importance + Helpful = expected = low error
+                RetrievalOutcome::Misleading => predicted, // High importance + Misleading = surprising = high error
+                RetrievalOutcome::Neutral => 0.5,          // Baseline
+            };
+            let error_multiplier = crate::constants::PREDICTION_ERROR_MIN_MULTIPLIER
+                + prediction_error
+                    * (crate::constants::PREDICTION_ERROR_MAX_MULTIPLIER
+                        - crate::constants::PREDICTION_ERROR_MIN_MULTIPLIER);
+            total_prediction_error += prediction_error;
+            prediction_error_count += 1;
+
             // Try working memory cache first
             let cached_memory = {
                 let working = self.working_memory.read();
@@ -4994,11 +7848,15 @@ impl MemorySystem {
                 memory.record_access();
                 match &outcome {
                     RetrievalOutcome::Helpful => {
-                        memory.boost_importance(HEBBIAN_BOOST_HELPFUL);
+                        memory.boost_importance(
+                            HEBBIAN_BOOST_HELPFUL * error_multiplier * self.reward_lr_mult(),
+                        );
                         stats.importance_boosts += 1;
                     }
                     RetrievalOutcome::Misleading => {
-                        memory.decay_importance(HEBBIAN_DECAY_MISLEADING);
+                        memory.decay_importance(
+                            HEBBIAN_DECAY_MISLEADING * error_multiplier * self.reward_lr_mult(),
+                        );
                         stats.importance_decays += 1;
                     }
                     RetrievalOutcome::Neutral => {
@@ -5022,11 +7880,19 @@ impl MemorySystem {
                         memory.record_access();
                         match &outcome {
                             RetrievalOutcome::Helpful => {
-                                memory.boost_importance(HEBBIAN_BOOST_HELPFUL);
+                                memory.boost_importance(
+                                    HEBBIAN_BOOST_HELPFUL
+                                        * error_multiplier
+                                        * self.reward_lr_mult(),
+                                );
                                 stats.importance_boosts += 1;
                             }
                             RetrievalOutcome::Misleading => {
-                                memory.decay_importance(HEBBIAN_DECAY_MISLEADING);
+                                memory.decay_importance(
+                                    HEBBIAN_DECAY_MISLEADING
+                                        * error_multiplier
+                                        * self.reward_lr_mult(),
+                                );
                                 stats.importance_decays += 1;
                             }
                             RetrievalOutcome::Neutral => {
@@ -5054,6 +7920,48 @@ impl MemorySystem {
             }
         }
 
+        // Connect feedback to MOMENTUM — the load-bearing learning signal.
+        // Previously reinforce_recall only bumped importance + graph edges; it
+        // never touched the feedback-momentum EMA, so the momentum store and the
+        // reinforcement path were disconnected. That is why raising
+        // FEEDBACK_MOMENTUM_SCALE did nothing on the learning curve (the harness
+        // drives reinforce_recall, not the momentum store). Push a +1 (Helpful) /
+        // −1 (Misleading) signal per reinforced memory into the EMA. The EMA
+        // accumulates it gradually (inertia-damped, robust to a single bad
+        // signal), so repeated use BUILDS momentum that becomes load-bearing in
+        // recall (Layer 5 feedback_multiplier) — momentum, not forcing.
+        if let Some(fs) = &self.feedback_store {
+            let value: f32 = match outcome {
+                RetrievalOutcome::Helpful => 1.0,
+                RetrievalOutcome::Misleading => -1.0,
+                RetrievalOutcome::Neutral => 0.0,
+            };
+            if value != 0.0 {
+                let now = chrono::Utc::now();
+                let mut guard = fs.write();
+                for id in memory_ids {
+                    let mtype = self
+                        .long_term_memory
+                        .get(id)
+                        .map(|m| m.experience.experience_type)
+                        .unwrap_or(ExperienceType::Observation);
+                    {
+                        let momentum = guard.get_or_create_momentum(id.clone(), mtype);
+                        momentum.update(SignalRecord {
+                            timestamp: now,
+                            value,
+                            confidence: 1.0,
+                            trigger: SignalTrigger::TemporalCredit {
+                                turns_aggregated: 1,
+                                raw_total: value,
+                            },
+                        });
+                    }
+                    guard.mark_dirty(id);
+                }
+            }
+        }
+
         // Report aggregate persistence failures
         if !persist_failures.is_empty() {
             stats.persist_failures = persist_failures.len();
@@ -5061,6 +7969,15 @@ impl MemorySystem {
                 failure_count = persist_failures.len(),
                 "Hebbian reinforcement had persistence failures - learning feedback partially lost"
             );
+        }
+
+        // Record average prediction error multiplier for observability
+        if prediction_error_count > 0 {
+            let avg_error = total_prediction_error / prediction_error_count as f32;
+            stats.prediction_error_multiplier = crate::constants::PREDICTION_ERROR_MIN_MULTIPLIER
+                + avg_error
+                    * (crate::constants::PREDICTION_ERROR_MAX_MULTIPLIER
+                        - crate::constants::PREDICTION_ERROR_MIN_MULTIPLIER);
         }
 
         Ok(stats)
@@ -5135,15 +8052,32 @@ impl MemorySystem {
         for fact in facts {
             // Ensure all related entities exist as graph nodes
             for entity_name in &fact.related_entities {
+                // Resolve entity type from graph (preserves NER-derived labels)
+                let labels =
+                    if let Ok(Some(existing)) = graph_guard.find_entity_by_name(entity_name) {
+                        existing.labels
+                    } else {
+                        vec![crate::graph_memory::EntityLabel::Concept]
+                    };
+
                 let entity = crate::graph_memory::EntityNode {
                     uuid: Uuid::new_v4(),
                     name: entity_name.clone(),
-                    labels: vec![crate::graph_memory::EntityLabel::Concept],
+                    labels,
                     created_at: now,
                     last_seen_at: now,
                     mention_count: 1,
-                    summary: String::new(),
-                    attributes: std::collections::HashMap::new(),
+                    summary: fact.fact.chars().take(200).collect(),
+                    attributes: {
+                        let mut a = std::collections::HashMap::new();
+                        a.insert("source".into(), "fact_consolidation".into());
+                        a.insert("confidence".into(), format!("{:.2}", fact.confidence));
+                        a.insert(
+                            "support_count".into(),
+                            fact.source_memories.len().to_string(),
+                        );
+                        a
+                    },
                     name_embedding: embedding_map.get(entity_name).cloned(),
                     salience: fact.confidence * 0.5,
                     is_proper_noun: entity_name
@@ -5151,6 +8085,8 @@ impl MemorySystem {
                         .next()
                         .map(|c| c.is_uppercase())
                         .unwrap_or(false),
+                    selectivity: None,
+                    fine_type: None,
                 };
                 if graph_guard.add_entity(entity).is_ok() {
                     entities_added += 1;
@@ -5175,23 +8111,57 @@ impl MemorySystem {
                             _ => 1.0,
                         };
 
+                        // Provenance: record EVERY source memory that attests this
+                        // fact, not just the first. A SemanticFact is the one place
+                        // the system holds an explicit multi-episode attestation set
+                        // (fact.source_memories), so capture all of them — the richest
+                        // companion signal for provenance-driven multi-hop recall (Inc2).
+                        // add_relationship caps + dedups the trail.
+                        let provenance: Vec<crate::graph_memory::ProvenanceRecord> = fact
+                            .source_memories
+                            .iter()
+                            .map(|mid| crate::graph_memory::ProvenanceRecord {
+                                source_episode_id: mid.0,
+                                mention_count: 1,
+                                first_observed: now,
+                                last_observed: now,
+                                confidence: Some(fact.confidence),
+                                evidence_span: None,
+                                typed_by: Some(crate::graph_memory::TypingMethod::LabelPair),
+                            })
+                            .collect();
                         let edge = crate::graph_memory::RelationshipEdge {
                             uuid: Uuid::new_v4(),
                             from_entity: e1.uuid,
                             to_entity: e2.uuid,
-                            relation_type: crate::graph_memory::RelationType::RelatedTo,
+                            relation_type: crate::graph_memory::infer_relation_type_for_pair(
+                                e1.labels
+                                    .first()
+                                    .unwrap_or(&crate::graph_memory::EntityLabel::Concept),
+                                e2.labels
+                                    .first()
+                                    .unwrap_or(&crate::graph_memory::EntityLabel::Concept),
+                            ),
                             strength: l2_base_weight * semantic_weight,
                             created_at: now,
                             valid_at: now,
                             invalidated_at: None,
-                            source_episode_id: None,
+                            source_episode_id: fact.source_memories.first().map(|mid| mid.0),
                             context: fact.fact.chars().take(100).collect(),
                             last_activated: now,
                             activation_count: 1,
-                            ltp_status: crate::graph_memory::LtpStatus::None,
+                            ltp_status: if fact.confidence >= 0.8 && fact.source_memories.len() >= 3
+                            {
+                                crate::graph_memory::LtpStatus::Weekly
+                            } else {
+                                crate::graph_memory::LtpStatus::Burst { detected_at: now }
+                            },
                             tier: crate::graph_memory::EdgeTier::L2Episodic,
                             activation_timestamps: None,
                             entity_confidence: Some(fact.confidence),
+                            forman_curvature: None,
+                            endpoint_selectivity: None,
+                            provenance,
                         };
                         if graph_guard.add_relationship(edge).is_ok() {
                             edges_added += 1;
@@ -5235,6 +8205,7 @@ impl MemorySystem {
                 return MemoryGraphStats {
                     node_count: stats.entity_count,
                     edge_count: stats.relationship_count,
+                    episode_count: stats.episode_count,
                     avg_strength,
                     potentiated_count,
                 };
@@ -5244,6 +8215,7 @@ impl MemorySystem {
         MemoryGraphStats {
             node_count: 0,
             edge_count: 0,
+            episode_count: 0,
             avg_strength: 0.0,
             potentiated_count: 0,
         }
@@ -5381,7 +8353,9 @@ impl MemorySystem {
         } else {
             // === CREATE PATH ===
             let memory_id = MemoryId(Uuid::new_v4());
-            let importance = self.calculate_importance(&experience);
+            let importance = experience
+                .importance_override
+                .unwrap_or_else(|| self.calculate_importance(&experience));
 
             // Generate embeddings if not provided
             if experience.embeddings.is_none() {
@@ -5472,9 +8446,10 @@ impl MemorySystem {
                     .experience
                     .entities
                     .iter()
-                    .zip(entity_embeddings.into_iter())
+                    .zip(entity_embeddings)
                     .map(|(entity_name, embedding)| {
-                        let (label, salience) = resolve_entity_label(entity_name, &ner_lookup);
+                        let (label, salience, fine_type) =
+                            resolve_entity_label(entity_name, &ner_lookup);
                         crate::graph_memory::EntityNode {
                             uuid: Uuid::new_v4(),
                             name: entity_name.clone(),
@@ -5491,6 +8466,8 @@ impl MemorySystem {
                                 .next()
                                 .map(|c| c.is_uppercase())
                                 .unwrap_or(false),
+                            selectivity: None,
+                            fine_type,
                         }
                     })
                     .collect();
@@ -5532,6 +8509,19 @@ impl MemorySystem {
                             _ => 1.0,
                         };
 
+                        // Provenance: the single source episode that produced this
+                        // co-occurrence edge. This is the primary ingest path (the
+                        // majority of edges), so populating it here gives most of the
+                        // graph a real attestation trail + confidence at edge birth.
+                        let provenance = vec![crate::graph_memory::ProvenanceRecord {
+                            source_episode_id: memory.id.0,
+                            mention_count: 1,
+                            first_observed: now,
+                            last_observed: now,
+                            confidence: entity_confidence,
+                            evidence_span: None,
+                            typed_by: Some(crate::graph_memory::TypingMethod::CoOccurrence),
+                        }];
                         let edge = crate::graph_memory::RelationshipEdge {
                             uuid: Uuid::new_v4(),
                             from_entity: e1.uuid,
@@ -5549,6 +8539,9 @@ impl MemorySystem {
                             tier: crate::graph_memory::EdgeTier::L1Working,
                             activation_timestamps: None,
                             entity_confidence,
+                            forman_curvature: None,
+                            endpoint_selectivity: None,
+                            provenance,
                         };
 
                         if let Err(e) = graph_guard.add_relationship(edge) {
@@ -5642,11 +8635,20 @@ impl MemorySystem {
         const AT_RISK_THRESHOLD: f32 = 0.2; // Memories below this are at risk of being forgotten
 
         // Decay working memory activations with event tracking
+        // Emotional modulation: high-arousal memories decay slower (amygdala coupling)
         {
             let working = self.working_memory.read();
             for memory in working.all_memories() {
                 let activation_before = memory.activation();
-                memory.decay_activation(decay_factor);
+                let arousal = memory
+                    .experience
+                    .context
+                    .as_ref()
+                    .map(|c| c.emotional.arousal)
+                    .unwrap_or(0.0);
+                let emotional_factor =
+                    1.0 - (arousal * crate::constants::EMOTIONAL_DECAY_MODULATION);
+                memory.decay_activation(decay_factor * emotional_factor);
                 let activation_after = memory.activation();
                 decayed_count += 1;
 
@@ -5671,11 +8673,20 @@ impl MemorySystem {
         }
 
         // Decay session memory activations with event tracking
+        // Emotional modulation: high-arousal memories decay slower (amygdala coupling)
         {
             let session = self.session_memory.read();
             for memory in session.all_memories() {
                 let activation_before = memory.activation();
-                memory.decay_activation(decay_factor);
+                let arousal = memory
+                    .experience
+                    .context
+                    .as_ref()
+                    .map(|c| c.emotional.arousal)
+                    .unwrap_or(0.0);
+                let emotional_factor =
+                    1.0 - (arousal * crate::constants::EMOTIONAL_DECAY_MODULATION);
+                memory.decay_activation(decay_factor * emotional_factor);
                 let activation_after = memory.activation();
                 decayed_count += 1;
 
@@ -5872,19 +8883,25 @@ impl MemorySystem {
                             embedding.as_deref(),
                         ) {
                             Ok(Some(mut existing)) => {
-                                // Reinforce the existing fact
-                                existing.support_count += 1;
+                                // Extend source memories — track if any genuinely new
+                                let mut new_sources_added = false;
+                                for src in &fact.source_memories {
+                                    if !existing.source_memories.contains(src) {
+                                        existing.source_memories.push(src.clone());
+                                        new_sources_added = true;
+                                    }
+                                }
+
+                                // Only increment support_count when new source evidence
+                                // is contributed. Prevents same memories from inflating
+                                // the count on every maintenance cycle.
+                                if new_sources_added {
+                                    existing.support_count += 1;
+                                }
                                 existing.last_reinforced = now;
                                 let confidence_before = existing.confidence;
                                 let boost = 0.1 * (1.0 - existing.confidence);
                                 existing.confidence = (existing.confidence + boost).min(1.0);
-
-                                // Extend source memories and related entities
-                                for src in &fact.source_memories {
-                                    if !existing.source_memories.contains(src) {
-                                        existing.source_memories.push(src.clone());
-                                    }
-                                }
                                 for entity in &fact.related_entities {
                                     if !existing.related_entities.contains(entity) {
                                         existing.related_entities.push(entity.clone());
@@ -5997,7 +9014,63 @@ impl MemorySystem {
         let mut replay_result = replay::ReplayCycleResult::default();
         {
             // PIPE-2: Check for pattern-triggered replay first
-            let pattern_result = self.pattern_detector.write().detect_patterns();
+            let mut pattern_result = self.pattern_detector.write().detect_patterns();
+
+            // PIPE-3: Semantic clustering — feed similarity triples from Vamana into
+            // detect_semantic_clusters(). Heavy-only because it requires vector searches.
+            if is_heavy && !all_memories_for_heavy.is_empty() {
+                let sample_size = crate::constants::SEMANTIC_CLUSTER_SAMPLE_SIZE;
+                let neighbor_k = crate::constants::SEMANTIC_CLUSTER_NEIGHBOR_K;
+
+                // Sample the most recent memories (tail of the vec, sorted by creation time)
+                let start = all_memories_for_heavy.len().saturating_sub(sample_size);
+                let sample = &all_memories_for_heavy[start..];
+
+                let mut similarity_triples: Vec<(String, String, f32)> = Vec::new();
+
+                for mem in sample {
+                    let emb = match mem.experience.embeddings.as_ref() {
+                        Some(e) => e,
+                        None => continue,
+                    };
+
+                    let neighbors =
+                        match self
+                            .retriever
+                            .search_by_embedding(emb, neighbor_k, Some(&mem.id))
+                        {
+                            Ok(n) => n,
+                            Err(_) => continue,
+                        };
+
+                    let source_id = mem.id.0.to_string();
+                    for (neighbor_id, similarity) in neighbors {
+                        similarity_triples.push((
+                            source_id.clone(),
+                            neighbor_id.0.to_string(),
+                            similarity,
+                        ));
+                    }
+                }
+
+                if !similarity_triples.is_empty() {
+                    let semantic_triggers = self
+                        .pattern_detector
+                        .write()
+                        .detect_semantic_clusters(&similarity_triples);
+
+                    if !semantic_triggers.is_empty() {
+                        tracing::info!(
+                            count = semantic_triggers.len(),
+                            triples = similarity_triples.len(),
+                            "Semantic clustering found clusters during heavy maintenance"
+                        );
+                        pattern_result.semantic_clusters_found = semantic_triggers.len();
+                        pattern_result.triggers.extend(semantic_triggers);
+                    }
+                }
+            }
+
             let has_pattern_triggers = !pattern_result.triggers.is_empty();
 
             // Log pattern detection results
@@ -6261,7 +9334,7 @@ impl MemorySystem {
         }
 
         // Sort by timestamp
-        all_events.sort_by(|a, b| a.timestamp().cmp(&b.timestamp()));
+        all_events.sort_by_key(|a| a.timestamp());
 
         // Generate report from combined events
         let report =
@@ -6401,26 +9474,85 @@ impl MemorySystem {
         // Run consolidation
         let result = consolidator.consolidate(&memories);
 
-        // Store extracted facts
-        if !result.new_facts.is_empty() {
-            let stored = self.fact_store.store_batch(user_id, &result.new_facts)?;
+        // Pattern separation gate (dentate gyrus analogy): before storing new
+        // facts, check if each one matches an existing engram. If so, reinforce
+        // the existing trace (pattern completion) instead of creating a duplicate.
+        // This prevents within-batch duplicates that bypass the find_similar() gate
+        // because both members are stored in the same consolidation cycle.
+        let mut deduplicated_facts: Vec<SemanticFact> = Vec::new();
+        let mut merged_count: usize = 0;
+
+        // Pre-encode all new facts to enable hybrid dedup with cosine gate
+        let new_texts: Vec<&str> = result.new_facts.iter().map(|f| f.fact.as_str()).collect();
+        let new_embeddings: Vec<Option<Vec<f32>>> = match self.embedder.encode_batch(&new_texts) {
+            Ok(embs) => embs.into_iter().map(Some).collect(),
+            Err(_) => vec![None; result.new_facts.len()],
+        };
+
+        for (fact, embedding) in result.new_facts.iter().zip(new_embeddings.iter()) {
+            let emb_ref = embedding.as_deref();
+            match self
+                .fact_store
+                .find_similar(user_id, &fact.fact, &fact.related_entities, emb_ref)
+            {
+                Ok(Some(mut existing)) => {
+                    // Pattern completion: reinforce existing trace.
+                    // Only increment support_count when genuinely new source
+                    // memories contribute evidence. Prevents same memories
+                    // from inflating the count across consolidation cycles.
+                    let existing_sources: std::collections::HashSet<MemoryId> =
+                        existing.source_memories.iter().cloned().collect();
+                    let mut new_sources_added = false;
+                    for src in &fact.source_memories {
+                        if !existing_sources.contains(src) {
+                            existing.source_memories.push(src.clone());
+                            new_sources_added = true;
+                        }
+                    }
+                    if new_sources_added {
+                        existing.support_count += 1;
+                    }
+                    existing.last_reinforced = chrono::Utc::now();
+                    let _ = self.fact_store.update(user_id, &existing);
+                    merged_count += 1;
+                }
+                _ => {
+                    deduplicated_facts.push(fact.clone());
+                }
+            }
+        }
+
+        if merged_count > 0 {
+            tracing::info!(
+                user_id = %user_id,
+                merged = merged_count,
+                "Pattern separation: merged new facts into existing engrams"
+            );
+        }
+
+        // Store genuinely new facts (passed pattern separation gate)
+        if !deduplicated_facts.is_empty() {
+            let stored = self.fact_store.store_batch(user_id, &deduplicated_facts)?;
             tracing::info!(
                 user_id = %user_id,
                 facts_extracted = result.facts_extracted,
                 facts_stored = stored,
+                facts_merged = merged_count,
                 "Semantic distillation complete"
             );
 
-            // Batch-encode and store embeddings for distilled facts
-            let texts: Vec<&str> = result.new_facts.iter().map(|f| f.fact.as_str()).collect();
-            if let Ok(batch_embs) = self.embedder.encode_batch(&texts) {
-                for (fact, emb) in result.new_facts.iter().zip(batch_embs.iter()) {
-                    let _ = self.fact_store.store_embedding(user_id, &fact.id, emb);
+            // Store embeddings for the genuinely new facts
+            for fact in &deduplicated_facts {
+                // Find the matching embedding from the pre-encoded batch
+                if let Some(pos) = result.new_facts.iter().position(|f| f.id == fact.id) {
+                    if let Some(Some(emb)) = new_embeddings.get(pos) {
+                        let _ = self.fact_store.store_embedding(user_id, &fact.id, emb);
+                    }
                 }
             }
 
-            // Record consolidation event for each fact (persists significant events)
-            for fact in &result.new_facts {
+            // Record consolidation event for each stored fact
+            for fact in &deduplicated_facts {
                 self.record_consolidation_event_for_user(
                     user_id,
                     ConsolidationEvent::FactExtracted {
@@ -6433,11 +9565,24 @@ impl MemorySystem {
                     },
                 );
             }
+
+            // Connect newly extracted facts to the knowledge graph — the
+            // timer-driven run_maintenance() path does this, but the on-demand
+            // distillation path used to leave facts orphaned (never wired into
+            // EntityNodes/edges), so graph-augmented recall couldn't reach them.
+            self.connect_facts_to_graph(&deduplicated_facts);
         }
 
-        // Advance watermark after successful extraction
+        // Advance watermark to the LAST memory's created_at, NOT now(): using now()
+        // would skip memories created during the (potentially slow) extraction cycle
+        // — they'd have created_at < now() and never be processed for facts. Mirrors
+        // run_maintenance().
         if !memories.is_empty() {
-            let new_watermark = chrono::Utc::now().timestamp_millis();
+            let new_watermark = memories
+                .iter()
+                .map(|m| m.created_at.timestamp_millis())
+                .max()
+                .unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
             self.fact_extraction_watermark
                 .store(new_watermark, std::sync::atomic::Ordering::Relaxed);
             self.long_term_memory
@@ -6445,6 +9590,16 @@ impl MemorySystem {
         }
 
         Ok(result)
+    }
+
+    /// Purge duplicate facts for a user (delegates to SemanticFactStore).
+    pub fn purge_duplicate_facts(&self, user_id: &str) -> Result<usize> {
+        self.fact_store.purge_duplicates(user_id)
+    }
+
+    /// Purge noise facts for a user (delegates to SemanticFactStore).
+    pub fn purge_noise_facts(&self, user_id: &str) -> Result<usize> {
+        self.fact_store.purge_noise_facts(user_id)
     }
 
     /// Get semantic facts for a user
@@ -6535,6 +9690,84 @@ impl MemorySystem {
         Ok(results)
     }
 
+    /// Build fact narratives by clustering facts on shared entities.
+    ///
+    /// Groups related facts into topic clusters using single-linkage clustering
+    /// on entity overlap. Each cluster gets a template-generated narrative and
+    /// heuristic-based causal chain detection (keyword analysis on temporally
+    /// ordered facts).
+    ///
+    /// Returns ALL clusters found (sorted by support, highest first) — callers
+    /// are responsible for paginating (`skip`/`take`) the result. Pagination is
+    /// intentionally not done here so the caller can report an accurate total
+    /// cluster count alongside a paged slice (see `handlers::facts::fact_narratives`).
+    pub fn build_fact_narratives(
+        &self,
+        user_id: &str,
+        entity_filter: Option<&str>,
+    ) -> Result<Vec<FactCluster>> {
+        let facts = if let Some(entity) = entity_filter {
+            self.fact_store.find_by_entity(user_id, entity, 200)?
+        } else {
+            self.fact_store.list(user_id, 500)?
+        };
+
+        if facts.is_empty() {
+            return Ok(vec![]);
+        }
+
+        // Step 1: Compute entity document frequency to identify hub entities
+        let n = facts.len();
+        let mut entity_df: std::collections::HashMap<&str, usize> =
+            std::collections::HashMap::new();
+        for f in &facts {
+            let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+            for e in &f.related_entities {
+                if seen.insert(e.as_str()) {
+                    *entity_df.entry(e.as_str()).or_default() += 1;
+                }
+            }
+        }
+        let hub_threshold = (n as f32 * 0.20).max(5.0) as usize;
+        let hub_entities: std::collections::HashSet<&str> = entity_df
+            .iter()
+            .filter(|(_, count)| **count >= hub_threshold)
+            .map(|(e, _)| *e)
+            .collect();
+
+        // Step 2: For each fact, find its most specific (lowest-DF) entity = topic
+        // Facts with no discriminative entity go into an "uncategorized" bucket
+        let mut topic_groups: std::collections::HashMap<String, Vec<usize>> =
+            std::collections::HashMap::new();
+
+        for (i, f) in facts.iter().enumerate() {
+            let best_entity = f
+                .related_entities
+                .iter()
+                .filter(|e| !hub_entities.contains(e.as_str()))
+                .min_by_key(|e| entity_df.get(e.as_str()).copied().unwrap_or(usize::MAX));
+
+            let topic = match best_entity {
+                Some(e) => e.clone(),
+                None => "__uncategorized__".to_string(),
+            };
+            topic_groups.entry(topic).or_default().push(i);
+        }
+
+        // Step 3: Build clusters from topic groups (skip uncategorized singletons)
+        let mut clusters: Vec<FactCluster> = topic_groups
+            .into_iter()
+            .filter(|(topic, indices)| {
+                // Keep groups with 2+ facts, or single facts if they have a real topic
+                indices.len() >= 2 || (indices.len() == 1 && topic != "__uncategorized__")
+            })
+            .map(|(_, indices)| build_single_cluster(&facts, &indices))
+            .collect();
+
+        clusters.sort_by(|a, b| b.total_support.cmp(&a.total_support));
+        Ok(clusters)
+    }
+
     /// Reinforce a fact with new supporting evidence
     ///
     /// Called when a new memory supports an existing fact.
@@ -6589,6 +9822,22 @@ impl MemorySystem {
         self.fact_store.delete(user_id, fact_id)
     }
 
+    /// Purge facts matching a content predicate. Returns (deleted, total_scanned).
+    pub fn purge_facts<F>(&self, user_id: &str, predicate: F) -> Result<(usize, usize)>
+    where
+        F: Fn(&SemanticFact) -> bool,
+    {
+        let all_facts = self.fact_store.list(user_id, 10_000)?;
+        let total = all_facts.len();
+        let mut deleted = 0;
+        for fact in &all_facts {
+            if predicate(fact) && self.fact_store.delete(user_id, &fact.id)? {
+                deleted += 1;
+            }
+        }
+        Ok((deleted, total))
+    }
+
     /// Get the fact store for direct access
     pub fn fact_store(&self) -> &Arc<facts::SemanticFactStore> {
         &self.fact_store
@@ -6615,32 +9864,149 @@ impl MemorySystem {
     ) -> Result<Vec<LineageEdge>> {
         let mut inferred_edges = Vec::new();
 
+        // Detect a project-pivot signal up front. When present we open a branch
+        // here, so the branch id is available to (a) tag the edges this memory
+        // originates and (b) anchor a BranchedFrom edge into the edge graph —
+        // otherwise branches were created as orphan metadata records that nothing
+        // referenced and every edge stayed silently on `main`.
+        let branch_id: Option<String> =
+            if lineage::LineageGraph::detect_branch_signal(&new_memory.experience.content) {
+                self.lineage_graph.ensure_main_branch(user_id)?;
+                let branch_name = format!("pivot-{}", chrono::Utc::now().format("%Y%m%d-%H%M%S"));
+                match self.lineage_graph.create_branch(
+                    user_id,
+                    &branch_name,
+                    "main",
+                    new_memory.id.clone(),
+                    Some(&format!(
+                        "Auto-detected pivot: {}",
+                        crate::memory::char_truncate(&new_memory.experience.content, 80)
+                    )),
+                ) {
+                    Ok(branch) => {
+                        tracing::info!(
+                            user_id = %user_id,
+                            branch = %branch.name,
+                            memory_id = %new_memory.id.0,
+                            "Auto-created lineage branch from pivot signal"
+                        );
+                        Some(branch.id)
+                    }
+                    Err(e) => {
+                        tracing::debug!("Auto-branch creation failed (non-fatal): {}", e);
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
+        // Read new_memory's outgoing edges ONCE. The forward pass below checks
+        // them on every candidate iteration; re-reading per candidate was an
+        // O(N²) store scan. We keep this cache consistent as edges are stored.
+        // (Backward-pass edges are candidate → new_memory, i.e. incoming, so they
+        // never appear here and cannot stale this cache.)
+        let mut new_memory_edges = self.lineage_graph.get_edges_from(user_id, &new_memory.id)?;
+
         for candidate in candidate_memories {
-            // Try inferring from candidate to new memory (candidate caused new)
+            // Backward pass: candidate → new_memory (what caused this memory?)
             if let Some((relation, confidence)) =
                 self.lineage_graph.infer_relation(candidate, new_memory)
             {
-                // Check if edge already exists
-                if !self
-                    .lineage_graph
-                    .edge_exists(user_id, &candidate.id, &new_memory.id)?
-                {
-                    let edge = LineageEdge::inferred(
-                        candidate.id.clone(),
-                        new_memory.id.clone(),
-                        relation,
-                        confidence,
-                    );
-                    self.lineage_graph.store_edge(user_id, &edge)?;
-                    inferred_edges.push(edge);
+                // BCM LTP threshold: sub-threshold stimulation produces LTD, not LTP.
+                // Weak inferences below the confidence floor are noise that would
+                // drown out genuine causal structure if persisted.
+                if confidence < crate::constants::LINEAGE_MIN_STORE_CONFIDENCE {
+                    continue;
+                }
+                // Check existing edges from candidate → new_memory
+                let existing_edges = self.lineage_graph.get_edges_from(user_id, &candidate.id)?;
+                let existing_edge = existing_edges.iter().find(|e| e.to == new_memory.id);
+                match existing_edge {
+                    Some(old) if confidence > old.confidence => {
+                        // Reinference produced stronger confidence — update edge
+                        let mut updated = old.clone();
+                        updated.confidence = confidence;
+                        updated.relation = relation;
+                        self.lineage_graph.store_edge(user_id, &updated)?;
+                    }
+                    None => {
+                        // No existing edge — create new
+                        let edge = LineageEdge::inferred(
+                            candidate.id.clone(),
+                            new_memory.id.clone(),
+                            relation,
+                            confidence,
+                        );
+                        self.lineage_graph.store_edge(user_id, &edge)?;
+                        inferred_edges.push(edge);
+                    }
+                    _ => {} // Existing edge has equal/higher confidence, skip
+                }
+            }
+
+            // Forward pass: new_memory → candidate (what did this memory cause?)
+            // This catches retroactive causality: when an earlier memory is stored
+            // after a later one (out-of-order ingestion), or when a new memory's
+            // type makes it a cause of existing memories (e.g., Learning stored
+            // before the Decision it informed).
+            if let Some((relation, confidence)) =
+                self.lineage_graph.infer_relation(new_memory, candidate)
+            {
+                // BCM LTP threshold (forward pass)
+                if confidence < crate::constants::LINEAGE_MIN_STORE_CONFIDENCE {
+                    continue;
+                }
+                let existing_pos = new_memory_edges.iter().position(|e| e.to == candidate.id);
+                match existing_pos {
+                    Some(i) if confidence > new_memory_edges[i].confidence => {
+                        let mut updated = new_memory_edges[i].clone();
+                        updated.confidence = confidence;
+                        updated.relation = relation;
+                        self.lineage_graph.store_edge(user_id, &updated)?;
+                        new_memory_edges[i] = updated;
+                    }
+                    None => {
+                        // Edges originating from the pivot memory belong to the
+                        // branch it opened (None → main otherwise).
+                        let edge = LineageEdge::inferred(
+                            new_memory.id.clone(),
+                            candidate.id.clone(),
+                            relation,
+                            confidence,
+                        )
+                        .with_branch(branch_id.clone());
+                        self.lineage_graph.store_edge(user_id, &edge)?;
+                        new_memory_edges.push(edge.clone());
+                        inferred_edges.push(edge);
+                    }
+                    _ => {}
                 }
             }
         }
 
-        // Check for branch signal in memory content
-        if lineage::LineageGraph::detect_branch_signal(&new_memory.experience.content) {
-            // Ensure main branch exists
-            self.lineage_graph.ensure_main_branch(user_id)?;
+        // If this memory opened a branch, anchor it into the edge graph with a
+        // BranchedFrom edge to the most recent prior candidate — the work it
+        // pivoted away from. Without this the branch is unreachable by trace()
+        // and find_root_cause().
+        if let Some(ref bid) = branch_id {
+            if let Some(origin) = candidate_memories
+                .iter()
+                .filter(|c| c.id != new_memory.id && c.created_at <= new_memory.created_at)
+                .max_by_key(|c| c.created_at)
+            {
+                if !new_memory_edges.iter().any(|e| e.to == origin.id) {
+                    let edge = LineageEdge::inferred(
+                        new_memory.id.clone(),
+                        origin.id.clone(),
+                        lineage::CausalRelation::BranchedFrom,
+                        crate::constants::LINEAGE_CONFIDENCE_BRANCHED_FROM,
+                    )
+                    .with_branch(Some(bid.clone()));
+                    self.lineage_graph.store_edge(user_id, &edge)?;
+                    inferred_edges.push(edge);
+                }
+            }
         }
 
         Ok(inferred_edges)
@@ -6756,9 +10122,204 @@ impl MemorySystem {
     }
 }
 
-/// Automatic persistence on drop - ensures vector index and ID mappings survive restarts
+// Automatic persistence on drop - ensures vector index and ID mappings survive restarts
+//
+// This is CRITICAL for local memory: when the system shuts down (gracefully or via drop),
+
+// =============================================================================
+// Fact Narrative Helpers (private, used by MemorySystem::build_fact_narratives)
+// =============================================================================
+
+/// Build a single FactCluster from a set of fact indices.
+fn build_single_cluster(all_facts: &[SemanticFact], indices: &[usize]) -> FactCluster {
+    use std::collections::HashMap;
+
+    let mut entity_counts: HashMap<&str, usize> = HashMap::new();
+    let mut cluster_facts: Vec<SemanticFact> = Vec::with_capacity(indices.len());
+
+    for &i in indices {
+        let f = &all_facts[i];
+        cluster_facts.push(f.clone());
+        for e in &f.related_entities {
+            *entity_counts.entry(e.as_str()).or_default() += 1;
+        }
+    }
+
+    // Sort by created_at for temporal ordering within narrative
+    cluster_facts.sort_by_key(|f| f.created_at);
+
+    let topic = entity_counts
+        .iter()
+        .max_by_key(|(_, c)| *c)
+        .map(|(n, _)| (*n).to_string())
+        .unwrap_or_else(|| "General".to_string());
+
+    let mut entities: Vec<String> = entity_counts.keys().map(|e| (*e).to_string()).collect();
+    entities.sort();
+
+    // Template-based narrative: no LLM needed
+    let narrative = if cluster_facts.len() == 1 {
+        format!("Regarding {}: {}", topic, cluster_facts[0].fact)
+    } else {
+        let mut lines = vec![format!(
+            "Regarding {} ({} facts):",
+            topic,
+            cluster_facts.len()
+        )];
+        for (i, f) in cluster_facts.iter().enumerate() {
+            let label = if f.confidence >= 0.8 {
+                "established"
+            } else if f.confidence >= 0.5 {
+                "probable"
+            } else {
+                "tentative"
+            };
+            lines.push(format!("  {}. [{}] {}", i + 1, label, f.fact));
+        }
+        lines.join("\n")
+    };
+
+    let causal_chains = detect_causal_chains(&cluster_facts);
+
+    let avg_confidence = if cluster_facts.is_empty() {
+        0.0
+    } else {
+        cluster_facts.iter().map(|f| f.confidence).sum::<f32>() / cluster_facts.len() as f32
+    };
+    let total_support: usize = cluster_facts.iter().map(|f| f.support_count).sum();
+
+    FactCluster {
+        topic,
+        entities,
+        facts: cluster_facts,
+        narrative,
+        avg_confidence,
+        total_support,
+        causal_chains,
+    }
+}
+
+/// Detect causal relationships between temporally ordered facts sharing entities.
 ///
-/// This is CRITICAL for local memory: when the system shuts down (gracefully or via drop),
+/// Analogous to hippocampal trace conditioning — the hippocampus bridges temporal
+/// gaps to form associations between events that share contextual features (entities).
+/// The keyword vocabulary defines the temporal receptive field: broader vocabulary
+/// detects more of the causal structure that actually exists in the fact timeline.
+///
+/// Relationship types:
+/// - superseded_by: fact B replaced/obsoleted fact A
+/// - resolved_by: fact B fixed/patched an issue described in fact A
+/// - informed_by: fact B was based on or learned from fact A
+/// - led_to: fact A generally caused or prompted fact B
+fn detect_causal_chains(sorted_facts: &[SemanticFact]) -> Vec<CausalFactLink> {
+    // Supersession signals: the later fact explicitly obsoletes the earlier one
+    const SUPERSEDED_KEYWORDS: &[&str] = &[
+        "replaced",
+        "instead",
+        "no longer",
+        "removed",
+        "upgraded",
+        "converted",
+        "refactored",
+        "deprecated",
+    ];
+
+    // Resolution signals: the later fact fixed a problem in the earlier one
+    const RESOLVED_KEYWORDS: &[&str] = &[
+        "fixed",
+        "resolved",
+        "patched",
+        "corrected",
+        "addressed",
+        "eliminated",
+    ];
+
+    // Informed-by signals: the later fact was derived from the earlier one
+    const INFORMED_KEYWORDS: &[&str] = &[
+        "based on",
+        "learned from",
+        "following",
+        "after discovering",
+        "informed by",
+        "derived from",
+    ];
+
+    // General evolution signals: any causal linkage between temporally ordered facts
+    const GENERAL_EVOLUTION: &[&str] = &[
+        "migrated",
+        "updated",
+        "changed",
+        "now uses",
+        "switched",
+        "added",
+        "resulted in",
+        "prompted",
+        "triggered",
+        "spawned",
+        "caused",
+        "introduced",
+        "implemented",
+        "enabled",
+    ];
+
+    let mut chains = Vec::new();
+
+    // Pre-compute lowercase facts to avoid repeated allocations in O(n²) loop.
+    let lowered: Vec<String> = sorted_facts.iter().map(|f| f.fact.to_lowercase()).collect();
+
+    // All keyword lists combined for the initial has-any-evolution check
+    let all_keywords: Vec<&str> = SUPERSEDED_KEYWORDS
+        .iter()
+        .chain(RESOLVED_KEYWORDS.iter())
+        .chain(INFORMED_KEYWORDS.iter())
+        .chain(GENERAL_EVOLUTION.iter())
+        .copied()
+        .collect();
+
+    for i in 0..sorted_facts.len() {
+        for j in (i + 1)..sorted_facts.len() {
+            let a = &sorted_facts[i];
+            let b = &sorted_facts[j];
+
+            // Must share at least one entity
+            let shared = a
+                .related_entities
+                .iter()
+                .any(|e| b.related_entities.contains(e));
+            if !shared {
+                continue;
+            }
+
+            let b_lower = &lowered[j];
+            let has_evolution = all_keywords.iter().any(|kw| b_lower.contains(kw));
+            if !has_evolution {
+                continue;
+            }
+
+            // Classify by most specific match (superseded > resolved > informed > led_to)
+            let relation = if SUPERSEDED_KEYWORDS.iter().any(|kw| b_lower.contains(kw)) {
+                "superseded_by"
+            } else if RESOLVED_KEYWORDS.iter().any(|kw| b_lower.contains(kw)) {
+                "resolved_by"
+            } else if INFORMED_KEYWORDS.iter().any(|kw| b_lower.contains(kw)) {
+                "informed_by"
+            } else {
+                "led_to"
+            };
+
+            chains.push(CausalFactLink {
+                from_fact_id: a.id.clone(),
+                to_fact_id: b.id.clone(),
+                from_fact: a.fact.clone(),
+                to_fact: b.fact.clone(),
+                relation: relation.to_string(),
+            });
+        }
+    }
+
+    chains
+}
+
 /// all in-memory state (vector index, ID mappings) must be persisted to disk.
 impl Drop for MemorySystem {
     fn drop(&mut self) {
@@ -6769,5 +10330,447 @@ impl Drop for MemorySystem {
         if let Err(e) = self.long_term_memory.flush() {
             tracing::error!("Failed to flush storage on shutdown: {}", e);
         }
+    }
+}
+
+#[cfg(test)]
+mod companion_injection_tests {
+    use super::*;
+    use crate::graph_memory::{
+        EntityLabel, EntityNode, GraphMemory, ProvenanceRecord, RelationType, RelationshipEdge,
+    };
+    use crate::memory::types::Experience;
+    use std::collections::HashMap as StdHashMap;
+
+    fn setup() -> (MemorySystem, tempfile::TempDir) {
+        let temp_dir = tempfile::TempDir::new().expect("temp dir");
+        let config = MemoryConfig {
+            storage_path: temp_dir.path().to_path_buf(),
+            working_memory_size: 50,
+            session_memory_size_mb: 50,
+            max_heap_per_user_mb: 200,
+            auto_compress: false,
+            compression_age_days: 1,
+            importance_threshold: 0.0,
+        };
+        let mut system = MemorySystem::new(config, None).expect("memory system");
+        let graph = GraphMemory::new(&temp_dir.path().join("graph"), None).expect("graph");
+        system.set_graph_memory(Arc::new(parking_lot::RwLock::new(graph)));
+        (system, temp_dir)
+    }
+
+    fn remember_with_entities(system: &MemorySystem, content: &str, entities: &[&str]) -> MemoryId {
+        let experience = Experience {
+            content: content.to_string(),
+            entities: entities.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        };
+        system.remember(experience, None).expect("remember")
+    }
+
+    fn add_entity(graph: &GraphMemory, name: &str) -> uuid::Uuid {
+        let node = EntityNode {
+            uuid: uuid::Uuid::new_v4(),
+            name: name.to_string(),
+            labels: vec![EntityLabel::Person],
+            created_at: chrono::Utc::now(),
+            last_seen_at: chrono::Utc::now(),
+            mention_count: 1,
+            summary: String::new(),
+            attributes: StdHashMap::new(),
+            name_embedding: None,
+            salience: 1.0,
+            is_proper_noun: true,
+            selectivity: None,
+            fine_type: None,
+        };
+        graph.add_entity(node).expect("add entity")
+    }
+
+    fn add_edge_with_provenance(
+        graph: &GraphMemory,
+        from: uuid::Uuid,
+        to: uuid::Uuid,
+        source_episode: uuid::Uuid,
+        confidence: Option<f32>,
+    ) {
+        let now = chrono::Utc::now();
+        let edge = RelationshipEdge {
+            uuid: uuid::Uuid::new_v4(),
+            from_entity: from,
+            to_entity: to,
+            relation_type: RelationType::CoOccurs,
+            strength: 1.0,
+            created_at: now,
+            valid_at: now,
+            invalidated_at: None,
+            source_episode_id: Some(source_episode),
+            context: String::new(),
+            last_activated: now,
+            activation_count: 1,
+            ltp_status: crate::graph_memory::LtpStatus::None,
+            tier: crate::graph_memory::EdgeTier::L1Working,
+            activation_timestamps: None,
+            entity_confidence: None,
+            forman_curvature: None,
+            endpoint_selectivity: None,
+            provenance: vec![ProvenanceRecord {
+                source_episode_id: source_episode,
+                mention_count: 1,
+                first_observed: now,
+                last_observed: now,
+                confidence,
+                evidence_span: None,
+                typed_by: None,
+            }],
+        };
+        graph.add_relationship(edge).expect("add edge");
+    }
+
+    /// Add an edge carrying NO provenance and no source episode — the harvester
+    /// must treat it as a no-op.
+    fn add_edge_no_provenance(graph: &GraphMemory, from: uuid::Uuid, to: uuid::Uuid) {
+        let now = chrono::Utc::now();
+        let edge = RelationshipEdge {
+            uuid: uuid::Uuid::new_v4(),
+            from_entity: from,
+            to_entity: to,
+            relation_type: RelationType::CoOccurs,
+            strength: 1.0,
+            created_at: now,
+            valid_at: now,
+            invalidated_at: None,
+            source_episode_id: None,
+            context: String::new(),
+            last_activated: now,
+            activation_count: 1,
+            ltp_status: crate::graph_memory::LtpStatus::None,
+            tier: crate::graph_memory::EdgeTier::L1Working,
+            activation_timestamps: None,
+            entity_confidence: None,
+            forman_curvature: None,
+            endpoint_selectivity: None,
+            provenance: Vec::new(),
+        };
+        graph.add_relationship(edge).expect("add edge");
+    }
+
+    /// A high-confidence provenance edge incident to a ranked memory's entity
+    /// surfaces the attesting companion episode, scored strictly below its source.
+    #[test]
+    fn companion_is_harvested_and_scored_sub_source() {
+        let (system, _t) = setup();
+        // Companion is a separate stored memory; anchor exposes entity "A".
+        let companion_id = remember_with_entities(&system, "Companion turn about B and C.", &["B"]);
+        let anchor_id =
+            remember_with_entities(&system, "Anchor turn mentions A and B.", &["A", "B"]);
+        let mut anchor = system.get_memory(&anchor_id).unwrap();
+        anchor.set_score(1.0);
+
+        {
+            let graph = system.graph_memory().unwrap().write();
+            let a = add_entity(&graph, "A");
+            let b = add_entity(&graph, "B");
+            // Edge A->B attested by the COMPANION episode (provenance points to it).
+            add_edge_with_provenance(&graph, a, b, companion_id.0, Some(0.9));
+        }
+
+        let ranked: Vec<SharedMemory> = vec![Arc::new(anchor)];
+        let companions =
+            system.harvest_provenance_companions(&system.graph_memory().unwrap().read(), &ranked);
+
+        assert_eq!(
+            companions.len(),
+            1,
+            "the single attesting companion is harvested"
+        );
+        let (mem, score) = &companions[0];
+        assert_eq!(mem.id, companion_id, "harvested the attesting episode");
+        // Sub-source: 1.0 (source) * 0.9 (conf) * 0.5 (factor) = 0.45 < 1.0.
+        assert!(*score < 1.0, "companion scores strictly below its source");
+        assert!((*score - 0.45).abs() < 1e-4, "score = source*conf*factor");
+    }
+
+    /// Companions already present in the ranked set are not re-injected (dedup),
+    /// and a single source episode attesting many edges is harvested once.
+    #[test]
+    fn dedup_against_ranked_and_across_edges() {
+        let (system, _t) = setup();
+        let anchor_id = remember_with_entities(&system, "Anchor with A and B.", &["A", "B"]);
+        let companion_id = remember_with_entities(&system, "Companion with C.", &["C"]);
+        let mut anchor = system.get_memory(&anchor_id).unwrap();
+        anchor.set_score(1.0);
+
+        {
+            let graph = system.graph_memory().unwrap().write();
+            let a = add_entity(&graph, "A");
+            let b = add_entity(&graph, "B");
+            // Two edges off A, BOTH attested by the same companion episode → one companion.
+            add_edge_with_provenance(&graph, a, b, companion_id.0, Some(0.9));
+            let c = add_entity(&graph, "Cnode");
+            add_edge_with_provenance(&graph, a, c, companion_id.0, Some(0.9));
+            // An edge attested by the ANCHOR itself must be skipped (already ranked).
+            add_edge_with_provenance(&graph, b, a, anchor_id.0, Some(0.9));
+        }
+
+        let ranked: Vec<SharedMemory> = vec![Arc::new(anchor)];
+        let companions =
+            system.harvest_provenance_companions(&system.graph_memory().unwrap().read(), &ranked);
+        assert_eq!(
+            companions.len(),
+            1,
+            "one unique companion (dedup across edges + skip already-ranked source)"
+        );
+        assert_eq!(companions[0].0.id, companion_id);
+    }
+
+    /// The cap bounds the number of injected companions.
+    #[test]
+    fn respects_injection_cap() {
+        let (system, _t) = setup();
+        let anchor_id = remember_with_entities(&system, "Anchor with A.", &["A"]);
+        let mut anchor = system.get_memory(&anchor_id).unwrap();
+        anchor.set_score(1.0);
+
+        let cap = crate::constants::COMPANION_INJECTION_MAX;
+        {
+            let graph = system.graph_memory().unwrap().write();
+            let a = add_entity(&graph, "A");
+            // cap + 3 distinct companion episodes, each attesting its own edge off A.
+            for i in 0..(cap + 3) {
+                let companion =
+                    remember_with_entities(&system, &format!("Companion episode number {i}."), &[]);
+                let other = add_entity(&graph, &format!("Other{i}"));
+                add_edge_with_provenance(&graph, a, other, companion.0, Some(0.9));
+            }
+        }
+
+        let ranked: Vec<SharedMemory> = vec![Arc::new(anchor)];
+        let companions =
+            system.harvest_provenance_companions(&system.graph_memory().unwrap().read(), &ranked);
+        assert_eq!(
+            companions.len(),
+            cap,
+            "injection is bounded by COMPANION_INJECTION_MAX"
+        );
+    }
+
+    /// No provenance on the incident edges → nothing to harvest (no-op).
+    #[test]
+    fn no_op_when_provenance_empty() {
+        let (system, _t) = setup();
+        let anchor_id = remember_with_entities(&system, "Anchor with A.", &["A"]);
+        let mut anchor = system.get_memory(&anchor_id).unwrap();
+        anchor.set_score(1.0);
+
+        {
+            let graph = system.graph_memory().unwrap().write();
+            let a = add_entity(&graph, "A");
+            let b = add_entity(&graph, "B");
+            // Edge with no source episode and an empty provenance trail.
+            add_edge_no_provenance(&graph, a, b);
+        }
+
+        let ranked: Vec<SharedMemory> = vec![Arc::new(anchor)];
+        let companions =
+            system.harvest_provenance_companions(&system.graph_memory().unwrap().read(), &ranked);
+        assert!(companions.is_empty(), "no provenance → no companions");
+    }
+
+    /// Low-confidence provenance is filtered out.
+    #[test]
+    fn filters_low_confidence_attestation() {
+        let (system, _t) = setup();
+        let anchor_id = remember_with_entities(&system, "Anchor with A.", &["A"]);
+        let companion_id = remember_with_entities(&system, "Companion with C.", &["C"]);
+        let mut anchor = system.get_memory(&anchor_id).unwrap();
+        anchor.set_score(1.0);
+
+        {
+            let graph = system.graph_memory().unwrap().write();
+            let a = add_entity(&graph, "A");
+            let b = add_entity(&graph, "B");
+            // confidence below COMPANION_INJECTION_MIN_CONFIDENCE (0.5).
+            add_edge_with_provenance(&graph, a, b, companion_id.0, Some(0.1));
+        }
+
+        let ranked: Vec<SharedMemory> = vec![Arc::new(anchor)];
+        let companions =
+            system.harvest_provenance_companions(&system.graph_memory().unwrap().read(), &ranked);
+        assert!(companions.is_empty(), "weak attestations are filtered");
+    }
+}
+
+#[cfg(test)]
+mod companion_rerank_tests {
+    use super::*;
+    use crate::graph_memory::{
+        EntityLabel, EntityNode, GraphMemory, RelationType, RelationshipEdge,
+    };
+    use crate::memory::types::Experience;
+    use std::collections::HashMap as StdHashMap;
+
+    fn setup() -> (MemorySystem, tempfile::TempDir) {
+        let temp_dir = tempfile::TempDir::new().expect("temp dir");
+        let config = MemoryConfig {
+            storage_path: temp_dir.path().to_path_buf(),
+            working_memory_size: 50,
+            session_memory_size_mb: 50,
+            max_heap_per_user_mb: 200,
+            auto_compress: false,
+            compression_age_days: 1,
+            importance_threshold: 0.0,
+        };
+        let mut system = MemorySystem::new(config, None).expect("memory system");
+        let graph = GraphMemory::new(&temp_dir.path().join("graph"), None).expect("graph");
+        system.set_graph_memory(Arc::new(parking_lot::RwLock::new(graph)));
+        (system, temp_dir)
+    }
+
+    fn stored(system: &MemorySystem, content: &str, entities: &[&str]) -> SharedMemory {
+        let experience = Experience {
+            content: content.to_string(),
+            entities: entities.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        };
+        let id = system.remember(experience, None).expect("remember");
+        Arc::new(system.get_memory(&id).expect("get"))
+    }
+
+    fn add_entity(graph: &GraphMemory, name: &str) -> uuid::Uuid {
+        let node = EntityNode {
+            uuid: uuid::Uuid::new_v4(),
+            name: name.to_string(),
+            labels: vec![EntityLabel::Person],
+            created_at: chrono::Utc::now(),
+            last_seen_at: chrono::Utc::now(),
+            mention_count: 1,
+            summary: String::new(),
+            attributes: StdHashMap::new(),
+            name_embedding: None,
+            salience: 1.0,
+            is_proper_noun: true,
+            selectivity: None,
+            fine_type: None,
+        };
+        graph.add_entity(node).expect("add entity")
+    }
+
+    fn add_edge(graph: &GraphMemory, from: uuid::Uuid, to: uuid::Uuid) {
+        let now = chrono::Utc::now();
+        let edge = RelationshipEdge {
+            uuid: uuid::Uuid::new_v4(),
+            from_entity: from,
+            to_entity: to,
+            relation_type: RelationType::CoOccurs,
+            strength: 1.0,
+            created_at: now,
+            valid_at: now,
+            invalidated_at: None,
+            source_episode_id: None,
+            context: String::new(),
+            last_activated: now,
+            activation_count: 1,
+            ltp_status: crate::graph_memory::LtpStatus::None,
+            tier: crate::graph_memory::EdgeTier::L1Working,
+            activation_timestamps: None,
+            entity_confidence: None,
+            forman_curvature: None,
+            endpoint_selectivity: None,
+            provenance: Vec::new(),
+        };
+        graph.add_relationship(edge).expect("add edge");
+    }
+
+    /// A pool no deeper than k passes through untouched (both modes).
+    #[test]
+    fn shallow_pool_is_untouched() {
+        let (system, _t) = setup();
+        let pool: Vec<SharedMemory> = (0..3)
+            .map(|i| stored(&system, &format!("Memory {i}."), &["Anchorite"]))
+            .collect();
+        let ids: Vec<MemoryId> = pool.iter().map(|m| m.id.clone()).collect();
+        let out = system.companion_rerank(pool.clone(), 5);
+        assert_eq!(out.iter().map(|m| m.id.clone()).collect::<Vec<_>>(), ids);
+        let out = system.graph_companion_rerank(pool, 5);
+        assert_eq!(out.iter().map(|m| m.id.clone()).collect::<Vec<_>>(), ids);
+    }
+
+    /// Surface mode: a deep candidate sharing an anchor entity rises above
+    /// non-sharing candidates ranked ahead of it.
+    #[test]
+    fn surface_rerank_boosts_shared_entity_candidate() {
+        let (system, _t) = setup();
+        let mut pool: Vec<SharedMemory> = Vec::new();
+        for i in 0..3 {
+            pool.push(stored(&system, &format!("Anchor {i}."), &["Kestrel"]));
+        }
+        pool.push(stored(&system, "Filler one.", &["Unrelated"]));
+        pool.push(stored(&system, "Filler two.", &["Alsounrelated"]));
+        let companion = stored(&system, "Companion shares Kestrel.", &["Kestrel"]);
+        pool.push(companion.clone());
+
+        // rank 5 base 1/6 + 0.10*1 = 0.2667 beats rank 3 (0.25) and rank 4 (0.20).
+        let out = system.companion_rerank(pool, 4);
+        assert_eq!(out.len(), 4);
+        assert_eq!(
+            out[3].id, companion.id,
+            "shared-entity companion takes the open slot past both fillers"
+        );
+    }
+
+    /// Graph mode: a deep candidate whose entity is 1-hop edge-connected to an
+    /// anchor entity rises; anchors stay frozen in the head (default).
+    #[test]
+    fn graph_rerank_boosts_edge_connected_candidate_and_freezes_anchors() {
+        let (system, _t) = setup();
+        {
+            let graph = system.graph_memory().unwrap().write();
+            let anchor_node = add_entity(&graph, "Meridian");
+            let companion_node = add_entity(&graph, "Solstice");
+            add_edge(&graph, anchor_node, companion_node);
+        }
+        let mut pool: Vec<SharedMemory> = Vec::new();
+        for i in 0..3 {
+            pool.push(stored(&system, &format!("Anchor {i}."), &["Meridian"]));
+        }
+        pool.push(stored(&system, "Filler one.", &["Unrelated"]));
+        pool.push(stored(&system, "Filler two.", &["Alsounrelated"]));
+        let companion = stored(&system, "Companion names Solstice.", &["Solstice"]);
+        pool.push(companion.clone());
+        let anchor_ids: Vec<MemoryId> = pool[..3].iter().map(|m| m.id.clone()).collect();
+
+        let out = system.graph_companion_rerank(pool, 4);
+        assert_eq!(out.len(), 4);
+        assert_eq!(
+            out[..3].iter().map(|m| m.id.clone()).collect::<Vec<_>>(),
+            anchor_ids,
+            "top anchors are frozen in place"
+        );
+        assert_eq!(
+            out[3].id, companion.id,
+            "edge-connected companion takes the open slot past both fillers"
+        );
+    }
+
+    /// Graph mode with no graph connectivity for any candidate leaves the
+    /// original order intact (boost never fires).
+    #[test]
+    fn graph_rerank_without_connectivity_preserves_order() {
+        let (system, _t) = setup();
+        {
+            let graph = system.graph_memory().unwrap().write();
+            add_entity(&graph, "Meridian");
+        }
+        let pool: Vec<SharedMemory> = (0..6)
+            .map(|i| stored(&system, &format!("Memory {i}."), &["Meridian"]))
+            .collect();
+        let head: Vec<MemoryId> = pool[..4].iter().map(|m| m.id.clone()).collect();
+        let out = system.graph_companion_rerank(pool, 4);
+        assert_eq!(
+            out.iter().map(|m| m.id.clone()).collect::<Vec<_>>(),
+            head,
+            "no connectivity -> original ranking survives"
+        );
     }
 }

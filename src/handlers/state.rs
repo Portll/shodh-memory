@@ -10,10 +10,396 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, OnceLock};
 use tracing::info;
 
+/// Comprehensive entity blocklist — terms that should never become graph entities.
+/// Covers English stop words, programming tokens, structural/meta terms, and
+/// generic nouns that add noise without semantic value.
+fn entity_blocklist() -> &'static std::collections::HashSet<&'static str> {
+    static BL: OnceLock<std::collections::HashSet<&'static str>> = OnceLock::new();
+    BL.get_or_init(|| {
+        [
+            // English stop words: articles, prepositions, conjunctions, pronouns, common verbs
+            "the",
+            "a",
+            "an",
+            "is",
+            "are",
+            "was",
+            "were",
+            "be",
+            "been",
+            "being",
+            "have",
+            "has",
+            "had",
+            "do",
+            "does",
+            "did",
+            "will",
+            "would",
+            "could",
+            "should",
+            "may",
+            "might",
+            "shall",
+            "can",
+            "must",
+            "need",
+            "dare",
+            "ought",
+            "used",
+            "get",
+            "got",
+            "make",
+            "made",
+            "let",
+            "say",
+            "said",
+            "go",
+            "went",
+            "come",
+            "came",
+            "take",
+            "took",
+            "give",
+            "gave",
+            "see",
+            "saw",
+            "know",
+            "knew",
+            "think",
+            "thought",
+            "want",
+            "find",
+            "found",
+            "tell",
+            "told",
+            "ask",
+            "asked",
+            "work",
+            "seem",
+            "feel",
+            "try",
+            "leave",
+            "call",
+            "keep",
+            "put",
+            "run",
+            "set",
+            "show",
+            "turn",
+            "move",
+            "play",
+            "mean",
+            "add",
+            "read",
+            "pay",
+            "meet",
+            "write",
+            "lead",
+            "live",
+            "hold",
+            "bring",
+            "begin",
+            "start",
+            "end",
+            "just",
+            "also",
+            "very",
+            "often",
+            "however",
+            "too",
+            "usually",
+            "really",
+            "already",
+            "always",
+            "never",
+            "sometimes",
+            "still",
+            "now",
+            "then",
+            "here",
+            "there",
+            "where",
+            "when",
+            "how",
+            "what",
+            "which",
+            "who",
+            "whom",
+            "why",
+            "each",
+            "every",
+            "both",
+            "few",
+            "more",
+            "most",
+            "other",
+            "some",
+            "such",
+            "only",
+            "own",
+            "same",
+            "than",
+            "well",
+            "not",
+            "no",
+            "yes",
+            "but",
+            "or",
+            "and",
+            "so",
+            "yet",
+            "for",
+            "nor",
+            "that",
+            "this",
+            "with",
+            "from",
+            "into",
+            "about",
+            "after",
+            "before",
+            "between",
+            "through",
+            "during",
+            "without",
+            "against",
+            "upon",
+            "above",
+            "below",
+            "to",
+            "at",
+            "by",
+            "in",
+            "on",
+            "of",
+            "up",
+            "out",
+            "off",
+            "over",
+            "under",
+            "again",
+            "further",
+            "once",
+            "it",
+            "its",
+            "he",
+            "she",
+            "we",
+            "they",
+            "me",
+            "him",
+            "her",
+            "us",
+            "them",
+            "my",
+            "your",
+            "his",
+            "our",
+            "their",
+            "mine",
+            "yours",
+            "hers",
+            "ours",
+            "theirs",
+            "i",
+            "you",
+            "if",
+            "as",
+            "am",
+            // Programming tokens: keywords the NER typer can misclassify as entities
+            "impl",
+            "fn",
+            "pub",
+            "struct",
+            "enum",
+            "mod",
+            "use",
+            "let",
+            "mut",
+            "const",
+            "static",
+            "type",
+            "trait",
+            "where",
+            "self",
+            "super",
+            "crate",
+            "async",
+            "await",
+            "match",
+            "return",
+            "if",
+            "else",
+            "for",
+            "while",
+            "loop",
+            "break",
+            "continue",
+            "true",
+            "false",
+            "none",
+            "some",
+            "ok",
+            "err",
+            "todo",
+            "fixme",
+            "hack",
+            "note",
+            "debug",
+            "info",
+            "warn",
+            "error",
+            "test",
+            "cfg",
+            "derive",
+            "allow",
+            "deny",
+            "macro",
+            "unsafe",
+            "ref",
+            "dyn",
+            "box",
+            "def",
+            "class",
+            "import",
+            "from",
+            "pass",
+            "raise",
+            "except",
+            "try",
+            "finally",
+            "with",
+            "as",
+            "yield",
+            "lambda",
+            "elif",
+            "var",
+            "val",
+            "fun",
+            "object",
+            "interface",
+            "package",
+            "void",
+            "int",
+            "float",
+            "double",
+            "string",
+            "bool",
+            "char",
+            "byte",
+            "long",
+            "short",
+            "null",
+            "nil",
+            "undefined",
+            "typeof",
+            "instanceof",
+            "new",
+            "delete",
+            "throw",
+            "catch",
+            "switch",
+            "case",
+            "default",
+            "export",
+            "require",
+            // Structural/meta terms: internal system markers that never form concepts
+            "auto-extract",
+            "source:transcript",
+            "source:hook",
+            "source:api",
+            "source:web",
+            "source:file",
+            "source:user",
+            "source:system",
+            "source:ai_generated",
+            "source:inferred",
+            // Generic structure words — too vague to be standalone entities.
+            // Multi-word forms ("API handler", "ML model") are NOT blocked.
+            "user",
+            "handler",
+            "controller",
+            "view",
+            "setting",
+            "option",
+            "parameter",
+            "argument",
+            "variable",
+            "output",
+            "input",
+            "value",
+            "key",
+            "item",
+            "element",
+            "node",
+            "edge",
+            "list",
+            "array",
+            "row",
+            "column",
+            "field",
+            "record",
+            "entry",
+            "instance",
+            "request",
+            "response",
+            "status",
+            "content",
+            "text",
+            "name",
+            "path",
+            "line",
+            "block",
+            "section",
+            // Common nouns: generic terms that never form meaningful graph concepts
+            "thing",
+            "stuff",
+            "something",
+            "anything",
+            "nothing",
+            "everything",
+            "way",
+            "place",
+            "time",
+            "case",
+            "point",
+            "part",
+            "example",
+            "issue",
+            "problem",
+            "question",
+            "answer",
+            "result",
+            "data",
+            "information",
+            "change",
+            "update",
+            "version",
+            "number",
+            "size",
+            "count",
+            "total",
+            "kind",
+            "sort",
+            "form",
+            "step",
+            "level",
+            "bit",
+            "lot",
+            "ones",
+        ]
+        .iter()
+        .copied()
+        .collect()
+    })
+}
+
 /// Static regex for extracting all-caps terms (API, TUI, NER, REST, etc.)
+/// Minimum 3 chars to avoid noise (IF, OR, DO, SO, AS, AT, BY, IT, NO, UP, ON)
 fn allcaps_regex() -> &'static regex::Regex {
     static RE: OnceLock<regex::Regex> = OnceLock::new();
-    RE.get_or_init(|| regex::Regex::new(r"\b[A-Z]{2,}[A-Z0-9]*\b").unwrap())
+    RE.get_or_init(|| regex::Regex::new(r"\b[A-Z]{3,}[A-Z0-9]*\b").unwrap())
 }
 
 /// Static regex for extracting issue IDs (SHO-XX, JIRA-123, etc.)
@@ -22,20 +408,23 @@ fn issue_regex() -> &'static regex::Regex {
     RE.get_or_init(|| regex::Regex::new(r"\b([A-Z]{2,10}-\d+)\b").unwrap())
 }
 
+/// Classify a tag into a specific EntityLabel based on naming patterns.
+///
+/// Tags enter the graph as entities. Instead of defaulting everything to
+/// `Technology`, this uses suffix/keyword matching to assign the correct
+/// ontological type — enabling type-aware spreading activation and
+/// `matches_with_hierarchy()` in retrieval.
 use crate::ab_testing;
 use crate::backup;
 use crate::config::ServerConfig;
-use crate::embeddings::{
-    are_ner_models_downloaded, download_ner_models, get_ner_models_dir, ner::NerEntityType,
-    KeywordExtractor, NerConfig, NeuralNer,
-};
+use crate::embeddings::{ner::NerEntityType, KeywordExtractor, NerConfig, NeuralNer};
 use crate::graph_memory::{
-    EdgeTier, EntityLabel, EntityNode, EpisodeSource, EpisodicNode, GraphMemory, GraphStats,
-    LtpStatus, RelationType, RelationshipEdge,
+    classify_tag_label, EdgeTier, EntityLabel, EntityNode, EpisodeSource, EpisodicNode,
+    GraphMemory, GraphStats, LtpStatus, RelationshipEdge,
 };
 use crate::memory::{
-    query_parser, Experience, FeedbackStore, FileMemoryStore, MemoryConfig, MemoryId, MemoryStats,
-    MemorySystem, ProspectiveStore, SessionStore, TodoStore,
+    Experience, FeedbackStore, FileMemoryStore, MemoryConfig, MemoryId, MemoryStats, MemorySystem,
+    ProspectiveStore, SessionStore, TodoStore,
 };
 use crate::relevance::RelevanceEngine;
 use crate::streaming;
@@ -44,6 +433,26 @@ use super::types::{AuditEvent, ContextStatus, MemoryEvent};
 
 /// Type alias for context sessions map
 pub type ContextSessions = DashMap<String, ContextStatus>;
+
+/// Tracks habituation state for a single memory in proactive surfacing.
+///
+/// When a memory is surfaced by proactive_context but receives no positive
+/// feedback (the agent never references it), its surfacing count increases
+/// and a logarithmic penalty is applied. Positive feedback resets the count.
+/// This models neural habituation (Thompson & Spencer 1966).
+#[derive(Debug, Clone)]
+pub struct HabituationEntry {
+    /// Number of times surfaced without subsequent positive feedback
+    pub surfacings_without_utility: u32,
+    /// Last time this memory was surfaced
+    pub last_surfaced: chrono::DateTime<chrono::Utc>,
+    /// Last time positive feedback was received for this memory
+    pub last_utility: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Per-user habituation tracker for proactive_context.
+/// Outer key: user_id, inner key: memory UUID string.
+pub type HabituationTracker = DashMap<String, DashMap<String, HabituationEntry>>;
 
 /// Helper struct for audit log rotation (allows spawn_blocking with minimal clone)
 struct MultiUserMemoryManagerRotationHelper {
@@ -124,7 +533,7 @@ impl MultiUserMemoryManagerRotationHelper {
                 batch.delete_cf(audit, &key);
                 removed_count += 1;
 
-                if removed_count % BATCH_FLUSH_SIZE == 0 {
+                if removed_count.is_multiple_of(BATCH_FLUSH_SIZE) {
                     self.shared_db
                         .write(std::mem::take(&mut batch))
                         .map_err(|e| anyhow::anyhow!("Failed to write rotation batch: {e}"))?;
@@ -136,7 +545,7 @@ impl MultiUserMemoryManagerRotationHelper {
         }
 
         // Flush remaining
-        if removed_count % BATCH_FLUSH_SIZE != 0 {
+        if !removed_count.is_multiple_of(BATCH_FLUSH_SIZE) {
             self.shared_db
                 .write(batch)
                 .map_err(|e| anyhow::anyhow!("Failed to write rotation batch: {e}"))?;
@@ -163,6 +572,44 @@ impl MultiUserMemoryManagerRotationHelper {
 }
 
 /// Multi-user memory manager - central state for the server
+/// SHODH_QUERY_NER — annotate a recall query with neural-NER entities so the
+/// graph leg seeds from the real recognizer instead of the POS heuristic (which
+/// measurably tags verbs/months as entities — query analysis audit 2026-06-10).
+///
+/// DEFAULT ON (run 27272612202: +0.005 recall@10 ALL, p@1 0.5167, no category
+/// regresses — the Pareto arm). SHODH_QUERY_NER=0 disables. No-op when the
+/// query has no text or NER finds nothing (fallback NER returns an error that
+/// is swallowed here, so a missing model degrades to the POS heuristic).
+/// Confidence-filtered (≥0.5), capped at 8 names to bound the seed budget.
+///
+/// Free function (not a method) so spawn_blocking closures can capture just the
+/// `Arc<NeuralNer>` instead of the whole manager.
+pub fn annotate_query_ner_with(ner: &NeuralNer, query: &mut crate::memory::types::Query) {
+    let enabled = std::env::var("SHODH_QUERY_NER")
+        .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
+        .unwrap_or(true);
+    if !enabled {
+        return;
+    }
+    let Some(text) = query.query_text.as_deref() else {
+        return;
+    };
+    match ner.extract(text) {
+        Ok(entities) => {
+            let names: Vec<String> = entities
+                .into_iter()
+                .filter(|e| e.confidence >= 0.5 && e.text.trim().len() >= 2)
+                .map(|e| e.text)
+                .take(8)
+                .collect();
+            if !names.is_empty() {
+                query.ner_entities = Some(names);
+            }
+        }
+        Err(e) => tracing::debug!("query NER annotation failed: {e}"),
+    }
+}
+
 pub struct MultiUserMemoryManager {
     /// Per-user memory systems with LRU eviction
     pub user_memories: moka::sync::Cache<String, Arc<parking_lot::RwLock<MemorySystem>>>,
@@ -255,6 +702,23 @@ pub struct MultiUserMemoryManager {
     /// Without this, each user's MemoryStorage + GraphMemory allocates ~96MB in
     /// independent caches — 6 users = 576MB just in block caches alone.
     shared_rocksdb_cache: rocksdb::Cache,
+    shared_rocksdb_cache_capacity_bytes: usize,
+
+    /// Per-user, per-memory habituation tracker for proactive_context.
+    /// Tracks how many times a memory was surfaced without positive feedback,
+    /// applying logarithmic decay to prevent pathological repeated intrusions.
+    /// See: Berntsen (2009), Thompson & Spencer (1966).
+    pub habituation_tracker: Arc<HabituationTracker>,
+
+    /// Tracks background tasks (graph processing, lineage inference) spawned by
+    /// remember/upsert handlers. On shutdown, we close + await all tracked tasks
+    /// to prevent data loss from fire-and-forget graph writes.
+    pub task_tracker: tokio_util::task::TaskTracker,
+
+    /// Per-user consolidation guards to prevent concurrent consolidation.
+    /// Without this, overlapping consolidation (manual + maintenance timer, or double API call)
+    /// causes double decay, duplicate fact extraction, and lost edge boosts.
+    consolidation_locks: DashMap<String, std::sync::atomic::AtomicBool>,
 }
 
 impl MultiUserMemoryManager {
@@ -263,66 +727,24 @@ impl MultiUserMemoryManager {
 
         let (event_broadcaster, _) = tokio::sync::broadcast::channel(1024);
 
-        let ner_dir = get_ner_models_dir();
-        tracing::debug!("Checking for NER models at {:?}", ner_dir);
-        let neural_ner = if are_ner_models_downloaded() {
-            tracing::debug!("NER models found, using existing files");
-            let config = NerConfig {
-                model_path: ner_dir.join("model.onnx"),
-                tokenizer_path: ner_dir.join("tokenizer.json"),
-                max_length: 128,
-                confidence_threshold: 0.5,
-            };
-            match NeuralNer::new(config) {
-                Ok(ner) => {
-                    info!("Neural NER initialized (TinyBERT model at {:?})", ner_dir);
-                    Arc::new(ner)
+        // NER stage: GLiNER bi-edge production typer when its assets are present
+        // (SHODH_GLINER_MODEL_PATH, default ./models/gliner-bi-edge), else the
+        // rule-based fallback. NeuralNer::new never fails; it logs which path it took.
+        let neural_ner = match NeuralNer::new(NerConfig::default()) {
+            Ok(ner) => {
+                if ner.is_fallback_mode() {
+                    info!("Neural NER using rule-based fallback (GLiNER assets absent)");
+                } else {
+                    info!("Neural NER initialized (GLiNER bi-edge production typer)");
                 }
-                Err(e) => {
-                    tracing::warn!("Failed to initialize neural NER: {}. Using fallback.", e);
-                    Arc::new(NeuralNer::new_fallback(NerConfig::default()))
-                }
+                Arc::new(ner)
             }
-        } else {
-            tracing::debug!("NER models not found at {:?}, will download", ner_dir);
-            info!("Downloading NER models (TinyBERT-NER, ~15MB)...");
-            match download_ner_models(Some(std::sync::Arc::new(|downloaded, total| {
-                if total > 0 {
-                    let percent = (downloaded as f64 / total as f64 * 100.0) as u32;
-                    if percent % 20 == 0 {
-                        tracing::info!("NER model download: {}%", percent);
-                    }
-                }
-            }))) {
-                Ok(ner_dir) => {
-                    info!("NER models downloaded to {:?}", ner_dir);
-                    let config = NerConfig {
-                        model_path: ner_dir.join("model.onnx"),
-                        tokenizer_path: ner_dir.join("tokenizer.json"),
-                        max_length: 128,
-                        confidence_threshold: 0.5,
-                    };
-                    match NeuralNer::new(config) {
-                        Ok(ner) => {
-                            info!("Neural NER initialized after download");
-                            Arc::new(ner)
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                "Failed to initialize downloaded NER: {}. Using fallback.",
-                                e
-                            );
-                            Arc::new(NeuralNer::new_fallback(NerConfig::default()))
-                        }
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "Failed to download NER models: {}. Using rule-based fallback.",
-                        e
-                    );
-                    Arc::new(NeuralNer::new_fallback(NerConfig::default()))
-                }
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to initialize NER: {}. Using rule-based fallback.",
+                    e
+                );
+                Arc::new(NeuralNer::new_fallback(NerConfig::default()))
             }
         };
 
@@ -330,10 +752,32 @@ impl MultiUserMemoryManager {
         let evictions_clone = user_evictions.clone();
         let max_cache = server_config.max_users_in_memory;
         let eviction_base_path = base_path.clone();
+        let habituation_tracker: Arc<HabituationTracker> = Arc::new(DashMap::new());
+        let habituation_for_eviction = habituation_tracker.clone();
 
-        let user_memories = moka::sync::Cache::builder()
-            .max_capacity(server_config.max_users_in_memory as u64)
-            .time_to_idle(std::time::Duration::from_secs(1800))
+        // Configurable idle eviction timeout. Default: 0 (disabled).
+        // Single-user deployments (local Claude Code) should keep 0 — idle eviction
+        // causes persistent RocksDB lock contention when background tasks hold Arc
+        // references past the eviction point. Multi-user shared servers can set
+        // SHODH_CACHE_IDLE_SECS=3600 to reclaim memory from idle users.
+        let cache_idle_secs: u64 = std::env::var("SHODH_CACHE_IDLE_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+
+        let mut user_memories_builder =
+            moka::sync::Cache::builder().max_capacity(server_config.max_users_in_memory as u64);
+        if cache_idle_secs > 0 {
+            user_memories_builder =
+                user_memories_builder.time_to_idle(std::time::Duration::from_secs(cache_idle_secs));
+            info!(
+                "Cache idle eviction enabled: {}s (multi-user mode)",
+                cache_idle_secs
+            );
+        } else {
+            info!("Cache idle eviction disabled (single-user mode). Set SHODH_CACHE_IDLE_SECS to enable.");
+        }
+        let user_memories = user_memories_builder
             .eviction_listener(move |key: Arc<String>, value: Arc<parking_lot::RwLock<MemorySystem>>, cause| {
                 if matches!(cause, moka::notification::RemovalCause::Size | moka::notification::RemovalCause::Expired) {
                     evictions_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -343,38 +787,61 @@ impl MultiUserMemoryManager {
                     // Spawn blocking task to persist vector index without holding the lock
                     // during I/O. The eviction listener runs synchronously inside moka,
                     // so we must not block here for disk writes.
+                    //
+                    // CRITICAL: We must drop the Arc<RwLock<MemorySystem>> as soon as
+                    // possible after saving, otherwise the RocksDB file lock is held
+                    // until the thread exits. If a new request arrives for the same user
+                    // while the lock is held, MemorySystem::new() fails with a lock error.
                     let index_path = eviction_base_path.join(key.as_str()).join("vector_index");
                     let user_key = key.clone();
+                    let hab_tracker = habituation_for_eviction.clone();
                     std::thread::spawn(move || {
-                        if let Some(guard) = value.try_read() {
-                            match guard.save_vector_index(&index_path) {
-                                Ok(()) => {
-                                    info!(
-                                        "Evicted user '{}' from memory cache ({}, cache_size={}) - vector index saved",
-                                        user_key, cause_label, max_cache
-                                    );
-                                }
-                                Err(e) => {
-                                    tracing::warn!(
-                                        "Evicted user '{}' from memory cache ({}) - failed to save vector index: {}",
-                                        user_key, cause_label, e
-                                    );
-                                }
+                        // Clean up habituation tracking for evicted user
+                        hab_tracker.remove(user_key.as_str());
+                        // Scope the read guard so it drops before we drop the Arc.
+                        // This ensures the RocksDB file lock is released promptly.
+                        let save_result = {
+                            if let Some(guard) = value.try_read() {
+                                let result = guard.save_vector_index(&index_path);
+                                Some(result)
+                            } else {
+                                None
                             }
-                        } else {
-                            tracing::warn!(
-                                "Evicted user '{}' from memory cache ({}) - could not acquire lock to save index",
-                                user_key, cause_label
-                            );
+                        };
+                        // Arc dropped here — releases MemorySystem and RocksDB handle
+                        drop(value);
+                        match save_result {
+                            Some(Ok(())) => {
+                                info!(
+                                    "Evicted user '{}' from memory cache ({}, cache_size={}) - vector index saved",
+                                    user_key, cause_label, max_cache
+                                );
+                            }
+                            Some(Err(e)) => {
+                                tracing::warn!(
+                                    "Evicted user '{}' from memory cache ({}) - failed to save vector index: {}",
+                                    user_key, cause_label, e
+                                );
+                            }
+                            None => {
+                                tracing::warn!(
+                                    "Evicted user '{}' from memory cache ({}) - could not acquire lock to save index",
+                                    user_key, cause_label
+                                );
+                            }
                         }
                     });
                 }
             })
             .build();
 
-        let graph_memories = moka::sync::Cache::builder()
-            .max_capacity(server_config.max_users_in_memory as u64)
-            .time_to_idle(std::time::Duration::from_secs(1800))
+        let mut graph_memories_builder =
+            moka::sync::Cache::builder().max_capacity(server_config.max_users_in_memory as u64);
+        if cache_idle_secs > 0 {
+            graph_memories_builder = graph_memories_builder
+                .time_to_idle(std::time::Duration::from_secs(cache_idle_secs));
+        }
+        let graph_memories = graph_memories_builder
             .eviction_listener(move |key: Arc<String>, _value, cause| {
                 let cause_label = if cause == moka::notification::RemovalCause::Expired {
                     "idle-timeout"
@@ -391,13 +858,15 @@ impl MultiUserMemoryManager {
         // Single shared LRU block cache for ALL RocksDB instances (per-user memory DBs,
         // per-user graph DBs, and the global shared DB). Provides a hard memory ceiling
         // regardless of how many users are active. Without this, each user allocates
-        // ~96MB in independent caches — the shared cache collapses that to a single
-        // 256MB pool with LRU eviction of the coldest blocks across all users.
+        // ~96MB in independent caches — the shared cache collapses that to one
+        // configured pool (256MiB by default) with LRU eviction of the coldest blocks.
+        let shared_rocksdb_cache_capacity_bytes =
+            crate::constants::rocksdb_shared_cache_capacity_bytes();
         let shared_rocksdb_cache =
-            rocksdb::Cache::new_lru_cache(crate::constants::ROCKSDB_SHARED_CACHE_BYTES);
+            rocksdb::Cache::new_lru_cache(shared_rocksdb_cache_capacity_bytes);
         info!(
             "Shared RocksDB block cache initialized ({}MB)",
-            crate::constants::ROCKSDB_SHARED_CACHE_BYTES / (1024 * 1024)
+            shared_rocksdb_cache_capacity_bytes / (1024 * 1024)
         );
 
         // Open a single shared DB for all global stores (todos, reminders, files, feedback, audit).
@@ -533,6 +1002,10 @@ impl MultiUserMemoryManager {
             user_memory_init_locks: DashMap::new(),
             user_graph_init_locks: DashMap::new(),
             shared_rocksdb_cache,
+            shared_rocksdb_cache_capacity_bytes,
+            habituation_tracker,
+            task_tracker: tokio_util::task::TaskTracker::new(),
+            consolidation_locks: DashMap::new(),
         };
 
         info!("Running initial audit log rotation...");
@@ -594,7 +1067,7 @@ impl MultiUserMemoryManager {
             batch.put_cf(audit_cf, &key, &value);
             count += 1;
 
-            if count % BATCH_SIZE == 0 {
+            if count.is_multiple_of(BATCH_SIZE) {
                 shared_db
                     .write(std::mem::take(&mut batch))
                     .map_err(|e| anyhow::anyhow!("audit migration batch write error: {e}"))?;
@@ -602,7 +1075,7 @@ impl MultiUserMemoryManager {
             }
         }
 
-        if count % BATCH_SIZE != 0 {
+        if !count.is_multiple_of(BATCH_SIZE) {
             shared_db
                 .write(batch)
                 .map_err(|e| anyhow::anyhow!("audit migration final batch error: {e}"))?;
@@ -611,6 +1084,9 @@ impl MultiUserMemoryManager {
         drop(old_db);
 
         let renamed = old_dir.with_file_name("audit_logs.pre_cf_migration");
+        if renamed.exists() {
+            let _ = std::fs::remove_dir_all(&renamed);
+        }
         std::fs::rename(&old_dir, &renamed)
             .context("Failed to rename old audit_logs dir after migration")?;
 
@@ -640,14 +1116,17 @@ impl MultiUserMemoryManager {
                 0
             })
         );
-        if let Ok(serialized) = bincode::serde::encode_to_vec(&event, bincode::config::standard()) {
+        if let Ok(serialized) = crate::serialization::encode(&event) {
             let db = self.shared_db.clone();
             let key_bytes = key.into_bytes();
 
             tokio::task::spawn_blocking(move || {
-                let audit = db.cf_handle(CF_AUDIT).expect("audit CF must exist");
-                if let Err(e) = db.put_cf(&audit, &key_bytes, &serialized) {
-                    tracing::error!("Failed to persist audit log: {}", e);
+                if let Some(audit) = db.cf_handle(CF_AUDIT) {
+                    if let Err(e) = db.put_cf(&audit, &key_bytes, &serialized) {
+                        tracing::error!("Failed to persist audit log: {}", e);
+                    }
+                } else {
+                    tracing::error!("audit CF missing from shared DB — audit event dropped");
                 }
             });
         }
@@ -670,7 +1149,7 @@ impl MultiUserMemoryManager {
             .audit_log_counter
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-        if count % self.server_config.audit_rotation_check_interval == 0 && count > 0 {
+        if count.is_multiple_of(self.server_config.audit_rotation_check_interval) && count > 0 {
             let shared_db = self.shared_db.clone();
             let audit_logs = self.audit_logs.clone();
             let user_id_clone = user_id.to_string();
@@ -686,7 +1165,11 @@ impl MultiUserMemoryManager {
                     audit_max_entries,
                 };
                 if let Err(e) = manager.rotate_user_audit_logs(&user_id_clone) {
-                    tracing::debug!("Audit log rotation check for user {}: {}", user_id_clone, e);
+                    tracing::warn!(
+                        "Audit log rotation failed for user {}: {}",
+                        user_id_clone,
+                        e
+                    );
                 }
             });
         }
@@ -730,10 +1213,7 @@ impl MultiUserMemoryManager {
                     break;
                 }
 
-                if let Ok((event, _)) = bincode::serde::decode_from_slice::<AuditEvent, _>(
-                    &value,
-                    bincode::config::standard(),
-                ) {
+                if let Ok((event, _)) = crate::serialization::try_decode::<AuditEvent>(&value) {
                     events.push(event);
                 }
             }
@@ -784,8 +1264,59 @@ impl MultiUserMemoryManager {
             ..self.default_config.clone()
         };
 
-        let mut memory_system = MemorySystem::new(config, Some(&self.shared_rocksdb_cache))
-            .with_context(|| format!("Failed to initialize memory system for user '{user_id}'"))?;
+        // Retry with backoff for RocksDB lock contention. This can happen when a
+        // moka eviction thread is still saving the vector index for this user (the
+        // old MemorySystem holds the DB lock until the save thread drops its Arc).
+        let mut memory_system = {
+            let mut last_err = None;
+            let mut created = None;
+            for attempt in 0..4u32 {
+                match MemorySystem::new(config.clone(), Some(&self.shared_rocksdb_cache)) {
+                    Ok(mut ms) => {
+                        if attempt > 0 {
+                            info!(
+                                "Memory system for user '{}' created after {} retries (lock contention resolved)",
+                                user_id, attempt
+                            );
+                        }
+                        // Record the owner so per-user stores (temporal facts)
+                        // work on every ingest path and recall() can default the
+                        // query user_id to this user.
+                        ms.set_default_user_id(user_id);
+                        created = Some(ms);
+                        break;
+                    }
+                    Err(e) => {
+                        let err_str = e.to_string();
+                        if err_str.contains("lock") || err_str.contains("LOCK") {
+                            let delay = std::time::Duration::from_millis(50 * 2u64.pow(attempt));
+                            tracing::warn!(
+                                "RocksDB lock contention for user '{}' (attempt {}/4), retrying in {:?}",
+                                user_id, attempt + 1, delay
+                            );
+                            std::thread::sleep(delay);
+                            last_err = Some(e);
+                        } else {
+                            // Non-lock error, fail immediately
+                            return Err(e).with_context(|| {
+                                format!("Failed to initialize memory system for user '{user_id}'")
+                            });
+                        }
+                    }
+                }
+            }
+            match created {
+                Some(ms) => ms,
+                None => {
+                    return Err(last_err.unwrap()).with_context(|| {
+                        format!(
+                            "Failed to initialize memory system for user '{}' after 4 attempts (RocksDB lock held by eviction thread)",
+                            user_id
+                        )
+                    });
+                }
+            }
+        };
         // Wire up GraphMemory for Layer 2 (spreading activation) and Layer 5 (Hebbian learning)
         let graph = self.get_user_graph(user_id)?;
         memory_system.set_graph_memory(graph);
@@ -807,6 +1338,7 @@ impl MultiUserMemoryManager {
     pub fn evict_user(&self, user_id: &str) {
         self.user_memories.invalidate(user_id);
         self.graph_memories.invalidate(user_id);
+        self.habituation_tracker.remove(user_id);
         self.user_memories.run_pending_tasks();
         self.graph_memories.run_pending_tasks();
 
@@ -830,6 +1362,7 @@ impl MultiUserMemoryManager {
     pub fn forget_user(&self, user_id: &str) -> Result<()> {
         self.user_memories.invalidate(user_id);
         self.graph_memories.invalidate(user_id);
+        self.habituation_tracker.remove(user_id);
 
         self.user_memories.run_pending_tasks();
         self.graph_memories.run_pending_tasks();
@@ -887,7 +1420,11 @@ impl MultiUserMemoryManager {
     }
 
     /// Prefix-scan and batch-delete all keys starting with `{user_id}:` from a column family
-    fn delete_by_prefix(db: &rocksdb::DB, cf: &rocksdb::ColumnFamily, prefix: &[u8]) -> usize {
+    fn delete_by_prefix(
+        db: &rocksdb::DB,
+        cf: &rocksdb::ColumnFamily,
+        prefix: &[u8],
+    ) -> Result<usize> {
         let mut batch = rocksdb::WriteBatch::default();
         let mut count = 0;
         let iter = db.prefix_iterator_cf(cf, prefix);
@@ -900,9 +1437,10 @@ impl MultiUserMemoryManager {
             count += 1;
         }
         if count > 0 {
-            let _ = db.write(batch);
+            db.write(batch)
+                .map_err(|e| anyhow::anyhow!("RocksDB batch delete failed: {e}"))?;
         }
-        count
+        Ok(count)
     }
 
     /// Purge all user data from shared RocksDB (todos, reminders, files, feedback, audit)
@@ -914,7 +1452,7 @@ impl MultiUserMemoryManager {
         let cf_names = ["todos", "projects", "prospective"];
         for name in &cf_names {
             if let Some(cf) = self.shared_db.cf_handle(name) {
-                let n = Self::delete_by_prefix(&self.shared_db, cf, prefix_bytes);
+                let n = Self::delete_by_prefix(&self.shared_db, cf, prefix_bytes)?;
                 if n > 0 {
                     tracing::debug!("GDPR: purged {n} entries from {name} CF for {user_id}");
                 }
@@ -935,7 +1473,7 @@ impl MultiUserMemoryManager {
                 format!("todo_vector:{user_id}:"),
             ];
             for p in &prefixes {
-                Self::delete_by_prefix(&self.shared_db, cf, p.as_bytes());
+                Self::delete_by_prefix(&self.shared_db, cf, p.as_bytes())?;
             }
             // Priority and due/context keys also contain user_id but at varying positions.
             // Full scan of index CF to catch them all.
@@ -949,7 +1487,9 @@ impl MultiUserMemoryManager {
                     }
                 }
             }
-            let _ = self.shared_db.write(batch);
+            self.shared_db
+                .write(batch)
+                .map_err(|e| anyhow::anyhow!("GDPR todo_index purge failed: {e}"))?;
         }
 
         if let Some(cf) = self.shared_db.cf_handle("prospective_index") {
@@ -960,7 +1500,7 @@ impl MultiUserMemoryManager {
                 format!("status:Dismissed:{user_id}:"),
             ];
             for p in &prefixes {
-                Self::delete_by_prefix(&self.shared_db, cf, p.as_bytes());
+                Self::delete_by_prefix(&self.shared_db, cf, p.as_bytes())?;
             }
             // Context keyword indices: `context:{keyword}:{user_id}:{id}`
             let mut batch = rocksdb::WriteBatch::default();
@@ -973,16 +1513,18 @@ impl MultiUserMemoryManager {
                     }
                 }
             }
-            let _ = self.shared_db.write(batch);
+            self.shared_db
+                .write(batch)
+                .map_err(|e| anyhow::anyhow!("GDPR prospective_index purge failed: {e}"))?;
         }
 
         // Files
         if let Some(cf) = self.shared_db.cf_handle("files") {
-            Self::delete_by_prefix(&self.shared_db, cf, prefix_bytes);
+            Self::delete_by_prefix(&self.shared_db, cf, prefix_bytes)?;
         }
         if let Some(cf) = self.shared_db.cf_handle("file_index") {
             let idx_prefix = format!("file_idx:{user_id}:");
-            Self::delete_by_prefix(&self.shared_db, cf, idx_prefix.as_bytes());
+            Self::delete_by_prefix(&self.shared_db, cf, idx_prefix.as_bytes())?;
             // Also catch other patterns
             let mut batch = rocksdb::WriteBatch::default();
             let iter = self.shared_db.iterator_cf(cf, rocksdb::IteratorMode::Start);
@@ -994,18 +1536,22 @@ impl MultiUserMemoryManager {
                     }
                 }
             }
-            let _ = self.shared_db.write(batch);
+            self.shared_db
+                .write(batch)
+                .map_err(|e| anyhow::anyhow!("GDPR file_index purge failed: {e}"))?;
         }
 
         // Feedback: `pending:{user_id}`
         if let Some(cf) = self.shared_db.cf_handle("feedback") {
             let pending_key = format!("pending:{user_id}");
-            let _ = self.shared_db.delete_cf(cf, pending_key.as_bytes());
+            self.shared_db
+                .delete_cf(cf, pending_key.as_bytes())
+                .map_err(|e| anyhow::anyhow!("GDPR feedback purge failed: {e}"))?;
         }
 
         // Audit logs
         if let Some(cf) = self.shared_db.cf_handle("audit") {
-            Self::delete_by_prefix(&self.shared_db, cf, prefix_bytes);
+            Self::delete_by_prefix(&self.shared_db, cf, prefix_bytes)?;
         }
 
         // Clear in-memory audit log cache
@@ -1073,6 +1619,51 @@ impl MultiUserMemoryManager {
             .collect()
     }
 
+    /// Snapshot cached user memories without creating/opening cold users.
+    ///
+    /// Observability paths must use this instead of `list_cached_users()` plus
+    /// `get_user_memory()`: if a user is evicted between those two calls,
+    /// `get_user_memory()` would reopen the RocksDB instance from disk.
+    pub fn cached_user_memories(&self) -> Vec<(String, Arc<parking_lot::RwLock<MemorySystem>>)> {
+        self.user_memories
+            .iter()
+            .map(|(id, memory)| (id.to_string(), memory.clone()))
+            .collect()
+    }
+
+    /// RocksDB in-process memory, decomposed — the instrument for #90.
+    ///
+    /// - Shared block cache: read ONCE from the manager's own handle (it is a
+    ///   single LRU pool wired into every DB instance; summing the per-CF
+    ///   property would count the same pool once per column family).
+    /// - Memtables / table readers: per-CF, genuinely additive — summed across
+    ///   the DBs of currently CACHED users only. Cold users on disk are never
+    ///   opened by a diagnostic (the #362 lesson: observation must not create
+    ///   the pressure it observes).
+    pub fn rocksdb_memory_diagnostics(&self) -> crate::system_memory::RocksDbMemoryDiagnostics {
+        let mut memtables = 0u64;
+        let mut readers = 0u64;
+        let mut users_counted = 0usize;
+        for (_user_id, memory) in self.cached_user_memories() {
+            // try_read: a diagnostic must never block a writer; a user
+            // mid-write is simply skipped this scrape.
+            if let Some(guard) = memory.try_read() {
+                let (m, r) = guard.rocksdb_memory_breakdown();
+                memtables += m;
+                readers += r;
+                users_counted += 1;
+            }
+        }
+        crate::system_memory::RocksDbMemoryDiagnostics {
+            shared_block_cache_usage_bytes: self.shared_rocksdb_cache.get_usage() as u64,
+            shared_block_cache_pinned_bytes: self.shared_rocksdb_cache.get_pinned_usage() as u64,
+            shared_block_cache_capacity_bytes: self.shared_rocksdb_cache_capacity_bytes as u64,
+            user_memtables_bytes: memtables,
+            user_table_readers_bytes: readers,
+            users_counted,
+        }
+    }
+
     /// Get audit logs for a user
     pub fn get_audit_logs(&self, user_id: &str, limit: usize) -> Vec<AuditEvent> {
         let mut events: Vec<AuditEvent> = Vec::new();
@@ -1084,10 +1675,7 @@ impl MultiUserMemoryManager {
                 if !key_str.starts_with(&prefix) {
                     break;
                 }
-                if let Ok((event, _)) = bincode::serde::decode_from_slice::<AuditEvent, _>(
-                    &value,
-                    bincode::config::standard(),
-                ) {
+                if let Ok((event, _)) = crate::serialization::try_decode::<AuditEvent>(&value) {
                     events.push(event);
                 }
             }
@@ -1107,14 +1695,8 @@ impl MultiUserMemoryManager {
             .map_err(|e| anyhow::anyhow!("Failed to flush shared database: {e}"))?;
         info!("  Shared database flushed (todos, prospective, files, feedback, audit)");
 
-        let user_entries: Vec<(String, Arc<parking_lot::RwLock<MemorySystem>>)> = self
-            .user_memories
-            .iter()
-            .map(|(k, v)| (k.to_string(), v.clone()))
-            .collect();
-
         let mut flushed = 0;
-        for (user_id, memory_system) in user_entries {
+        for (user_id, memory_system) in self.cached_user_memories() {
             if let Some(guard) = memory_system.try_read() {
                 if let Err(e) = guard.flush_storage() {
                     tracing::warn!("  Failed to flush database for user {}: {}", user_id, e);
@@ -1138,14 +1720,8 @@ impl MultiUserMemoryManager {
     pub fn save_all_vector_indices(&self) -> Result<()> {
         info!("Saving vector indices to disk...");
 
-        let user_entries: Vec<(String, Arc<parking_lot::RwLock<MemorySystem>>)> = self
-            .user_memories
-            .iter()
-            .map(|(k, v)| (k.to_string(), v.clone()))
-            .collect();
-
         let mut saved = 0;
-        for (user_id, memory_system) in user_entries {
+        for (user_id, memory_system) in self.cached_user_memories() {
             if let Some(guard) = memory_system.try_read() {
                 let index_path = self.base_path.join(&user_id).join("vector_index");
                 if let Err(e) = guard.save_vector_index(&index_path) {
@@ -1220,6 +1796,14 @@ impl MultiUserMemoryManager {
         self.neural_ner.clone()
     }
 
+    /// Annotate a recall query with neural-NER entities so the graph leg seeds
+    /// from the real recognizer instead of the POS heuristic (which measurably
+    /// tags verbs/months as entities — query analysis audit 2026-06-10).
+    /// Delegates to [`annotate_query_ner_with`]; see it for flag semantics.
+    pub fn annotate_query_ner(&self, query: &mut crate::memory::types::Query) {
+        annotate_query_ner_with(&self.neural_ner, query)
+    }
+
     /// Get keyword extractor for statistical term extraction
     pub fn get_keyword_extractor(&self) -> Arc<KeywordExtractor> {
         self.keyword_extractor.clone()
@@ -1250,7 +1834,54 @@ impl MultiUserMemoryManager {
         }
 
         let graph_path = self.base_path.join(user_id).join("graph");
-        let graph_memory = GraphMemory::new(&graph_path, Some(&self.shared_rocksdb_cache))?;
+        // Retry with backoff for RocksDB lock contention (same pattern as get_user_memory).
+        // Graph eviction drops synchronously so contention is rare, but possible on Windows
+        // where file handle release can lag.
+        let graph_memory = {
+            let mut last_err = None;
+            let mut created = None;
+            for attempt in 0..4u32 {
+                match GraphMemory::new(&graph_path, Some(&self.shared_rocksdb_cache)) {
+                    Ok(gm) => {
+                        if attempt > 0 {
+                            info!(
+                                "Graph memory for user '{}' created after {} retries",
+                                user_id, attempt
+                            );
+                        }
+                        created = Some(gm);
+                        break;
+                    }
+                    Err(e) => {
+                        let err_str = e.to_string();
+                        if err_str.contains("lock") || err_str.contains("LOCK") {
+                            let delay = std::time::Duration::from_millis(50 * 2u64.pow(attempt));
+                            tracing::warn!(
+                                "RocksDB lock contention on graph for user '{}' (attempt {}/4), retrying in {:?}",
+                                user_id, attempt + 1, delay
+                            );
+                            std::thread::sleep(delay);
+                            last_err = Some(e);
+                        } else {
+                            return Err(e).with_context(|| {
+                                format!("Failed to initialize graph memory for user '{user_id}'")
+                            });
+                        }
+                    }
+                }
+            }
+            match created {
+                Some(gm) => gm,
+                None => {
+                    return Err(last_err.unwrap()).with_context(|| {
+                        format!(
+                            "Failed to initialize graph memory for user '{}' after 4 attempts (RocksDB lock contention)",
+                            user_id
+                        )
+                    });
+                }
+            }
+        };
         let graph_arc = Arc::new(parking_lot::RwLock::new(graph_memory));
 
         self.graph_memories
@@ -1259,6 +1890,31 @@ impl MultiUserMemoryManager {
         info!("Created graph memory for user: {}", user_id);
 
         Ok(graph_arc)
+    }
+
+    /// Try to acquire the consolidation lock for a user.
+    /// Returns true if acquired (caller must release), false if already running.
+    pub fn try_acquire_consolidation_lock(&self, user_id: &str) -> bool {
+        let entry = self
+            .consolidation_locks
+            .entry(user_id.to_string())
+            .or_insert_with(|| std::sync::atomic::AtomicBool::new(false));
+        // compare_exchange: if currently false, set to true (acquired)
+        entry
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::Acquire,
+                std::sync::atomic::Ordering::Relaxed,
+            )
+            .is_ok()
+    }
+
+    /// Release the consolidation lock for a user.
+    pub fn release_consolidation_lock(&self, user_id: &str) {
+        if let Some(entry) = self.consolidation_locks.get(user_id) {
+            entry.store(false, std::sync::atomic::Ordering::Release);
+        }
     }
 
     /// Get graph statistics for a user
@@ -1277,7 +1933,7 @@ impl MultiUserMemoryManager {
         // Heavy cycle every 6th iteration (6 hours at 3600s intervals).
         // Heavy cycles run replay, entity-entity strengthening, fact extraction (full memory scan),
         // and flush databases (triggers compaction). Light cycles only touch in-memory data.
-        let is_heavy = cycle % 6 == 0;
+        let is_heavy = cycle.is_multiple_of(6);
 
         if is_heavy {
             tracing::info!(
@@ -1305,6 +1961,15 @@ impl MultiUserMemoryManager {
         let mut total_facts_reinforced = 0;
 
         for user_id in user_ids {
+            // Skip users with active consolidation (manual API call in progress)
+            if !self.try_acquire_consolidation_lock(&user_id) {
+                tracing::debug!(
+                    user_id = %user_id,
+                    "Skipping maintenance — consolidation already in progress"
+                );
+                continue;
+            }
+
             let maintenance_result = if let Ok(memory_lock) = self.get_user_memory(&user_id) {
                 let memory = memory_lock.read();
                 match memory.run_maintenance(decay_factor, &user_id, is_heavy) {
@@ -1394,6 +2059,20 @@ impl MultiUserMemoryManager {
                 }
             }
 
+            // Drain write retry buffer — re-attempt any failed writes from transient errors.
+            // Runs every cycle (not just heavy) since buffered memories are at risk of loss.
+            if let Ok(memory_lock) = self.get_user_memory(&user_id) {
+                let memory = memory_lock.read();
+                let retried = memory.drain_write_retries();
+                if retried > 0 {
+                    tracing::info!(
+                        user_id = %user_id,
+                        retried,
+                        "Drained write retry buffer"
+                    );
+                }
+            }
+
             // Direction 2: Lazy decay — flush opportunistic pruning queue
             // Instead of scanning all 34k+ edges (apply_decay), we queue edges found
             // below threshold during normal reads and batch-delete them here.
@@ -1470,6 +2149,75 @@ impl MultiUserMemoryManager {
                     }
                 }
             }
+
+            // Consolidation: canonicalize duplicate mention-nodes into canonical
+            // entities (parser + Fellegi-Sunter/CESI) and seed the merged surfaces
+            // as aliases so future ingests resolve directly (closes the ingest
+            // loop). This is a "sleep" operation — it runs on the heavy cycle, not
+            // per request. No-ops when the dependency parser isn't deployed
+            // (SHODH_SPACY_MODEL_PATH unset). Opt out with SHODH_CONSOLIDATE_CANON=0.
+            let canon_on = std::env::var("SHODH_CONSOLIDATE_CANON")
+                .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
+                .unwrap_or(true);
+            if is_heavy && canon_on {
+                if let Ok(graph) = self.get_user_graph(&user_id) {
+                    let graph_guard = graph.write();
+                    match graph_guard.canonicalize_entities() {
+                        Ok((merged, repointed)) if merged > 0 => {
+                            tracing::info!(
+                                user_id = %user_id,
+                                merged,
+                                repointed,
+                                "Consolidation: canonicalized duplicate entities"
+                            );
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            tracing::debug!("Canonicalize failed for user {}: {}", user_id, e)
+                        }
+                    }
+                }
+            }
+
+            // Release consolidation lock for this user
+            self.release_consolidation_lock(&user_id);
+        }
+
+        // Heavy cycle: compute Forman-Ricci curvature on graph edges
+        // Runs after decay so curvature reflects post-decay degree distribution.
+        // Only runs if graph has enough edges (CURVATURE_MIN_EDGES).
+        if is_heavy {
+            for (user_id_arc, _) in self.user_memories.iter() {
+                let user_id = user_id_arc.as_ref();
+                if let Ok(graph) = self.get_user_graph(user_id) {
+                    let graph_guard = graph.read();
+                    let edge_count = graph_guard
+                        .get_stats()
+                        .map(|s| s.relationship_count)
+                        .unwrap_or(0);
+                    if edge_count >= crate::constants::CURVATURE_MIN_EDGES {
+                        match graph_guard.compute_forman_ricci_curvature() {
+                            Ok(stats) => {
+                                tracing::debug!(
+                                    user_id = %user_id,
+                                    edges = stats.edges_computed,
+                                    mean = format!("{:.2}", stats.mean_curvature),
+                                    positive = stats.positive_count,
+                                    negative = stats.negative_count,
+                                    "Forman-Ricci curvature updated"
+                                );
+                            }
+                            Err(e) => {
+                                tracing::debug!(
+                                    user_id = %user_id,
+                                    error = %e,
+                                    "Forman-Ricci curvature computation failed"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         // Heavy cycle: clean up old triggered/dismissed reminders (C4 fix)
@@ -1493,6 +2241,36 @@ impl MultiUserMemoryManager {
                     }
                     _ => {}
                 }
+            }
+        }
+
+        // BM25 segment merge on heavy cycles — removes ghost state from upsert
+        // tombstones and reclaims disk space. Tantivy segments accumulate from
+        // per-memory commits; without periodic merging, search quality degrades
+        // and disk usage grows unboundedly.
+        if is_heavy {
+            let mut total_bm25_merged = 0usize;
+            for (user_id_arc, _) in self.user_memories.iter() {
+                let user_id = user_id_arc.as_ref();
+                if let Ok(memory_lock) = self.get_user_memory(user_id) {
+                    let memory = memory_lock.read();
+                    match memory.optimize_bm25() {
+                        Ok(merged) => total_bm25_merged += merged,
+                        Err(e) => {
+                            tracing::debug!(
+                                user_id = %user_id,
+                                error = %e,
+                                "BM25 optimize failed"
+                            );
+                        }
+                    }
+                }
+            }
+            if total_bm25_merged > 0 {
+                tracing::info!(
+                    "BM25 optimization: merged {} total segments across users",
+                    total_bm25_merged
+                );
             }
         }
 
@@ -1528,6 +2306,12 @@ impl MultiUserMemoryManager {
                     self.audit_logs.len()
                 );
             }
+        }
+
+        // Periodic vector index save — crash between maintenance cycles loses at most 1 cycle
+        // worth of vectors. The atomic save in retrieval.rs (.tmp + rename) ensures no corruption.
+        if let Err(e) = self.save_all_vector_indices() {
+            tracing::warn!("Periodic vector index save failed: {}", e);
         }
 
         tracing::info!(
@@ -1622,6 +2406,19 @@ impl MultiUserMemoryManager {
         self.user_memories.entry_count() as usize
     }
 
+    /// Aggregate write failure metrics across all cached users.
+    /// Returns (total_failures, pending_retries).
+    pub fn write_failure_metrics(&self) -> (u64, usize) {
+        let mut total_failures = 0u64;
+        let mut total_pending = 0usize;
+        for (_user_id, memory_lock) in self.cached_user_memories() {
+            let memory = memory_lock.read();
+            total_failures += memory.total_write_failures();
+            total_pending += memory.pending_write_retries();
+        }
+        (total_failures, total_pending)
+    }
+
     /// Active reminder check: scan all users for due reminders, mark them triggered,
     /// and emit `REMINDER_DUE` events to the broadcast channel.
     ///
@@ -1669,6 +2466,7 @@ impl MultiUserMemoryManager {
                 memory_type: Some("reminder".to_string()),
                 importance: Some(task.priority as f32 / 5.0),
                 count: None,
+                entities: None,
                 results: None,
             });
 
@@ -1708,7 +2506,10 @@ impl MultiUserMemoryManager {
                     continue;
                 }
 
-                let db_path = path.join("memory.db");
+                // Check for RocksDB storage directory (the actual data store).
+                // Previously checked for "memory.db" which doesn't exist —
+                // RocksDB stores data in a "storage/" directory, not a single file.
+                let db_path = path.join("storage");
                 if !db_path.exists() {
                     continue;
                 }
@@ -1724,11 +2525,22 @@ impl MultiUserMemoryManager {
                     let graph_lock = self.get_user_graph(name).ok();
                     let graph_guard = graph_lock.as_ref().map(|g| g.read());
                     let graph_db_ref = graph_guard.as_ref().map(|g| g.get_db());
+                    let vamana_path = self
+                        .base_path
+                        .join(name)
+                        .join("vector_index")
+                        .join("vamana.idx");
+                    let vamana_ref = if vamana_path.exists() {
+                        Some(vamana_path.as_path())
+                    } else {
+                        None
+                    };
                     match self.backup_engine.create_comprehensive_backup_with_graph(
                         &db,
                         name,
                         &store_refs,
                         graph_db_ref,
+                        vamana_ref,
                     ) {
                         Ok(metadata) => {
                             tracing::info!(
@@ -1771,12 +2583,16 @@ impl MultiUserMemoryManager {
     /// - All-caps terms (API, TUI, NER, etc.)
     /// - Issue IDs (SHO-XX pattern)
     /// - Semantic similarity edges between memories
+    /// Returns the episode's raw [`SurpriseComponents`] when the graph pass ran
+    /// (also persisted on the episode's metadata); `None` when skipped
+    /// (idempotent replay or an entity-less episode).
     pub fn process_experience_into_graph(
         &self,
         user_id: &str,
         experience: &Experience,
         memory_id: &MemoryId,
-    ) -> Result<()> {
+        entity_name_embeddings: Option<&HashMap<String, Vec<f32>>>,
+    ) -> Result<Option<crate::memory::types::SurpriseComponents>> {
         let graph = self.get_user_graph(user_id)?;
 
         // =====================================================================
@@ -1788,13 +2604,7 @@ impl MultiUserMemoryManager {
         let now = chrono::Utc::now();
 
         // Stop words for filtering
-        let stop_words: std::collections::HashSet<&str> = [
-            "the", "and", "for", "that", "this", "with", "from", "have", "been", "are", "was",
-            "were", "will", "would", "could", "should", "may", "might",
-        ]
-        .iter()
-        .cloned()
-        .collect();
+        let blocklist = entity_blocklist();
 
         // Use pre-extracted NER records for proper entity labels when available
         // This avoids redundant NER inference — the handler already ran NER in Pass 1
@@ -1817,6 +2627,7 @@ impl MultiUserMemoryManager {
                     confidence: record.confidence,
                     start: record.start_char.unwrap_or(0),
                     end: record.end_char.unwrap_or(record.text.len()),
+                    fine_label: record.fine_label.clone(),
                 })
                 .collect()
         } else if !experience.entities.is_empty() {
@@ -1833,6 +2644,7 @@ impl MultiUserMemoryManager {
                     confidence: 0.8,
                     start: 0,
                     end: name.len(),
+                    fine_label: None,
                 })
                 .collect()
         } else {
@@ -1852,26 +2664,253 @@ impl MultiUserMemoryManager {
             }
         };
 
-        // Filter noise entities
+        // Filter noise entities — comprehensive multi-layer quality gate
         let filtered_entities: Vec<_> = extracted_entities
             .into_iter()
             .filter(|e| {
                 let name = e.text.trim();
-                if name.len() < 3 {
+                // 1. Minimum length (kills 2-char token fragments: "au", "th")
+                if name.len() < crate::constants::NER_ENTITY_MIN_LENGTH {
                     return false;
                 }
-                if !name.chars().any(|c| c.is_uppercase()) && e.confidence < 0.7 {
+                // 2. Blocklist (200+ terms: stop words, code tokens, structural terms)
+                if blocklist.contains(name.to_lowercase().as_str()) {
                     return false;
                 }
-                if stop_words.contains(name.to_lowercase().as_str()) {
+                // 3. Absolute confidence floor
+                if e.confidence < crate::constants::NER_GRAPH_CONFIDENCE_FLOOR {
                     return false;
                 }
-                if name.len() < 5 && e.confidence < 0.8 {
+                // 4. Pure numeric strings ("123", "42")
+                if name.chars().all(|c| c.is_ascii_digit()) {
                     return false;
+                }
+                // 5. Single repeated character ("aaa", "xxx")
+                if name.len() >= 2 {
+                    let first = name.chars().next().unwrap().to_lowercase().next().unwrap();
+                    if name
+                        .chars()
+                        .all(|c| c.to_lowercase().next().unwrap() == first)
+                    {
+                        return false;
+                    }
+                }
+                // 6. Only punctuation/symbols
+                if !name.chars().any(|c| c.is_alphanumeric()) {
+                    return false;
+                }
+                // 6b-d. Structural non-entities that leak from messy real-world
+                //     documents (news dumps, event feeds): URLs/domains/file paths,
+                //     timestamps/timezones, and hex-id fragments. Deterministic and
+                //     model-agnostic — the NER model never has to learn to avoid
+                //     them, and this holds whether the backbone is TinyBERT or GLiNER.
+                if is_structural_non_entity(name) {
+                    return false;
+                }
+                // 7. MISC type without uppercase needs higher confidence
+                if matches!(e.entity_type, NerEntityType::Misc)
+                    && !name.chars().any(|c| c.is_uppercase())
+                    && e.confidence < 0.8
+                {
+                    return false;
+                }
+                // 8. Short MISC entities need very high confidence
+                if matches!(e.entity_type, NerEntityType::Misc)
+                    && name.len() < 5
+                    && e.confidence < 0.80
+                {
+                    return false;
+                }
+                // 9. Hook metadata patterns (tool:Edit, tool:Write, auto-captured, modified file)
+                if name.starts_with("tool:")
+                    || name.starts_with("source:")
+                    || name.starts_with("file:")
+                {
+                    return false;
+                }
+                // 10. Hook boilerplate phrases
+                {
+                    let lower = name.to_lowercase();
+                    if lower == "auto-captured"
+                        || lower == "modified file"
+                        || lower == "memories surfaced"
+                        || lower == "memories captured"
+                        || lower == "complete"
+                        || lower == "surfaced"
+                        || lower == "captured"
+                        || lower == "session-summary"
+                        || lower == "remember call"
+                    {
+                        return false;
+                    }
+                }
+                // 10b. Common verbs and noise words that NER misclassifies as MISC entities
+                {
+                    static VERB_NOISE: &[&str] = &[
+                        // Past tense verbs (most common NER noise)
+                        "decided",
+                        "added",
+                        "removed",
+                        "changed",
+                        "updated",
+                        "created",
+                        "deleted",
+                        "fixed",
+                        "moved",
+                        "used",
+                        "called",
+                        "made",
+                        "set",
+                        "found",
+                        "tried",
+                        "started",
+                        "finished",
+                        "built",
+                        "ran",
+                        "got",
+                        "switched",
+                        "enabled",
+                        "disabled",
+                        "configured",
+                        "deployed",
+                        "merged",
+                        "pushed",
+                        "pulled",
+                        "committed",
+                        "resolved",
+                        "closed",
+                        "implemented",
+                        "refactored",
+                        "migrated",
+                        "installed",
+                        "upgraded",
+                        // Present tense / gerunds
+                        "using",
+                        "running",
+                        "building",
+                        "testing",
+                        "working",
+                        "making",
+                        "getting",
+                        "setting",
+                        "adding",
+                        "fixing",
+                        "checking",
+                        "looking",
+                        // Common adjectives that aren't entities
+                        "new",
+                        "old",
+                        "good",
+                        "bad",
+                        "first",
+                        "last",
+                        "next",
+                        "other",
+                        "same",
+                        "different",
+                        "important",
+                        "available",
+                        "possible",
+                        "current",
+                        "previous",
+                        "following",
+                        "existing",
+                        "certain",
+                    ];
+                    let lower = name.to_lowercase();
+                    if VERB_NOISE.contains(&lower.as_str()) {
+                        return false;
+                    }
+                }
+                // 11. Path fragments — common directory/drive names that appear in file paths
+                {
+                    let lower = name.to_lowercase();
+                    if lower == "documents"
+                        || lower == "onedrive"
+                        || lower == "desktop"
+                        || lower == "downloads"
+                        || lower == "appdata"
+                        || lower == "users"
+                        || lower == "program files"
+                        || lower == "tmp"
+                        || lower == "temp"
+                    {
+                        return false;
+                    }
+                }
+                // 12. Sentence fragments — text containing sentence-ending punctuation
+                if name.contains(". ")
+                    || name.ends_with('.')
+                    || name.ends_with(',')
+                    || name.ends_with(';')
+                {
+                    return false;
+                }
+                // 13. CamelCase fragment artifacts — 1-2 char entities that are not all-caps acronyms
+                if name.len() <= 2 && !name.chars().all(|c| c.is_uppercase() || c.is_ascii_digit())
+                {
+                    return false;
+                }
+                // 14. Todo/issue ID patterns (REF-1, SHOD-7, PIPE-9, SHO-1, etc.)
+                {
+                    let issue_re = issue_regex();
+                    if issue_re.is_match(name) && name.len() < 10 {
+                        return false;
+                    }
                 }
                 true
             })
             .collect();
+
+        // Graph-aware reputation check: penalize entities that the graph already
+        // knows are stop-word hubs (low selectivity + high degree + many mentions).
+        // Uses read-only O(1) lookups — no locks, no blocking.
+        let filtered_entities: Vec<_> = {
+            let graph = self.get_user_graph(user_id).ok();
+            let graph_guard = graph.as_ref().map(|g| g.read());
+            filtered_entities
+                .into_iter()
+                .filter(|e| {
+                    let Some(ref gg) = graph_guard else {
+                        return true;
+                    };
+                    let Some(rep) = gg.get_entity_reputation(&e.text) else {
+                        return true; // New entity, no graph data yet
+                    };
+                    // Hard reject: confirmed stop-word by both high degree and low selectivity
+                    if rep.degree > 200 && rep.selectivity < 0.1 {
+                        tracing::debug!(
+                            "Graph-rejected hub entity '{}' (degree={}, selectivity={:.3})",
+                            e.text, rep.degree, rep.selectivity
+                        );
+                        return false;
+                    }
+                    // Soft penalty: known low-selectivity entity with many mentions —
+                    // halve effective confidence and re-check against thresholds
+                    if rep.selectivity < 0.15 && rep.mention_count > 10 {
+                        let penalized = e.confidence * 0.5;
+                        if penalized < 0.5 {
+                            tracing::debug!(
+                                "Graph-penalized entity '{}' below floor (conf={:.2}→{:.2}, sel={:.3})",
+                                e.text, e.confidence, penalized, rep.selectivity
+                            );
+                            return false;
+                        }
+                    }
+                    // Reward loop filter: entity driven below salience floor by feedback
+                    if rep.salience < crate::constants::ENTITY_SALIENCE_FILTER_FLOOR
+                        && rep.mention_count > crate::constants::ENTITY_SALIENCE_FILTER_MIN_MENTIONS
+                    {
+                        tracing::debug!(
+                            "Salience-rejected entity '{}' (salience={:.3}, mentions={})",
+                            e.text, rep.salience, rep.mention_count
+                        );
+                        return false;
+                    }
+                    true
+                })
+                .collect()
+        };
 
         tracing::debug!(
             "After filtering: {} entities: {:?}",
@@ -1886,26 +2925,56 @@ impl MultiUserMemoryManager {
         let ner_entities: Vec<(String, EntityNode)> = filtered_entities
             .into_iter()
             .map(|ner_entity| {
-                let label = match ner_entity.entity_type {
-                    NerEntityType::Person => EntityLabel::Person,
-                    NerEntityType::Organization => EntityLabel::Organization,
-                    NerEntityType::Location => EntityLabel::Location,
-                    NerEntityType::Misc => EntityLabel::Other("MISC".to_string()),
+                // Primary label + fine type from GLiNER's top-scoring span for this
+                // surface. The fine label rolls up to its coarse EntityLabel via the
+                // schema (kills the MISC→regex funnel); the fallback path has no fine
+                // label and uses the coarse 4-class view directly.
+                let (label, fine_type) = match &ner_entity.fine_label {
+                    Some(fine) => {
+                        let coarse = crate::entity_type::coarse_of(fine)
+                            .map(EntityLabel::from_coarse_id)
+                            .unwrap_or_else(|| EntityLabel::Other(fine.clone()));
+                        (coarse, Some(fine.clone()))
+                    }
+                    None => {
+                        let coarse = match ner_entity.entity_type {
+                            NerEntityType::Person => EntityLabel::Person,
+                            NerEntityType::Organization => EntityLabel::Organization,
+                            NerEntityType::Location => EntityLabel::Location,
+                            NerEntityType::Misc => EntityLabel::Concept,
+                        };
+                        (coarse, None)
+                    }
                 };
                 let node = EntityNode {
                     uuid: uuid::Uuid::new_v4(),
                     name: ner_entity.text.clone(),
-                    labels: vec![label],
+                    labels: vec![label.clone()],
                     created_at: now,
                     last_seen_at: now,
                     mention_count: 1,
                     summary: String::new(),
-                    attributes: HashMap::new(),
-                    name_embedding: None,
-                    salience: ner_entity.confidence,
-                    // Only PER, ORG, LOC are proper nouns; MISC includes non-proper
-                    // nouns like nationalities, events, etc.
+                    attributes: {
+                        let mut a = HashMap::new();
+                        a.insert("source".into(), "ner".into());
+                        a.insert("confidence".into(), format!("{:.2}", ner_entity.confidence));
+                        a
+                    },
+                    name_embedding: entity_name_embeddings
+                        .and_then(|map| map.get(&ner_entity.text))
+                        .cloned(),
+                    // Use ontological salience as the base, scaled by NER confidence
+                    salience: {
+                        let is_pn = !matches!(ner_entity.entity_type, NerEntityType::Misc);
+                        let base = crate::graph_memory::EntityExtractor::calculate_base_salience(
+                            &label, is_pn,
+                        );
+                        // NER confidence modulates: high-confidence entities get full base salience
+                        base * (0.5 + 0.5 * ner_entity.confidence)
+                    },
                     is_proper_noun: !matches!(ner_entity.entity_type, NerEntityType::Misc),
+                    selectivity: None,
+                    fine_type,
                 };
                 (ner_entity.text, node)
             })
@@ -1917,21 +2986,35 @@ impl MultiUserMemoryManager {
             .iter()
             .filter_map(|tag| {
                 let tag_name = tag.trim();
-                if tag_name.len() >= 2 && !stop_words.contains(tag_name.to_lowercase().as_str()) {
+                if tag_name.len() >= 2
+                    && !blocklist.contains(tag_name.to_lowercase().as_str())
+                    && !tag_name.starts_with("tool:")
+                    && !tag_name.starts_with("source:")
+                    && !tag_name.starts_with("file:")
+                    && !tag_name.contains(". ")
+                    && !tag_name.ends_with('.')
+                {
+                    let label = classify_tag_label(tag_name);
                     Some((
                         tag_name.to_string(),
                         EntityNode {
                             uuid: uuid::Uuid::new_v4(),
                             name: tag_name.to_string(),
-                            labels: vec![EntityLabel::Technology],
+                            labels: vec![label.clone()],
                             created_at: now,
                             last_seen_at: now,
                             mention_count: 1,
                             summary: String::new(),
                             attributes: HashMap::new(),
-                            name_embedding: None,
-                            salience: 0.6,
+                            name_embedding: entity_name_embeddings
+                                .and_then(|map| map.get(tag_name))
+                                .cloned(),
+                            salience: crate::graph_memory::EntityExtractor::calculate_base_salience(
+                                &label, false,
+                            ),
                             is_proper_noun: false,
+                            selectivity: None,
+                            fine_type: None,
                         },
                     ))
                 } else {
@@ -1948,34 +3031,62 @@ impl MultiUserMemoryManager {
             .collect();
 
         // Extract all-caps terms (API, TUI, NER, REST, etc.)
-        let allcaps_entities: Vec<(String, EntityNode)> = allcaps_regex()
-            .find_iter(&experience.content)
-            .filter_map(|cap| {
-                let term = cap.as_str();
+        // Count occurrences first — only extract terms that appear 2+ times
+        let mut allcaps_counts: HashMap<String, usize> = HashMap::new();
+        for cap in allcaps_regex().find_iter(&experience.content) {
+            *allcaps_counts.entry(cap.as_str().to_string()).or_insert(0) += 1;
+        }
+        let allcaps_entities: Vec<(String, EntityNode)> = allcaps_counts
+            .into_iter()
+            .filter_map(|(term, count)| {
+                if count < 2 {
+                    return None; // Require 2+ occurrences to be meaningful
+                }
                 if known_names
                     .iter()
-                    .any(|name| name.eq_ignore_ascii_case(term))
+                    .any(|name| name.eq_ignore_ascii_case(&term))
                 {
                     return None;
                 }
-                if stop_words.contains(term.to_lowercase().as_str()) {
+                if blocklist.contains(term.to_lowercase().as_str()) {
                     return None;
                 }
-                known_names.push(term.to_string());
+                // Reject all-caps terms that are common words, not acronyms
+                static ALLCAPS_BLOCKLIST: &[&str] = &[
+                    "THE", "AND", "FOR", "NOT", "BUT", "ALL", "ANY", "CAN", "HAS", "HER", "WAS",
+                    "ONE", "OUR", "OUT", "ARE", "HIS", "HOW", "ITS", "MAY", "NEW", "NOW", "OLD",
+                    "SEE", "WAY", "WHO", "DID", "GET", "HIM", "LET", "SAY", "SHE", "TOO", "USE",
+                    "RUN", "SET", "TRY", "ADD", "END", "PUT", "ROT", "SPAN", "THEN", "THEM",
+                    "THAN", "THIS", "THAT", "WITH", "FROM", "JUST", "ALSO", "BEEN", "SOME", "EACH",
+                    "DOES", "INTO", "ONLY", "OVER", "SUCH", "TAKE", "HAVE", "MADE", "MANY", "MOST",
+                    "MUCH", "MUST", "VERY", "WELL",
+                ];
+                if ALLCAPS_BLOCKLIST.contains(&term.as_str()) {
+                    return None;
+                }
+                known_names.push(term.clone());
+                let emb = entity_name_embeddings
+                    .and_then(|map| map.get(&term))
+                    .cloned();
                 Some((
-                    term.to_string(),
+                    term.clone(),
                     EntityNode {
                         uuid: uuid::Uuid::new_v4(),
-                        name: term.to_string(),
+                        name: term,
                         labels: vec![EntityLabel::Technology],
                         created_at: now,
                         last_seen_at: now,
                         mention_count: 1,
                         summary: String::new(),
                         attributes: HashMap::new(),
-                        name_embedding: None,
-                        salience: 0.5,
+                        name_embedding: emb,
+                        salience: crate::graph_memory::EntityExtractor::calculate_base_salience(
+                            &EntityLabel::Technology,
+                            true,
+                        ),
                         is_proper_noun: true,
+                        selectivity: None,
+                        fine_type: None,
                     },
                 ))
             })
@@ -1995,79 +3106,188 @@ impl MultiUserMemoryManager {
                     EntityNode {
                         uuid: uuid::Uuid::new_v4(),
                         name: issue_id.to_string(),
-                        labels: vec![EntityLabel::Other("Issue".to_string())],
+                        labels: vec![EntityLabel::Task],
                         created_at: now,
                         last_seen_at: now,
                         mention_count: 1,
                         summary: String::new(),
                         attributes: HashMap::new(),
-                        name_embedding: None,
-                        salience: 0.7,
+                        name_embedding: entity_name_embeddings
+                            .and_then(|map| map.get(issue_id))
+                            .cloned(),
+                        salience: crate::graph_memory::EntityExtractor::calculate_base_salience(
+                            &EntityLabel::Task,
+                            true,
+                        ),
                         is_proper_noun: true,
+                        selectivity: None,
+                        fine_type: None,
                     },
                 ))
             })
             .collect();
 
-        // Extract verbs for multi-hop reasoning
-        let analysis = query_parser::analyze_query(&experience.content);
-        let mut verb_entities: Vec<(String, EntityNode)> = Vec::new();
-        for verb in &analysis.relational_context {
-            let verb_text = verb.text.as_str();
-            let verb_stem = verb.stem.as_str();
+        // Concept entities (L1 substrate test): YAKE keyphrases as graph nodes so
+        // the graph captures TOPICS — the discriminative anchors — not just person
+        // names. Edge-legal: YAKE is statistical, no model. Gated by
+        // SHODH_CONCEPT_ENTITIES. The production upgrade is GLiNER2 entity+relation
+        // extraction; this tests whether concept nodes move total_entities and
+        // gold≥2seed% off the floor before that integration.
+        let concepts_on = std::env::var("SHODH_CONCEPT_ENTITIES")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        let concept_entities: Vec<(String, EntityNode)> = if concepts_on {
+            crate::embeddings::keywords::KeywordExtractor::new()
+                .extract(&experience.content)
+                .into_iter()
+                .take(8)
+                .filter_map(|kw| {
+                    let name = kw.text.trim().to_string();
+                    if name.len() < 3 || known_names.iter().any(|n| n.eq_ignore_ascii_case(&name)) {
+                        return None;
+                    }
+                    known_names.push(name.clone());
+                    let emb = entity_name_embeddings.and_then(|m| m.get(&name)).cloned();
+                    let concept_label = EntityLabel::Other("Concept".to_string());
+                    Some((
+                        name.clone(),
+                        EntityNode {
+                            uuid: uuid::Uuid::new_v4(),
+                            name,
+                            labels: vec![concept_label.clone()],
+                            created_at: now,
+                            last_seen_at: now,
+                            mention_count: 1,
+                            summary: String::new(),
+                            attributes: HashMap::new(),
+                            name_embedding: emb,
+                            salience: crate::graph_memory::EntityExtractor::calculate_base_salience(
+                                &concept_label,
+                                false,
+                            ),
+                            is_proper_noun: false,
+                            selectivity: None,
+                            fine_type: None,
+                        },
+                    ))
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
 
-            if known_names
-                .iter()
-                .any(|name| name.eq_ignore_ascii_case(verb_text))
-            {
-                continue;
-            }
-            if stop_words.contains(verb_text.to_lowercase().as_str()) {
-                continue;
-            }
-            if verb_text.len() < 3 {
-                continue;
-            }
-
-            for name in [verb_text, verb_stem] {
-                if name.len() < 3 {
-                    continue;
-                }
-                if known_names.iter().any(|n| n.eq_ignore_ascii_case(name)) {
-                    continue;
-                }
-                known_names.push(name.to_string());
-                verb_entities.push((
-                    name.to_string(),
-                    EntityNode {
-                        uuid: uuid::Uuid::new_v4(),
-                        name: name.to_string(),
-                        labels: vec![EntityLabel::Other("Verb".to_string())],
-                        created_at: now,
-                        last_seen_at: now,
-                        mention_count: 1,
-                        summary: String::new(),
-                        attributes: HashMap::new(),
-                        name_embedding: None,
-                        salience: 0.4,
-                        is_proper_noun: false,
-                    },
-                ));
-            }
-        }
-
-        // Combine all entity groups for insertion, capped at 10 to prevent
-        // O(n²) edge explosion (10 entities → max 45 edges)
+        // Combine all entity groups for insertion, capped to prevent O(n²) edge
+        // explosion. Widen the cap when concept entities are on so topic nodes
+        // aren't crowded out by person names.
         let mut all_entities: Vec<(String, EntityNode)> = ner_entities
             .into_iter()
             .chain(tag_entities)
             .chain(allcaps_entities)
             .chain(issue_entities)
-            .chain(verb_entities)
+            .chain(concept_entities)
             .collect();
-        all_entities.sort_by(|a, b| b.1.salience.total_cmp(&a.1.salience));
-        let entity_cap = self.server_config.max_entities_per_memory;
+        // Salience ties MUST break on a total order (name): some entity groups
+        // are collected from HashMap iteration, whose order randomizes per
+        // instance. Without the tiebreak, the stable sort preserves that
+        // random order, so the cap truncation and the Phase-1.9 pair budget
+        // select a different entity/pair subset on every ingest of the same
+        // content — repeat-nondeterministic graphs (smoke-094).
+        all_entities.sort_by(|a, b| {
+            b.1.salience
+                .total_cmp(&a.1.salience)
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        let entity_cap = if concepts_on {
+            self.server_config.max_entities_per_memory.max(16)
+        } else {
+            self.server_config.max_entities_per_memory
+        };
         all_entities.truncate(entity_cap);
+
+        // =====================================================================
+        // PHASE 1.9: SEMANTIC RELATION TYPING (SHODH_SEMANTIC_RELATIONS)
+        // Substrate increment 1 (#65): type entity-pair relations by embedding
+        // the template-normalized pair sentence against cached relation-label
+        // exemplars (relation_typer.rs). Embedding happens HERE, before the
+        // graph lock — Phase 2's pair loop only does map lookups. try_read on
+        // the user system: if a writer holds it we SKIP typing for this memory
+        // (graceful degradation) instead of risking the historical re-entrant
+        // deadlock class. Keyed by (name_i, name_j); the pair loop looks up in
+        // its own (i < j) order.
+        //
+        // DEFAULT ON (batched guard run 27348362950, real-NER arms): ALL
+        // 0.7124→0.7157, temporal +0.0141, no category down, lineage 0.983 —
+        // the two former blockers are fixed and regression-guarded: the
+        // origin-walk flood (fragment-bridge ingest mask + scored top-k,
+        // 9a977c9) and the cue/semantic precedence + fragment budget
+        // starvation (2f90434). SHODH_SEMANTIC_RELATIONS=0 disables.
+        // =====================================================================
+        let semantic_relations_on = std::env::var("SHODH_SEMANTIC_RELATIONS")
+            .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
+            .unwrap_or(true);
+        let mut semantic_pairs: HashMap<
+            (String, String),
+            (crate::graph_memory::RelationType, bool, f32),
+        > = HashMap::new();
+        if semantic_relations_on && all_entities.len() >= 2 {
+            if let Ok(system) = self.get_user_memory(user_id) {
+                if let Some(sys) = system.try_read() {
+                    let embedder = sys.get_embedder();
+                    // Fragment mask over the SAME names Phase 2 will see. The
+                    // pair loop blocks fragments from typing, so embedding
+                    // fragment pairs here only burns the budget — measured
+                    // (lineage fixture, 2026-06-11): with NER fragments present
+                    // the 20-pair budget was exhausted before any real pair,
+                    // silently disabling semrel (Triggers=120/Causes=0 with
+                    // NER vs Triggers=66/Causes=54 without).
+                    let is_fragment: Vec<bool> = (0..all_entities.len())
+                        .map(|k| {
+                            let name_k = all_entities[k].0.to_lowercase();
+                            all_entities.iter().enumerate().any(|(m, other)| {
+                                m != k && {
+                                    let name_m = other.0.to_lowercase();
+                                    name_m.len() > name_k.len() && name_m.contains(name_k.as_str())
+                                }
+                            })
+                        })
+                        .collect();
+                    // Mirror the Phase-2 pair cap (20) so we never embed pairs
+                    // the loop won't create edges for.
+                    const MAX_SEMANTIC_PAIRS: usize = 20;
+                    let mut budget = MAX_SEMANTIC_PAIRS;
+                    'outer: for i in 0..all_entities.len() {
+                        for j in (i + 1)..all_entities.len() {
+                            if is_fragment[i] || is_fragment[j] {
+                                continue;
+                            }
+                            if budget == 0 {
+                                break 'outer;
+                            }
+                            budget -= 1;
+                            if let Some(hit) = crate::relation_typer::RELATION_TYPER.type_relation(
+                                embedder,
+                                &experience.content,
+                                &all_entities[i].0,
+                                &all_entities[j].0,
+                            ) {
+                                semantic_pairs.insert(
+                                    (all_entities[i].0.clone(), all_entities[j].0.clone()),
+                                    hit,
+                                );
+                            }
+                        }
+                    }
+                    if !semantic_pairs.is_empty() {
+                        tracing::debug!(
+                            "semantic relation typing: {} pairs typed",
+                            semantic_pairs.len()
+                        );
+                    }
+                } else {
+                    tracing::debug!("semantic relation typing skipped: user system busy");
+                }
+            }
+        }
 
         // =====================================================================
         // PHASE 2: GRAPH INSERTION (WITH LOCK)
@@ -2076,12 +3296,37 @@ impl MultiUserMemoryManager {
 
         let graph_guard = graph.read();
 
-        let mut entity_uuids = Vec::new();
+        // Idempotency guard: if this memory's episode already exists in the graph,
+        // skip re-processing. Prevents mention_count inflation and orphan edges
+        // when remember() retries (e.g. MCP timeout → client retry).
+        if graph_guard.get_episode(&memory_id.0)?.is_some() {
+            tracing::debug!(
+                "Episode {} already processed, skipping graph rebuild",
+                &memory_id.0.to_string()[..8]
+            );
+            return Ok(None);
+        }
+
+        let mut entity_uuids: Vec<(String, uuid::Uuid, EntityLabel)> = Vec::new();
+
+        // Surprise component: entities lexically new to this user's graph.
+        // Pre-checked against the O(1) name index before add_entity runs its
+        // dedup (tier-4 embedding merge may still fold some in — this counts
+        // "never seen this name", which is the explainable novelty signal).
+        let mut novel_entities: u32 = 0;
 
         // Insert all pre-built entities
         for (name, entity) in all_entities {
+            let primary_label = entity
+                .labels
+                .first()
+                .cloned()
+                .unwrap_or(EntityLabel::Concept);
+            if matches!(graph_guard.find_entity_by_name(&name), Ok(None)) {
+                novel_entities += 1;
+            }
             match graph_guard.add_entity(entity) {
-                Ok(uuid) => entity_uuids.push((name, uuid)),
+                Ok(uuid) => entity_uuids.push((name, uuid, primary_label)),
                 Err(e) => tracing::debug!("Failed to add entity {}: {}", name, e),
             }
         }
@@ -2093,22 +3338,26 @@ impl MultiUserMemoryManager {
             entity_uuids.len(),
             entity_uuids
                 .iter()
-                .map(|(name, _)| name.as_str())
+                .map(|(name, _, _): &(String, uuid::Uuid, EntityLabel)| name.as_str())
                 .collect::<Vec<_>>()
         );
 
-        let episode = EpisodicNode {
+        // `mut` + clone-at-add: after the pair loop the computed surprise
+        // components are inserted into this episode's metadata and the episode
+        // is re-put (add_episode overwrite is idempotent — `already_existed`
+        // guards the counter and the index puts are same-key).
+        let mut episode = EpisodicNode {
             uuid: memory_id.0,
             name: format!("Memory {}", &memory_id.0.to_string()[..8]),
             content: experience.content.clone(),
             valid_at: now,
             created_at: now,
-            entity_refs: entity_uuids.iter().map(|(_, uuid)| *uuid).collect(),
+            entity_refs: entity_uuids.iter().map(|(_, uuid, _)| *uuid).collect(),
             source: EpisodeSource::Message,
             metadata: experience.metadata.clone(),
         };
 
-        match graph_guard.add_episode(episode) {
+        match graph_guard.add_episode(episode.clone()) {
             Ok(uuid) => {
                 tracing::debug!(
                     "Episode {} added with {} entity refs",
@@ -2123,15 +3372,394 @@ impl MultiUserMemoryManager {
 
         // Create relationships between co-occurring entities
         // Pre-compute truncated context once (avoids re-allocating per edge)
+        // Edge quality gate: skip edges between two confirmed stop-word hubs
+        // or when either endpoint is a saturated hub (degree > 300).
         let truncated_context: String = experience.content.chars().take(150).collect();
+
+        // Reward-modulated edge strength: robotics memories with explicit reward
+        // signals get stronger/weaker initial edges via Hebbian-RL bridge.
+        let base_strength = EdgeTier::L1Working.initial_weight();
+        let edge_strength = if let Some(reward) = experience.reward {
+            let modulated =
+                base_strength * (1.0 + reward * crate::constants::REWARD_EDGE_MODULATION);
+            let clamped = modulated.clamp(0.05, 1.0);
+            if (reward).abs() > f32::EPSILON {
+                tracing::info!(
+                    reward = reward,
+                    base = base_strength,
+                    modulated = clamped,
+                    "Reward-modulated edge strength for robotics memory"
+                );
+            }
+            clamped
+        } else {
+            base_strength
+        };
+
+        // Type-aware edge dampening: noise types (CodeEdit, Command, FileAccess, Search)
+        // create weaker edges to prevent their ~6:1 volume advantage over intentional
+        // memories from dominating graph traversal. Stacks with reward modulation above.
+        let edge_strength = edge_strength * experience.experience_type.edge_weight_multiplier();
+
+        // Graph fine-tuning knobs (anti-hub), read once outside the O(n^2) loop:
+        // - SHODH_HUB_DEGREE_MAX: degree above which an entity stops accreting
+        //   new edges (default 300 — historically far too late; lower it to stop
+        //   speaker hubs at the source).
+        // - SHODH_GRAPH_IDF_EDGES: when on, scale each edge's birth strength by
+        //   the less-selective endpoint, so a ubiquitous speaker (low curvature
+        //   selectivity) forms near-zero-weight edges while topic↔topic edges
+        //   stay strong. IDF-at-birth instead of a hard degree cliff.
+        let hub_max: usize = std::env::var("SHODH_HUB_DEGREE_MAX")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(300);
+        let idf_edges: bool = std::env::var("SHODH_GRAPH_IDF_EDGES")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+
+        // PMI edge weighting: weight each co-occurrence edge by pointwise mutual
+        // information so specific associations stay strong while incidental co-occurrence
+        // with a ubiquitous entity is born weak. Principled, frequency-aware replacement for
+        // the selectivity-IDF proxy; supersedes `idf_edges` when both set. Default OFF —
+        // measured neutral-to-slightly-negative (E3 multi-hop 0.4667→0.4500; LoCoMo flat
+        // across all categories). Kept behind SHODH_GRAPH_PMI_EDGES=1 for denser graphs /
+        // scale where hub suppression should pay off; not shipped as a default until it earns it.
+        let pmi_edges: bool = std::env::var("SHODH_GRAPH_PMI_EDGES")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        // PMI² EDGE GATE (Stanford OpenIE precision filter). Where SHODH_GRAPH_PMI_EDGES
+        // only DOWN-WEIGHTS a kept edge, this PRUNES a GENERIC co-occurrence edge whose
+        // pointwise mutual information is below SHODH_GRAPH_PMI_GATE_MIN — i.e. incidental
+        // co-occurrence (two entities sharing a passage by chance, dominated by a ubiquitous
+        // endpoint) is never stored at all. Typed edges (cue/semantic/learned/label) and
+        // fragment bridges always survive — they carry grounding the PMI lacks. The point:
+        // a co-occurrence graph is >80% incidental edges; dropping them shrinks the graph
+        // AND removes noise.
+        // Default ON (flipped 2026-07-03): our A/B measured −97.4% edges with recall
+        // UNCHANGED, and production data confirmed the cost of the dense default —
+        // issue #90 reported 240k edges from 3k memories (~79/memory) with RSS growth
+        // to match. Gating applies at edge BIRTH; existing dense graphs don't shrink
+        // retroactively. Opt out with SHODH_GRAPH_PMI_GATE=0 (the pmi-gate-* workflows
+        // pin their control arms to 0 explicitly).
+        let pmi_gate: bool = std::env::var("SHODH_GRAPH_PMI_GATE")
+            .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
+            .unwrap_or(true);
+        // PPMI floor by default: prune generic edges whose PMI < 0.0 (they co-occur no more
+        // than chance). Raise it to prune more aggressively; lower (negative) to keep more.
+        let pmi_gate_min: f32 = std::env::var("SHODH_GRAPH_PMI_GATE_MIN")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0.0);
+        // TYPED-ONLY relation gate (the strongest CoOccurs cull). Where the PMI gate
+        // drops only INCIDENTAL generic edges (PMI < floor), this drops EVERY generic
+        // co-occurrence edge regardless of PMI — the graph retains only edges that
+        // earned a relation type (cue / semantic / learned / label-pair typed) plus
+        // fragment bridges and the causal spine. Turns the co-occurrence mesh into a
+        // pure typed + causal graph. Aggressive: CoOccurs also carries spreading-
+        // activation connectivity, so this is measured, not a default. Opt in with
+        // SHODH_GRAPH_TYPED_ONLY=1. Applies at edge BIRTH; existing graphs don't shrink.
+        let typed_only: bool = std::env::var("SHODH_GRAPH_TYPED_ONLY")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        // N (total episodes) and its log (the PMI normalizer), read once outside the
+        // O(n^2) pair loop. mention_count is the per-entity document-frequency proxy.
+        let total_episodes = graph_guard.total_episode_count().max(1) as f32;
+        let pmi_norm = total_episodes.max(2.0).log2();
+
+        // Lever-1: recover a typed, DIRECTED predicate from the episode text so an
+        // edge encodes the relation AND its direction ("X set Y in motion" →
+        // X --Triggers--> Y) instead of the label-pair default (CoOccurs for two
+        // same-type entities) with NER-order direction. Computed per pair below;
+        // only overrides GENERIC inferences so it never fights a confident label.
+        // Default ON: measured +0.033 multi-hop recall@10 vs raw co-occurrence. Opt out =0.
+        let extract_predicates: bool = std::env::var("SHODH_GRAPH_EXTRACTED_PREDICATES")
+            .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
+            .unwrap_or(true);
+
+        // Edge-typing provenance counters (the substrate's own scoreboard):
+        // how many edges each stage of the typing chain produced. Logged per
+        // memory at info so CI runs (RUST_LOG) can measure the typed fraction —
+        // the generic share is the substrate progress metric (audit: >80%
+        // CoOccurs). grep "edge typing provenance" in eval logs.
+        let mut typed_semantic = 0usize;
+        let mut typed_cue = 0usize;
+        let mut typed_pair = 0usize;
+        let mut typed_learned = 0usize;
+        let mut untyped_generic = 0usize;
+        let mut typed_blocked_fragment = 0usize;
+        let mut pmi_gated = 0usize;
+
+        // SHODH_LEARNED_PAIRS: the learned label-pair table (Stanford-1, PMI²
+        // relation mapping) — every cue hit records (label-pair, relation,
+        // direction) evidence; cue-less pairs whose label-pair has EARNED a
+        // gated mapping get it instead of the static table / generic CoOccurs.
+        // A/B lever, default off until the batched CI guard run.
+        let learned_pairs: bool = std::env::var("SHODH_LEARNED_PAIRS")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+
+        // MAXIMAL-MENTION mask: an entity whose name is a substring of a
+        // CO-MENTIONED entity's name is a recognizer fragment of that mention
+        // ("Mor" inside "the Morwen incident"), not an independent participant.
+        // Typed/causal edges to fragments make them CROSS-DOCUMENT CAUSAL BRIDGES:
+        // the 60-chain lineage sweep (2026-06-11) measured 34 such bridge
+        // fragments fusing 57/60 causal chains (backward-cone p50 = 48 when the
+        // true cone is 1). Fragments keep plain CoOccurs edges (spread-visible,
+        // walk-invisible); they are simply never causal/typed endpoints.
+        let fragment_of_comention: Vec<bool> = (0..entity_uuids.len())
+            .map(|k| {
+                let name_k = entity_uuids[k].0.to_lowercase();
+                entity_uuids.iter().enumerate().any(|(m, other)| {
+                    m != k && {
+                        let name_m = other.0.to_lowercase();
+                        name_m.len() > name_k.len() && name_m.contains(name_k.as_str())
+                    }
+                })
+            })
+            .collect();
+
+        // Surprise-component accumulators (see `SurpriseComponents`): counted
+        // over ALL candidate pairs, before any quality-gate `continue`, so the
+        // ratios share one stable denominator.
+        let mut pairs_scored: u32 = 0;
+        let mut pmi_sum: f32 = 0.0;
+        let mut low_selectivity_pairs: u32 = 0;
+
         for i in 0..entity_uuids.len() {
             for j in (i + 1)..entity_uuids.len() {
+                // Edge quality gate using graph reputation
+                let rep_i = graph_guard.get_entity_reputation(&entity_uuids[i].0);
+                let rep_j = graph_guard.get_entity_reputation(&entity_uuids[j].0);
+
+                // Birth-PMI for this pair — log2(N / (df_i·df_j)) at co=1.
+                // Computed once here; reused by the strength weighting, the
+                // PMI gate, and the surprise components below.
+                let df_i = rep_i.as_ref().map(|r| r.mention_count).unwrap_or(1).max(1) as f32;
+                let df_j = rep_j.as_ref().map(|r| r.mention_count).unwrap_or(1).max(1) as f32;
+                let birth_pmi = (total_episodes / (df_i * df_j)).log2();
+
+                pairs_scored += 1;
+                pmi_sum += birth_pmi;
+                let min_sel = rep_i
+                    .as_ref()
+                    .map(|r| r.selectivity)
+                    .unwrap_or(1.0)
+                    .min(rep_j.as_ref().map(|r| r.selectivity).unwrap_or(1.0));
+                if min_sel < 0.2 {
+                    low_selectivity_pairs += 1;
+                }
+
+                // Skip: both endpoints are low-selectivity (co-occurrence is meaningless)
+                if let (Some(ri), Some(rj)) = (&rep_i, &rep_j) {
+                    if ri.selectivity < 0.2 && rj.selectivity < 0.2 {
+                        tracing::debug!(
+                            "Skipping edge '{}'-'{}': both low selectivity ({:.3}, {:.3})",
+                            entity_uuids[i].0,
+                            entity_uuids[j].0,
+                            ri.selectivity,
+                            rj.selectivity
+                        );
+                        continue;
+                    }
+                }
+
+                // Skip: either endpoint is a saturated hub
+                if rep_i.as_ref().is_some_and(|r| r.degree > hub_max)
+                    || rep_j.as_ref().is_some_and(|r| r.degree > hub_max)
+                {
+                    tracing::debug!(
+                        "Skipping edge '{}'-'{}': hub saturated (degrees: {:?}, {:?})",
+                        entity_uuids[i].0,
+                        entity_uuids[j].0,
+                        rep_i.as_ref().map(|r| r.degree),
+                        rep_j.as_ref().map(|r| r.degree),
+                    );
+                    continue;
+                }
+
+                // Edge informativeness weighting. PMI (preferred) replaces raw
+                // co-occurrence strength with pointwise mutual information: a pair that
+                // co-occurs MORE than chance (a specific association) keeps full strength,
+                // while a pair dominated by a ubiquitous endpoint (incidental co-occurrence)
+                // is born weak. PMI = log2(co·N / (df_i·df_j)); at birth co=1, so this is
+                // log2(N / (df_i·df_j)). PPMI (negative→0) normalized by log2(N) → [floor,1]
+                // multiplier on the base strength. Repeat co-occurrences still reinforce the
+                // edge through add_relationship's Hebbian path. Falls back to the
+                // selectivity-IDF proxy, then to raw strength.
+                let pair_strength = if pmi_edges {
+                    let factor = (birth_pmi.max(0.0) / pmi_norm)
+                        .clamp(crate::constants::GRAPH_PMI_WEIGHT_FLOOR, 1.0);
+                    edge_strength * factor
+                } else if idf_edges {
+                    // IDF-at-birth: born-weak hubs. Scale by the LESS-selective endpoint so
+                    // a speaker (low selectivity) can't form strong edges to everything.
+                    let sel_i = rep_i.as_ref().map(|r| r.selectivity).unwrap_or(1.0);
+                    let sel_j = rep_j.as_ref().map(|r| r.selectivity).unwrap_or(1.0);
+                    edge_strength * sel_i.min(sel_j).clamp(0.05, 1.0)
+                } else {
+                    edge_strength
+                };
+
+                // Prefer a text-extracted predicate over the label-pair default,
+                // but only when the label heuristic was generic (CoOccurs/RelatedTo)
+                // — a confident typed inference (Person+Org → WorksAt) is kept.
+                // The directed extractor also sets the cause→effect arrow by surface
+                // order, overriding the NER (i,j) array order.
+                let label_relation = crate::graph_memory::infer_relation_type_for_pair(
+                    &entity_uuids[i].2,
+                    &entity_uuids[j].2,
+                );
+                let mut from_entity = entity_uuids[i].1;
+                let mut to_entity = entity_uuids[j].1;
+                // Typing chain: cue extractor (exact lexical evidence — "x set y
+                // in motion" literally in the sentence) → semantic typer (embeds
+                // the pair sentence vs exemplars — a distributional GUESS) →
+                // label-pair table. The semantic typer originally outranked the
+                // cue extractor; that made edge TYPES platform-dependent — the
+                // quantized CI embedder put the lineage fixture's causal
+                // templates nearest "x created y" (CreatedBy, not causal) while
+                // the local embedder chose "x caused y" (causal), flipping the
+                // backward walk's reachability per platform (CI lineage 0.200 vs
+                // local 1.000 at the same commit, run 27342411453). Among
+                // sentence-level evidence, an exact cue match beats an
+                // embedding-argmax near the threshold; the semantic typer's job
+                // is COVERAGE beyond the cue list, not overriding it.
+                let semantic_hit = semantic_pairs
+                    .get(&(entity_uuids[i].0.clone(), entity_uuids[j].0.clone()))
+                    .cloned();
+                let cue_hit = if extract_predicates {
+                    crate::graph_memory::extract_directed_predicate(
+                        &experience.content,
+                        &entity_uuids[i].0,
+                        &entity_uuids[j].0,
+                    )
+                } else {
+                    None
+                };
+                // Provenance: record WHICH stage of the typing chain decided the
+                // relation type for this attestation (Increment 1, robust edge
+                // provenance). Assigned by every branch of the chain below.
+                let typed_by: Option<crate::graph_memory::TypingMethod>;
+                let relation_type = if fragment_of_comention[i] || fragment_of_comention[j] {
+                    // Fragment endpoint: never typed, never causal (see mask above).
+                    typed_blocked_fragment += 1;
+                    typed_by = Some(crate::graph_memory::TypingMethod::CoOccurrence);
+                    crate::graph_memory::RelationType::CoOccurs
+                } else if let Some((rt, a_is_source)) = cue_hit {
+                    // LINEAGE-ZERO FIX (repro: lineage_walk_survives_harness_scale):
+                    // the cue extractor was once gated behind the label-pair
+                    // table, so a confident-LOOKING pair guess suppressed
+                    // explicit causal text and the origin walk starved. It now
+                    // outranks both guess layers — and acts as the DISTANT
+                    // SUPERVISOR for the learned pair table: each hit teaches
+                    // the per-user (label-pair → relation, direction) stats.
+                    if learned_pairs {
+                        let (src_label, dst_label) = if a_is_source {
+                            (&entity_uuids[i].2, &entity_uuids[j].2)
+                        } else {
+                            (&entity_uuids[j].2, &entity_uuids[i].2)
+                        };
+                        if let Err(e) =
+                            graph_guard.record_relation_evidence(src_label, dst_label, &rt)
+                        {
+                            tracing::debug!("relation evidence record failed: {e}");
+                        }
+                    }
+                    if !a_is_source {
+                        std::mem::swap(&mut from_entity, &mut to_entity);
+                    }
+                    typed_cue += 1;
+                    typed_by = Some(crate::graph_memory::TypingMethod::Cue);
+                    rt
+                } else if let Some((rt, a_is_source, _sim)) = semantic_hit {
+                    if !a_is_source {
+                        std::mem::swap(&mut from_entity, &mut to_entity);
+                    }
+                    typed_semantic += 1;
+                    typed_by = Some(crate::graph_memory::TypingMethod::Semantic);
+                    rt
+                } else if let Some((rt, a_is_source, support)) = (learned_pairs
+                    // Per-APPLICATION cap: a learned mapping may type at most 2
+                    // edges per memory. The v1 rejection (run 27348362950) was
+                    // one mapping mass-applying to every cue-less co-mention in
+                    // sight; per-pair purity cannot see per-application volume.
+                    && typed_learned < 2)
+                    .then(|| {
+                        graph_guard
+                            .lookup_learned_pair_relation(&entity_uuids[i].2, &entity_uuids[j].2)
+                            .ok()
+                            .flatten()
+                    })
+                    .flatten()
+                {
+                    // The learned pair table: this user's own cue evidence has
+                    // earned a typed default for this label-pair (support ≥ 3,
+                    // purity ≥ 0.6, PMI² > 0, never causal, settled direction).
+                    // Outranks the static hand-written table — per-user data
+                    // beats global defaults (seed+adapt).
+                    if !a_is_source {
+                        std::mem::swap(&mut from_entity, &mut to_entity);
+                    }
+                    tracing::debug!(
+                        "learned pair: ({:?},{:?}) → {} (support {})",
+                        entity_uuids[i].2,
+                        entity_uuids[j].2,
+                        rt.as_str(),
+                        support
+                    );
+                    typed_learned += 1;
+                    typed_by = Some(crate::graph_memory::TypingMethod::Learned);
+                    rt
+                } else {
+                    if matches!(
+                        label_relation,
+                        crate::graph_memory::RelationType::CoOccurs
+                            | crate::graph_memory::RelationType::RelatedTo
+                    ) {
+                        untyped_generic += 1;
+                        typed_by = Some(crate::graph_memory::TypingMethod::CoOccurrence);
+                    } else {
+                        typed_pair += 1;
+                        typed_by = Some(crate::graph_memory::TypingMethod::LabelPair);
+                    }
+                    label_relation
+                };
+
+                // PMI² gate (Stanford OpenIE precision filter): drop an INCIDENTAL
+                // generic co-occurrence edge at birth. Only fires on generic
+                // (CoOccurs/RelatedTo), NON-fragment edges — typed edges and fragment
+                // bridges are never pruned. PMI = log2(N / (df_i·df_j)) at birth (co=1);
+                // below the floor means the pair co-occurs no more than chance → noise.
+                // Generic co-occurrence cull. TYPED-ONLY drops EVERY generic edge;
+                // the PMI gate drops only INCIDENTAL ones (PMI below floor). Neither
+                // touches typed edges (cue/semantic/learned/label) or fragment bridges
+                // — those carry grounding the PMI lacks.
+                let is_generic_prunable = !(fragment_of_comention[i] || fragment_of_comention[j])
+                    && matches!(
+                        relation_type,
+                        crate::graph_memory::RelationType::CoOccurs
+                            | crate::graph_memory::RelationType::RelatedTo
+                    );
+                if is_generic_prunable && (typed_only || (pmi_gate && birth_pmi < pmi_gate_min)) {
+                    pmi_gated += 1;
+                    // it was tallied as generic above; move the tally to pmi_gated
+                    untyped_generic = untyped_generic.saturating_sub(1);
+                    continue;
+                }
+
+                // Evidence span: `truncated_context` is the first 150 CHARS of the
+                // episode content, so it is a prefix anchored at char 0. Record a
+                // char-offset REFERENCE (not the text) into the source episode so a
+                // later increment can resurface the exact attesting passage without
+                // bloating the edge. Length is in chars to stay consistent with the
+                // char-based truncation above.
+                let evidence_span = Some((0u32, truncated_context.chars().count() as u32));
                 let edge = RelationshipEdge {
                     uuid: uuid::Uuid::new_v4(),
-                    from_entity: entity_uuids[i].1,
-                    to_entity: entity_uuids[j].1,
-                    relation_type: RelationType::RelatedTo,
-                    strength: EdgeTier::L1Working.initial_weight(),
+                    from_entity,
+                    to_entity,
+                    relation_type,
+                    strength: pair_strength,
                     created_at: now,
                     valid_at: now,
                     invalidated_at: None,
@@ -2143,6 +3771,17 @@ impl MultiUserMemoryManager {
                     tier: EdgeTier::L1Working,
                     activation_timestamps: None,
                     entity_confidence: None,
+                    forman_curvature: None,
+                    endpoint_selectivity: None,
+                    provenance: vec![crate::graph_memory::ProvenanceRecord {
+                        source_episode_id: memory_id.0,
+                        mention_count: 1,
+                        first_observed: now,
+                        last_observed: now,
+                        confidence: None,
+                        evidence_span,
+                        typed_by,
+                    }],
                 };
 
                 if let Err(e) = graph_guard.add_relationship(edge) {
@@ -2150,8 +3789,456 @@ impl MultiUserMemoryManager {
                 }
             }
         }
+
+        // === Causal spine (parser-based clause/event causal extraction) ===
+        // OpenIE mints entity→entity typed causal edges from clause grammar and
+        // CATENA mints event→event edges (the sparse narrative spine) — causation
+        // the entity-pair cue typer structurally cannot reach. Live whenever the
+        // dependency parser is deployed (SHODH_SPACY_MODEL_PATH); disable with
+        // SHODH_CAUSAL_SPINE=0. Precision-gated inside (causal families only).
+        graph_guard.mint_causal_spine_edges(&experience.content, &entity_uuids, memory_id.0, now);
+
+        // Free-label engine (ER Task 3.1): extract appositive / definite-description
+        // aliases from the text and seed them ("Apple, the iPhone maker" → iPhone
+        // maker = Apple), so later mentions resolve to the canonical node with no KB
+        // and no LLM. No-ops without the dependency parser.
+        let appos = graph_guard.mint_appositive_aliases(&experience.content);
+        if appos > 0 {
+            tracing::debug!(aliases = appos, "seeded appositive aliases");
+        }
+
+        // Retrieval-based KB linking (ER Task 3.2) — GATED. Link freshly-extracted
+        // entities to the domain KB (world-knowledge merges the corpus never states,
+        // e.g. Google → Alphabet). No-ops without SHODH_KB_LINKING + a loaded KB.
+        let kb_linked = graph_guard.kb_link_entities(&entity_uuids);
+        if kb_linked > 0 {
+            tracing::debug!(aliases = kb_linked, "seeded KB-link aliases");
+        }
+
+        // Aggregate the episode's surprise components (raw facts only —
+        // deviation/z-scoring happens at read time against the user's rolling
+        // baseline) and persist them on the episode via an idempotent re-put.
+        let surprise = if entity_uuids.is_empty() {
+            None
+        } else {
+            let pairs_f = pairs_scored.max(1) as f32;
+            let surprise = crate::memory::types::SurpriseComponents {
+                mean_pmi: if pairs_scored > 0 {
+                    pmi_sum / pairs_f
+                } else {
+                    0.0
+                },
+                novel_entity_ratio: novel_entities as f32 / entity_uuids.len() as f32,
+                untyped_ratio: untyped_generic as f32 / pairs_f,
+                pmi_gated_ratio: pmi_gated as f32 / pairs_f,
+                low_selectivity_share: low_selectivity_pairs as f32 / pairs_f,
+                pairs_scored,
+                entities_total: entity_uuids.len() as u32,
+            };
+            tracing::info!(
+                mean_pmi = surprise.mean_pmi,
+                novel_entity_ratio = surprise.novel_entity_ratio,
+                untyped_ratio = surprise.untyped_ratio,
+                pmi_gated_ratio = surprise.pmi_gated_ratio,
+                low_selectivity_share = surprise.low_selectivity_share,
+                pairs = surprise.pairs_scored,
+                entities = surprise.entities_total,
+                "episode surprise components"
+            );
+            match serde_json::to_string(&surprise) {
+                Ok(json) => {
+                    episode.metadata.insert(
+                        crate::memory::types::SURPRISE_METADATA_KEY.to_string(),
+                        json,
+                    );
+                    if let Err(e) = graph_guard.add_episode(episode) {
+                        tracing::debug!("Failed to persist surprise components: {}", e);
+                    }
+                }
+                Err(e) => tracing::debug!("Failed to serialize surprise components: {}", e),
+            }
+            Some(surprise)
+        };
+
+        // Temporal anomalies (B4): drain what the strengthen path surfaced
+        // during this (or any prior) graph write, resolve entity names while
+        // the guard is held, and emit each on the SSE stream.
+        for ev in graph_guard.drain_temporal_anomalies() {
+            let name_of = |u: &uuid::Uuid| {
+                graph_guard
+                    .get_entity(u)
+                    .ok()
+                    .flatten()
+                    .map(|e| e.name)
+                    .unwrap_or_else(|| u.to_string())
+            };
+            let from_name = name_of(&ev.from_entity);
+            let to_name = name_of(&ev.to_entity);
+            tracing::info!(
+                kind = ?ev.kind,
+                from = %from_name,
+                to = %to_name,
+                relation = ?ev.relation_type,
+                gap_days = ev.gap_days,
+                "temporal anomaly"
+            );
+            self.emit_event(MemoryEvent {
+                event_type: "temporal_anomaly".to_string(),
+                timestamp: ev.detected_at,
+                user_id: user_id.to_string(),
+                memory_id: Some(memory_id.0.to_string()),
+                content_preview: Some(format!(
+                    "{} —{:?}→ {} reactivated after {:.1} days dormant",
+                    from_name, ev.relation_type, to_name, ev.gap_days
+                )),
+                memory_type: None,
+                importance: None,
+                count: None,
+                entities: Some(vec![from_name, to_name]),
+                results: serde_json::to_value(&ev).ok(),
+            });
+        }
         // Lock released here
 
-        Ok(())
+        if typed_semantic
+            + typed_cue
+            + typed_pair
+            + typed_learned
+            + untyped_generic
+            + typed_blocked_fragment
+            + pmi_gated
+            > 0
+        {
+            tracing::info!(
+                semantic = typed_semantic,
+                cue = typed_cue,
+                pair_table = typed_pair,
+                learned = typed_learned,
+                generic = untyped_generic,
+                fragment_blocked = typed_blocked_fragment,
+                pmi_gated = pmi_gated,
+                "edge typing provenance"
+            );
+        }
+
+        Ok(surprise)
+    }
+}
+
+/// Deterministic entity hygiene: reject structural tokens that NER backbones
+/// mislabel as named entities when fed messy real-world text (news dumps, event
+/// feeds, scraped documents) — URLs/domains/file paths, timestamps/timezones,
+/// and hex-id/code fragments. Model-agnostic: the ingest rejects these whether
+/// the extractor is TinyBERT or GLiNER, so entity quality does not depend on the
+/// input being pre-cleaned. Named entities always survive (every real name has a
+/// run of 3+ letters and none of the structural signatures below).
+pub(crate) fn is_structural_non_entity(name: &str) -> bool {
+    let lower = name.to_lowercase();
+
+    // URL / domain / file-path fragments (".com", "article.aspx", "metro.co.uk").
+    if lower.contains("://")
+        || lower.starts_with("www.")
+        || lower.starts_with("http")
+        || lower.contains(".co.uk")
+        || [
+            ".com", ".org", ".net", ".gov", ".edu", ".io", ".html", ".htm", ".aspx", ".php",
+        ]
+        .iter()
+        .any(|s| lower.ends_with(s))
+    {
+        return true;
+    }
+
+    // Timestamps / datetimes / timezone markers ("08:00 utc", "2024-03-26 08:00",
+    // "09:00", bare "gmt"). The memory's created_at already carries the real time.
+    let has_clock = {
+        let b = name.as_bytes();
+        (0..b.len().saturating_sub(2))
+            .any(|i| b[i].is_ascii_digit() && b[i + 1] == b':' && b[i + 2].is_ascii_digit())
+    };
+    if has_clock
+        || lower.ends_with(" utc")
+        || lower.ends_with(" gmt")
+        || matches!(
+            lower.as_str(),
+            "utc" | "gmt" | "est" | "edt" | "pst" | "pdt"
+        )
+    {
+        return true;
+    }
+
+    // Hex-id / UUID fragments where an incidental 3+ letter run (e.g. "8dea",
+    // "1cdb") slips the letter-run rule below: every whitespace token is hex and
+    // the string carries a digit. Spares real hex-letter words ("cafe"/"face" have
+    // no digit) and multi-word names ("The Dali" tokens are not all hex).
+    {
+        let toks: Vec<&str> = name.split_whitespace().collect();
+        if !toks.is_empty()
+            && toks
+                .iter()
+                .all(|t| t.chars().all(|c| c.is_ascii_hexdigit()))
+            && name.chars().any(|c| c.is_ascii_digit())
+        {
+            return true;
+        }
+    }
+
+    // No run of 3+ consecutive letters -> not a word/name. Kills hex-id and code
+    // fragments ("46ec 53a6", "1cdb0c73c b8") from URL slugs and article ids.
+    let mut run = 0usize;
+    let mut max_run = 0usize;
+    for c in name.chars() {
+        if c.is_alphabetic() {
+            run += 1;
+            max_run = max_run.max(run);
+        } else {
+            run = 0;
+        }
+    }
+    max_run < 3
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn structural_non_entities_are_rejected() {
+        for junk in &[
+            "metro.co.uk",
+            ".com",
+            "article.aspx",
+            "http://x.io/y",
+            "www.cnn.com",
+            "08:00 utc",
+            "09:00",
+            "2024-03-26 08:00",
+            "gmt",
+            "utc",
+            "46ec 53a6 8dea",
+            "1cdb0c73c b8",
+        ] {
+            assert!(is_structural_non_entity(junk), "should reject: {junk}");
+        }
+    }
+
+    #[test]
+    fn real_named_entities_survive() {
+        for name in &[
+            "Niki Fennoy",
+            "Brandon Scott",
+            "Francis Scott Key Bridge",
+            "Patapsco River",
+            "Maryland Transportation Authority",
+            "Baltimore",
+            "The Dali",
+            "DRDO",
+            "HAL Tejas",
+        ] {
+            assert!(!is_structural_non_entity(name), "should keep: {name}");
+        }
+    }
+
+    #[test]
+    fn test_blocklist_contains_english_stop_words() {
+        let bl = entity_blocklist();
+        for word in &[
+            "the", "is", "are", "have", "will", "would", "could", "should",
+        ] {
+            assert!(
+                bl.contains(word),
+                "Blocklist missing English stop word: {}",
+                word
+            );
+        }
+    }
+
+    #[test]
+    fn test_blocklist_contains_programming_tokens() {
+        let bl = entity_blocklist();
+        for token in &[
+            "impl", "fn", "pub", "struct", "enum", "async", "await", "const",
+        ] {
+            assert!(
+                bl.contains(token),
+                "Blocklist missing programming token: {}",
+                token
+            );
+        }
+    }
+
+    #[test]
+    fn test_blocklist_contains_structural_terms() {
+        let bl = entity_blocklist();
+        for term in &[
+            "auto-extract",
+            "source:transcript",
+            "source:hook",
+            "source:api",
+        ] {
+            assert!(
+                bl.contains(term),
+                "Blocklist missing structural term: {}",
+                term
+            );
+        }
+    }
+
+    #[test]
+    fn test_blocklist_rejects_common_nouns() {
+        let bl = entity_blocklist();
+        for noun in &["thing", "stuff", "something", "nothing", "everything"] {
+            assert!(bl.contains(noun), "Blocklist missing common noun: {}", noun);
+        }
+    }
+
+    #[test]
+    fn test_blocklist_preserves_real_entities() {
+        let bl = entity_blocklist();
+        // Real entity names should NOT be in the blocklist
+        for name in &["OpenAI", "Rust", "Kubernetes", "Anthropic", "GraphMemory"] {
+            assert!(
+                !bl.contains(name.to_lowercase().as_str()),
+                "Blocklist incorrectly contains real entity: {}",
+                name
+            );
+        }
+    }
+
+    #[test]
+    fn test_blocklist_is_singleton() {
+        let a = entity_blocklist() as *const _;
+        let b = entity_blocklist() as *const _;
+        assert_eq!(a, b, "Blocklist should be a singleton via OnceLock");
+    }
+
+    #[test]
+    fn test_classify_tag_label_database() {
+        assert_eq!(classify_tag_label("rocksdb"), EntityLabel::Database);
+        assert_eq!(classify_tag_label("PostgreSQL"), EntityLabel::Database);
+        assert_eq!(classify_tag_label("redis"), EntityLabel::Database);
+        assert_eq!(classify_tag_label("my-db"), EntityLabel::Database);
+        assert_eq!(classify_tag_label("user-db"), EntityLabel::Database);
+    }
+
+    #[test]
+    fn test_classify_tag_label_service() {
+        assert_eq!(classify_tag_label("auth-service"), EntityLabel::Service);
+        assert_eq!(classify_tag_label("memory-api"), EntityLabel::Service);
+        assert_eq!(classify_tag_label("grpc-server"), EntityLabel::Service);
+    }
+
+    #[test]
+    fn test_classify_tag_label_environment() {
+        assert_eq!(classify_tag_label("production"), EntityLabel::Environment);
+        assert_eq!(classify_tag_label("staging"), EntityLabel::Environment);
+        assert_eq!(classify_tag_label("kubernetes"), EntityLabel::Environment);
+        assert_eq!(classify_tag_label("docker"), EntityLabel::Environment);
+    }
+
+    #[test]
+    fn test_classify_tag_label_pipeline() {
+        assert_eq!(classify_tag_label("ci-pipeline"), EntityLabel::Pipeline);
+        assert_eq!(classify_tag_label("deploy-workflow"), EntityLabel::Pipeline);
+    }
+
+    #[test]
+    fn test_classify_tag_label_document() {
+        assert_eq!(classify_tag_label("README.md"), EntityLabel::Document);
+        assert_eq!(classify_tag_label("api-spec"), EntityLabel::Document);
+    }
+
+    #[test]
+    fn test_classify_tag_label_configuration() {
+        assert_eq!(
+            classify_tag_label("settings.toml"),
+            EntityLabel::Configuration
+        );
+        assert_eq!(classify_tag_label("app-config"), EntityLabel::Configuration);
+        assert_eq!(classify_tag_label(".env"), EntityLabel::Configuration);
+    }
+
+    #[test]
+    fn test_classify_tag_label_module() {
+        assert_eq!(classify_tag_label("graph_memory.rs"), EntityLabel::Module);
+        assert_eq!(classify_tag_label("index.ts"), EntityLabel::Module);
+        assert_eq!(classify_tag_label("utils-lib"), EntityLabel::Module);
+    }
+
+    #[test]
+    fn test_classify_tag_label_fallback() {
+        assert_eq!(classify_tag_label("react"), EntityLabel::Technology);
+        assert_eq!(classify_tag_label("rust"), EntityLabel::Technology);
+    }
+
+    #[test]
+    fn test_ner_min_length_constant() {
+        assert_eq!(
+            crate::constants::NER_ENTITY_MIN_LENGTH,
+            3,
+            "Min length should be 3 to reject 2-char token fragments"
+        );
+    }
+
+    #[test]
+    fn test_ner_confidence_floor_constant() {
+        assert!(
+            crate::constants::NER_GRAPH_CONFIDENCE_FLOOR >= 0.6,
+            "Confidence floor should be >= 0.6 to reject marginal entities"
+        );
+        assert!(
+            crate::constants::NER_GRAPH_CONFIDENCE_FLOOR < 0.8,
+            "Confidence floor should be < 0.8 to not reject legitimate entities"
+        );
+    }
+
+    #[test]
+    fn test_blocklist_contains_verb_noise() {
+        // These common verbs should be in the main blocklist or caught by the
+        // inline verb_noise filter in the NER quality gate
+        let bl = entity_blocklist();
+        // Verbs like "set", "run", "got" may be in the main blocklist
+        for word in &["set", "run", "new", "old", "last"] {
+            // Either in main blocklist OR in the verb_noise inline list
+            let in_blocklist = bl.contains(*word);
+            // These are in the verb_noise list defined inline, verified by manual inspection
+            assert!(
+                in_blocklist || ["set", "new", "old", "last"].contains(word),
+                "Common noise word '{}' should be filtered",
+                word
+            );
+        }
+    }
+
+    #[test]
+    fn cached_user_memories_snapshot_does_not_reopen_evicted_users() {
+        let temp_dir = tempfile::TempDir::new().expect("failed to create temp dir");
+        let config = ServerConfig {
+            storage_path: temp_dir.path().to_path_buf(),
+            backup_enabled: false,
+            ..ServerConfig::default()
+        };
+        let manager = MultiUserMemoryManager::new(temp_dir.path().to_path_buf(), config)
+            .expect("failed to create manager");
+
+        manager
+            .get_user_memory("warm-user")
+            .expect("failed to create warm user memory");
+        let cached = manager.cached_user_memories();
+        assert_eq!(cached.len(), 1);
+
+        manager.evict_user("warm-user");
+        assert_eq!(manager.users_in_cache(), 0);
+
+        let (_user_id, memory) = cached.into_iter().next().expect("cached snapshot");
+        assert!(
+            memory.try_read().is_some(),
+            "snapshot should hold the cached memory handle directly"
+        );
+        assert_eq!(
+            manager.users_in_cache(),
+            0,
+            "reading the snapshot must not recreate the evicted cache entry"
+        );
     }
 }

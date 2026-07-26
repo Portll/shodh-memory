@@ -339,6 +339,7 @@ fn build_knowledge_graph(graph: &GraphMemory) -> Result<MifKnowledgeGraph> {
             summary: e.summary,
             created_at: e.created_at,
             last_seen_at: e.last_seen_at,
+            fine_type: e.fine_type,
         })
         .collect();
 
@@ -467,6 +468,31 @@ fn label_to_string(label: &EntityLabel) -> String {
         EntityLabel::Product => "product".to_string(),
         EntityLabel::Skill => "skill".to_string(),
         EntityLabel::Keyword => "keyword".to_string(),
+        EntityLabel::Project => "project".to_string(),
+        EntityLabel::Task => "task".to_string(),
+        EntityLabel::Document => "document".to_string(),
+        EntityLabel::Repository => "repository".to_string(),
+        EntityLabel::Service => "service".to_string(),
+        EntityLabel::Database => "database".to_string(),
+        EntityLabel::Metric => "metric".to_string(),
+        EntityLabel::Configuration => "configuration".to_string(),
+        EntityLabel::Environment => "environment".to_string(),
+        EntityLabel::Pipeline => "pipeline".to_string(),
+        EntityLabel::Team => "team".to_string(),
+        EntityLabel::Role => "role".to_string(),
+        EntityLabel::Module => "module".to_string(),
+        EntityLabel::Norp => "norp".to_string(),
+        EntityLabel::Gpe => "gpe".to_string(),
+        EntityLabel::Facility => "facility".to_string(),
+        EntityLabel::Vehicle => "vehicle".to_string(),
+        EntityLabel::Weapon => "weapon".to_string(),
+        EntityLabel::Work => "work".to_string(),
+        EntityLabel::Law => "law".to_string(),
+        EntityLabel::Title => "title".to_string(),
+        EntityLabel::Cyber => "cyber".to_string(),
+        EntityLabel::Money => "money".to_string(),
+        EntityLabel::Quantity => "quantity".to_string(),
+        EntityLabel::Time => "time".to_string(),
         EntityLabel::Other(s) => s.to_lowercase(),
     }
 }
@@ -528,6 +554,21 @@ fn relation_type_to_string(r: &crate::graph_memory::RelationType) -> String {
         RelationType::AssociatedWith => "associated_with",
         RelationType::CoRetrieved => "co_retrieved",
         RelationType::CoOccurs => "co_occurs",
+        RelationType::Manages => "manages",
+        RelationType::DependsOn => "depends_on",
+        RelationType::Requires => "requires",
+        RelationType::Configures => "configures",
+        RelationType::Prefers => "prefers",
+        RelationType::Recommends => "recommends",
+        RelationType::Documents => "documents",
+        RelationType::Implements => "implements",
+        RelationType::DeploysTo => "deploys_to",
+        RelationType::Monitors => "monitors",
+        RelationType::Triggers => "triggers",
+        RelationType::SupersededBy => "superseded_by",
+        RelationType::AlternativeTo => "alternative_to",
+        RelationType::AssignedTo => "assigned_to",
+        RelationType::Approves => "approves",
         RelationType::Custom(s) => return s.to_lowercase(),
     }
     .to_string()
@@ -554,4 +595,106 @@ fn todo_priority_to_string(p: &TodoPriority) -> String {
         TodoPriority::None => "none",
     }
     .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::graph_memory::EntityNode;
+    use crate::mif::import::import_graph_entities;
+
+    /// `EntityNode.fine_type` (schema leaf, e.g. "bridge") is manually threaded
+    /// through `MifGraphEntity` — not covered by whole-struct serde — so an
+    /// export/import round trip must be verified explicitly: build_knowledge_graph
+    /// (export) must emit it, and import_graph_entities (import) must restore it
+    /// onto the reconstructed EntityNode in a fresh graph.
+    #[test]
+    fn mif_round_trip_preserves_fine_type() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let graph = GraphMemory::new(temp_dir.path(), None).unwrap();
+        let now = Utc::now();
+
+        let entity = EntityNode {
+            uuid: Uuid::new_v4(),
+            name: "Francis Scott Key Bridge".to_string(),
+            labels: vec![EntityLabel::Facility],
+            created_at: now,
+            last_seen_at: now,
+            mention_count: 1,
+            summary: String::new(),
+            attributes: HashMap::new(),
+            name_embedding: None,
+            salience: 0.5,
+            is_proper_noun: true,
+            selectivity: None,
+            fine_type: Some("bridge".to_string()),
+        };
+        graph.add_entity(entity).unwrap();
+
+        let kg = build_knowledge_graph(&graph).unwrap();
+        assert_eq!(kg.entities.len(), 1);
+        assert_eq!(
+            kg.entities[0].fine_type.as_deref(),
+            Some("bridge"),
+            "export must carry fine_type onto MifGraphEntity"
+        );
+
+        let temp_dir2 = tempfile::tempdir().unwrap();
+        let graph2 = GraphMemory::new(temp_dir2.path(), None).unwrap();
+        let (imported, errors) = import_graph_entities(&kg, &graph2);
+        assert_eq!(imported, 1);
+        assert!(errors.is_empty(), "import errors: {errors:?}");
+
+        let entities = graph2.get_all_entities().unwrap();
+        assert_eq!(entities.len(), 1);
+        assert_eq!(
+            entities[0].fine_type,
+            Some("bridge".to_string()),
+            "import must restore fine_type onto the reconstructed EntityNode"
+        );
+    }
+
+    /// An entity with no fine type (the common case — most extraction paths
+    /// don't populate it yet) must round-trip to `None`, not to e.g. an empty
+    /// string or a spurious default, and must not appear in serialized MIF
+    /// JSON at all (skip_serializing_if).
+    #[test]
+    fn mif_round_trip_omits_fine_type_when_absent() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let graph = GraphMemory::new(temp_dir.path(), None).unwrap();
+        let now = Utc::now();
+
+        let entity = EntityNode {
+            uuid: Uuid::new_v4(),
+            name: "Unspecified Thing".to_string(),
+            labels: vec![EntityLabel::Concept],
+            created_at: now,
+            last_seen_at: now,
+            mention_count: 1,
+            summary: String::new(),
+            attributes: HashMap::new(),
+            name_embedding: None,
+            salience: 0.5,
+            is_proper_noun: false,
+            selectivity: None,
+            fine_type: None,
+        };
+        graph.add_entity(entity).unwrap();
+
+        let kg = build_knowledge_graph(&graph).unwrap();
+        assert_eq!(kg.entities[0].fine_type, None);
+
+        let json = serde_json::to_string(&kg.entities[0]).unwrap();
+        assert!(
+            !json.contains("fine_type"),
+            "skip_serializing_if(None) should omit fine_type from serialized MIF: {json}"
+        );
+
+        let temp_dir2 = tempfile::tempdir().unwrap();
+        let graph2 = GraphMemory::new(temp_dir2.path(), None).unwrap();
+        let (imported, _errors) = import_graph_entities(&kg, &graph2);
+        assert_eq!(imported, 1);
+        let entities = graph2.get_all_entities().unwrap();
+        assert_eq!(entities[0].fine_type, None);
+    }
 }

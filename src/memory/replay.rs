@@ -15,8 +15,9 @@
 //! - Similar memories compete during retrieval
 
 use crate::constants::{
-    INTERFERENCE_COMPETITION_FACTOR, INTERFERENCE_MAX_TRACKED, INTERFERENCE_PROACTIVE_DECAY,
-    INTERFERENCE_PROACTIVE_THRESHOLD, INTERFERENCE_RETROACTIVE_DECAY,
+    COMPETITION_CLOSE_RATIO, COMPETITION_SUPPRESSION_SCALE, COMPETITION_SURVIVAL_FLOOR,
+    COMPETITION_SURVIVOR_DAMAGE_RATIO, INTERFERENCE_COMPETITION_FACTOR, INTERFERENCE_MAX_TRACKED,
+    INTERFERENCE_PROACTIVE_DECAY, INTERFERENCE_PROACTIVE_THRESHOLD, INTERFERENCE_RETROACTIVE_DECAY,
     INTERFERENCE_SEVERE_THRESHOLD, INTERFERENCE_SIMILARITY_THRESHOLD,
     INTERFERENCE_VULNERABILITY_HOURS, REPLAY_AROUSAL_THRESHOLD, REPLAY_BATCH_SIZE,
     REPLAY_EDGE_BOOST, REPLAY_IMPORTANCE_THRESHOLD, REPLAY_MAX_AGE_DAYS, REPLAY_STRENGTH_BOOST,
@@ -96,6 +97,7 @@ impl ReplayManager {
     /// - Important (above REPLAY_IMPORTANCE_THRESHOLD)
     /// - Connected (at least REPLAY_MIN_CONNECTIONS)
     /// - Optionally: high emotional arousal for priority
+    #[allow(clippy::type_complexity)]
     pub fn identify_replay_candidates(
         &self,
         memories: &[(String, f32, f32, DateTime<Utc>, Vec<String>, String)], // (id, importance, arousal, created_at, connections, content_preview)
@@ -126,7 +128,10 @@ impl ReplayManager {
                     } else {
                         0.0
                     };
-                    let connectivity_factor = 1.0 + (connections.len() as f32 / 10.0).min(0.5); // Max 50% boost
+                    let connectivity_factor = 1.0
+                        + (connections.len() as f32
+                            / crate::constants::REPLAY_CONNECTIVITY_DIVISOR)
+                            .min(crate::constants::REPLAY_CONNECTIVITY_MAX_BOOST);
 
                     let priority =
                         importance * recency_factor * (1.0 + arousal_boost) * connectivity_factor;
@@ -156,6 +161,7 @@ impl ReplayManager {
     /// Execute replay for a batch of candidates
     ///
     /// Returns strength boosts to apply to memories and edges
+    #[allow(clippy::type_complexity)]
     pub fn execute_replay(
         &mut self,
         candidates: &[ReplayCandidate],
@@ -348,7 +354,8 @@ impl InterferenceDetector {
                     memory_id: old_id.clone(),
                     content_preview: old_preview.clone(),
                     activation_before: *old_importance,
-                    activation_after: (*old_importance - decay).max(0.05),
+                    activation_after: (*old_importance - decay)
+                        .max(crate::constants::INTERFERENCE_ACTIVATION_FLOOR),
                     interfering_memory_id: new_memory_id.to_string(),
                     interference_type: InterferenceType::Retroactive,
                     timestamp: now,
@@ -403,10 +410,17 @@ impl InterferenceDetector {
     ///
     /// When multiple similar memories are retrieved, they compete
     /// for activation. Stronger memories suppress weaker ones.
+    /// `record_state`: when false, competition COMPUTES winners/suppression
+    /// exactly as always (per-query ranking semantics unchanged) but records
+    /// NO interference into the detector. Eval determinism requires it: the
+    /// accumulated records feed Layer 4.6's survivor/loser boosts on FUTURE
+    /// queries, so repeat 0 of a harness run was teaching the detector and
+    /// shifting repeats 1+ (L1 smoke cross-repeat divergence, smoke-094).
     pub fn apply_retrieval_competition(
         &mut self,
         candidates: &[(String, f32, f32)], // (memory_id, relevance_score, similarity_to_query)
         query_preview: &str,
+        record_state: bool,
     ) -> CompetitionResult {
         if candidates.len() <= 1 {
             return CompetitionResult {
@@ -448,31 +462,36 @@ impl InterferenceDetector {
                     let score_ratio = score / winner_score;
 
                     // Strong suppression for very close competitors
-                    if score_ratio > 0.9 {
-                        let suppression =
-                            INTERFERENCE_COMPETITION_FACTOR * (1.0 - score_ratio) * 10.0;
+                    if score_ratio > COMPETITION_CLOSE_RATIO {
+                        let suppression = INTERFERENCE_COMPETITION_FACTOR
+                            * (1.0 - score_ratio)
+                            * COMPETITION_SUPPRESSION_SCALE;
                         let new_score = (score - suppression).max(0.0);
 
-                        if new_score > 0.1 {
+                        if new_score > COMPETITION_SURVIVAL_FLOOR {
                             winners.push((id.clone(), new_score));
                             // Mild interference record for close survivors ("battle-tested")
-                            self.record_interference(
-                                id,
-                                winner_id,
-                                score_ratio,
-                                InterferenceType::RetrievalCompetition,
-                                suppression * 0.3,
-                            );
+                            if record_state {
+                                self.record_interference(
+                                    id,
+                                    winner_id,
+                                    score_ratio,
+                                    InterferenceType::RetrievalCompetition,
+                                    suppression * COMPETITION_SURVIVOR_DAMAGE_RATIO,
+                                );
+                            }
                         } else {
                             suppressed.push(id.clone());
                             // Strong interference record for fully suppressed memories
-                            self.record_interference(
-                                id,
-                                winner_id,
-                                score_ratio,
-                                InterferenceType::RetrievalCompetition,
-                                suppression,
-                            );
+                            if record_state {
+                                self.record_interference(
+                                    id,
+                                    winner_id,
+                                    score_ratio,
+                                    InterferenceType::RetrievalCompetition,
+                                    suppression,
+                                );
+                            }
                         }
                     } else {
                         winners.push((id.clone(), *score));
@@ -872,7 +891,7 @@ mod tests {
             ("mem-3".to_string(), 0.5, 0.70),  // Lower, should survive
         ];
 
-        let result = detector.apply_retrieval_competition(&candidates, "test query");
+        let result = detector.apply_retrieval_competition(&candidates, "test query", true);
 
         // Winner should be first
         assert_eq!(result.winners[0].0, "mem-1");

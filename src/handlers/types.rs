@@ -42,6 +42,9 @@ pub struct MemoryEvent {
     pub memory_type: Option<String>,
     pub importance: Option<f32>,
     pub count: Option<usize>,
+    /// Tags/entities for TUI display
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entities: Option<Vec<String>>,
     /// Full command results for rich TUI display (recall, proactive_context)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub results: Option<serde_json::Value>,
@@ -79,53 +82,6 @@ pub struct RecordResponse {
     pub created_at: String,
 }
 
-/// Simplified remember request - just content, auto-creates Experience
-#[derive(Deserialize)]
-pub struct RememberRequest {
-    pub user_id: String,
-    pub content: String,
-    /// Optional memory type (default: auto-classified)
-    #[serde(default)]
-    pub memory_type: Option<String>,
-    /// Optional tags/entities
-    #[serde(default)]
-    pub tags: Vec<String>,
-    /// Optional override timestamp (ISO 8601)
-    #[serde(default)]
-    pub created_at: Option<chrono::DateTime<chrono::Utc>>,
-    /// Optional emotional valence (-1.0 to 1.0)
-    #[serde(default)]
-    pub emotional_valence: Option<f32>,
-    /// Optional emotional arousal (0.0 to 1.0)
-    #[serde(default)]
-    pub emotional_arousal: Option<f32>,
-    /// Optional dominant emotion label
-    #[serde(default)]
-    pub emotion: Option<String>,
-    /// Optional source type
-    #[serde(default)]
-    pub source_type: Option<String>,
-    /// Optional credibility score (0.0 to 1.0)
-    #[serde(default)]
-    pub credibility: Option<f32>,
-    /// Optional episode ID for grouping related memories
-    #[serde(default)]
-    pub episode_id: Option<String>,
-    /// Optional sequence number within episode
-    #[serde(default)]
-    pub sequence_number: Option<u32>,
-    /// Optional preceding memory ID (for temporal chains)
-    #[serde(default)]
-    pub preceding_memory_id: Option<String>,
-}
-
-/// Simplified remember response
-#[derive(Serialize)]
-pub struct RememberResponse {
-    pub id: String,
-    pub stored: bool,
-}
-
 // =============================================================================
 // RECALL API
 // =============================================================================
@@ -137,9 +93,62 @@ pub struct RecallRequest {
     pub query: String,
     #[serde(default = "default_recall_limit")]
     pub limit: usize,
-    /// Retrieval mode: "semantic", "associative", or "hybrid" (default)
+    /// Retrieval mode: "semantic", "associative", "temporal", "spatial", "mission", "action_outcome", or "hybrid" (default)
     #[serde(default = "default_recall_mode")]
     pub mode: String,
+    /// Session ID for session-scoped retrieval (used with mode="temporal")
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+
+    // === Robotics Filters ===
+    /// Filter by robot/drone identifier
+    #[serde(default)]
+    pub robot_id: Option<String>,
+    /// Filter by mission identifier
+    #[serde(default)]
+    pub mission_id: Option<String>,
+    /// Spatial filter: center latitude (requires geo_lon and geo_radius_meters)
+    #[serde(default)]
+    pub geo_lat: Option<f64>,
+    /// Spatial filter: center longitude
+    #[serde(default)]
+    pub geo_lon: Option<f64>,
+    /// Spatial filter: search radius in meters
+    #[serde(default)]
+    pub geo_radius_meters: Option<f64>,
+    /// Filter by action type
+    #[serde(default)]
+    pub action_type: Option<String>,
+    /// Filter by minimum reward value
+    #[serde(default)]
+    pub reward_min: Option<f32>,
+    /// Filter by maximum reward value
+    #[serde(default)]
+    pub reward_max: Option<f32>,
+    /// Filter by outcome type: success, failure, partial, aborted, timeout
+    #[serde(default)]
+    pub outcome_type: Option<String>,
+    /// Filter for failures only
+    #[serde(default)]
+    pub failures_only: Option<bool>,
+    /// Filter by terrain type
+    #[serde(default)]
+    pub terrain_type: Option<String>,
+    /// Filter by tags (any match)
+    #[serde(default)]
+    pub tags: Option<Vec<String>>,
+    /// Enable retrieval diagnostics (per-stage timing, per-memory score attribution)
+    #[serde(default)]
+    pub debug: bool,
+    /// Offset for pagination (skip first N results, default 0)
+    #[serde(default)]
+    pub offset: usize,
+    /// Pipeline-layer attribution (RH-8). One of:
+    /// "vamana_only", "+spreading", "+bm25", "+rerank", "+facts", "full" (default).
+    /// Production callers omit this. The recall harness / per-layer eval set it
+    /// to attribute quality and latency deltas to specific stages.
+    #[serde(default)]
+    pub layers: Option<String>,
 }
 
 pub fn default_recall_limit() -> usize {
@@ -238,6 +247,9 @@ pub struct RecallMemory {
     pub created_at: String,
     pub score: f32,
     pub tier: String,
+    /// Per-memory score attribution (only when debug=true)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub score_attribution: Option<crate::memory::types::ScoreAttribution>,
 }
 
 #[derive(Serialize)]
@@ -245,84 +257,6 @@ pub struct RecallExperience {
     pub content: String,
     pub memory_type: Option<String>,
     pub tags: Vec<String>,
-}
-
-// =============================================================================
-// BATCH REMEMBER API
-// =============================================================================
-
-/// Batch remember request for bulk inserts
-#[derive(Deserialize)]
-pub struct BatchRememberRequest {
-    pub user_id: String,
-    pub memories: Vec<BatchMemoryItem>,
-    #[serde(default)]
-    pub options: BatchRememberOptions,
-}
-
-/// Options for batch remember operation
-#[derive(Deserialize)]
-pub struct BatchRememberOptions {
-    #[serde(default = "default_true")]
-    pub extract_entities: bool,
-    #[serde(default = "default_true")]
-    pub create_edges: bool,
-}
-
-fn default_true() -> bool {
-    true
-}
-
-impl Default for BatchRememberOptions {
-    fn default() -> Self {
-        Self {
-            extract_entities: true,
-            create_edges: true,
-        }
-    }
-}
-
-#[derive(Deserialize, Clone)]
-pub struct BatchMemoryItem {
-    pub content: String,
-    #[serde(default)]
-    pub memory_type: Option<String>,
-    #[serde(default)]
-    pub tags: Vec<String>,
-    #[serde(default)]
-    pub created_at: Option<chrono::DateTime<chrono::Utc>>,
-    #[serde(default)]
-    pub emotional_valence: Option<f32>,
-    #[serde(default)]
-    pub emotional_arousal: Option<f32>,
-    #[serde(default)]
-    pub emotion: Option<String>,
-    #[serde(default)]
-    pub source_type: Option<String>,
-    #[serde(default)]
-    pub credibility: Option<f32>,
-    #[serde(default)]
-    pub episode_id: Option<String>,
-    #[serde(default)]
-    pub sequence_number: Option<u32>,
-    #[serde(default)]
-    pub preceding_memory_id: Option<String>,
-}
-
-/// Error detail for a single item in batch
-#[derive(Serialize)]
-pub struct BatchErrorItem {
-    pub index: usize,
-    pub error: String,
-}
-
-#[derive(Serialize)]
-pub struct BatchRememberResponse {
-    pub created: usize,
-    pub failed: usize,
-    pub memory_ids: Vec<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub errors: Vec<BatchErrorItem>,
 }
 
 // =============================================================================
@@ -335,7 +269,7 @@ pub struct UpsertRequest {
     pub user_id: String,
     pub external_id: String,
     pub content: String,
-    #[serde(default)]
+    #[serde(default, alias = "type", alias = "experience_type")]
     pub memory_type: Option<String>,
     #[serde(default)]
     pub tags: Vec<String>,
@@ -345,6 +279,9 @@ pub struct UpsertRequest {
     pub changed_by: Option<String>,
     #[serde(default)]
     pub change_reason: Option<String>,
+    /// Optional importance override (0.0-1.0). When provided, bypasses auto-calculation.
+    #[serde(default)]
+    pub importance: Option<f32>,
 }
 
 fn default_change_type() -> String {
@@ -824,6 +761,7 @@ pub struct BuildVisualizationRequest {
 
 #[cfg(test)]
 mod tests {
+    use super::super::remember::{BatchRememberOptions, BatchRememberRequest, RememberRequest};
     use super::*;
     use serde_json::json;
 
@@ -902,6 +840,17 @@ mod tests {
     }
 
     #[test]
+    fn test_remember_request_accepts_type_alias() {
+        let json = json!({
+            "user_id": "test-user",
+            "content": "test content",
+            "type": "Decision"
+        });
+        let req: RememberRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(req.memory_type, Some("Decision".to_string()));
+    }
+
+    #[test]
     fn test_recall_request_defaults() {
         let json = json!({
             "user_id": "test-user",
@@ -969,6 +918,18 @@ mod tests {
     }
 
     #[test]
+    fn test_batch_remember_request_accepts_type_alias() {
+        let json = json!({
+            "user_id": "test-user",
+            "memories": [
+                {"content": "memory 1", "type": "Learning"}
+            ]
+        });
+        let req: BatchRememberRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(req.memories[0].memory_type, Some("Learning".to_string()));
+    }
+
+    #[test]
     fn test_upsert_request() {
         let json = json!({
             "user_id": "test-user",
@@ -978,6 +939,18 @@ mod tests {
         let req: UpsertRequest = serde_json::from_value(json).unwrap();
         assert_eq!(req.external_id, "linear:SHO-123");
         assert_eq!(req.change_type, "content_updated"); // default
+    }
+
+    #[test]
+    fn test_upsert_request_accepts_type_alias() {
+        let json = json!({
+            "user_id": "test-user",
+            "external_id": "linear:SHO-123",
+            "content": "issue content",
+            "type": "Context"
+        });
+        let req: UpsertRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(req.memory_type, Some("Context".to_string()));
     }
 
     #[test]
@@ -1036,6 +1009,7 @@ mod tests {
             memory_type: Some("Observation".to_string()),
             importance: Some(0.8),
             count: None,
+            entities: None,
             results: None,
         };
         let json = serde_json::to_string(&event).unwrap();

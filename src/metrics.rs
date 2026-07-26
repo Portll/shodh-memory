@@ -139,6 +139,52 @@ pub static MEMORY_RETRIEVE_RESULTS: LazyLock<HistogramVec> = LazyLock::new(|| {
 });
 
 // ============================================================================
+// Ontological Retrieval Metrics
+// ============================================================================
+
+/// Ontological intent confidence distribution per query
+pub static ONTOLOGICAL_INTENT_CONFIDENCE: LazyLock<Histogram> = LazyLock::new(|| {
+    Histogram::with_opts(
+        HistogramOpts::new(
+            "shodh_ontological_intent_confidence",
+            "Distribution of inferred ontological intent confidence scores",
+        )
+        .buckets(vec![0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]),
+    )
+    .expect("ONTOLOGICAL_INTENT_CONFIDENCE metric must be valid at compile time")
+});
+
+/// Ontological re-rank boost applied to individual memories (Layer 4.9)
+pub static ONTOLOGICAL_RERANK_BOOST_APPLIED: LazyLock<Histogram> = LazyLock::new(|| {
+    Histogram::with_opts(
+        HistogramOpts::new(
+            "shodh_ontological_rerank_boost",
+            "Distribution of ontological re-rank boost values applied to memories",
+        )
+        .buckets(vec![0.0, 0.02, 0.04, 0.08, 0.12, 0.16, 0.20, 0.25]),
+    )
+    .expect("ONTOLOGICAL_RERANK_BOOST_APPLIED metric must be valid at compile time")
+});
+
+/// Queries where ontological intent was below confidence threshold (fallback to unfiltered)
+pub static ONTOLOGICAL_FALLBACK_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
+    IntCounter::new(
+        "shodh_ontological_fallback_total",
+        "Queries where ontological intent was below confidence threshold",
+    )
+    .expect("ONTOLOGICAL_FALLBACK_TOTAL metric must be valid at compile time")
+});
+
+/// Queries where ontological filtering was disabled due to high graph density
+pub static ONTOLOGICAL_DENSITY_SKIP_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
+    IntCounter::new(
+        "shodh_ontological_density_skip_total",
+        "Queries where ontological filtering was disabled due to high graph density",
+    )
+    .expect("ONTOLOGICAL_DENSITY_SKIP_TOTAL metric must be valid at compile time")
+});
+
+// ============================================================================
 // Embedding Metrics (P1.2: Instrument embed operations)
 // ============================================================================
 
@@ -203,7 +249,10 @@ pub static ACTIVE_USERS: LazyLock<IntGauge> = LazyLock::new(|| {
 /// Total memories stored by tier (aggregate across all users)
 pub static MEMORIES_BY_TIER: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     IntGaugeVec::new(
-        Opts::new("shodh_memories_by_tier", "Total memories by tier"),
+        Opts::new(
+            "shodh_memories_by_tier",
+            "Total memories by tier across currently cached users",
+        ),
         &["tier"], // tier: "working", "session", "longterm"
     )
     .expect("MEMORIES_BY_TIER metric must be valid at compile time")
@@ -213,9 +262,99 @@ pub static MEMORIES_BY_TIER: LazyLock<IntGaugeVec> = LazyLock::new(|| {
 pub static MEMORY_HEAP_BYTES_TOTAL: LazyLock<IntGauge> = LazyLock::new(|| {
     IntGauge::new(
         "shodh_memory_heap_bytes_total",
-        "Total estimated heap usage across all users",
+        "Total estimated heap usage across currently cached users",
     )
     .expect("MEMORY_HEAP_BYTES_TOTAL metric must be valid at compile time")
+});
+
+/// Shared RocksDB block cache usage (single pool across all DB instances).
+pub static ROCKSDB_BLOCK_CACHE_USAGE_BYTES: LazyLock<IntGauge> = LazyLock::new(|| {
+    IntGauge::new(
+        "shodh_rocksdb_block_cache_usage_bytes",
+        "Bytes used in the shared RocksDB block cache (single pool across all DBs)",
+    )
+    .expect("ROCKSDB_BLOCK_CACHE_USAGE_BYTES metric must be valid at compile time")
+});
+
+/// Bytes pinned (unevictable) in the shared RocksDB block cache.
+pub static ROCKSDB_BLOCK_CACHE_PINNED_BYTES: LazyLock<IntGauge> = LazyLock::new(|| {
+    IntGauge::new(
+        "shodh_rocksdb_block_cache_pinned_bytes",
+        "Bytes pinned in the shared RocksDB block cache",
+    )
+    .expect("ROCKSDB_BLOCK_CACHE_PINNED_BYTES metric must be valid at compile time")
+});
+
+/// Configured shared RocksDB block cache capacity.
+pub static ROCKSDB_BLOCK_CACHE_CAPACITY_BYTES: LazyLock<IntGauge> = LazyLock::new(|| {
+    IntGauge::new(
+        "shodh_rocksdb_block_cache_capacity_bytes",
+        "Configured capacity of the shared RocksDB block cache",
+    )
+    .expect("ROCKSDB_BLOCK_CACHE_CAPACITY_BYTES metric must be valid at compile time")
+});
+
+/// Sum of memtable bytes across all CFs of all cached users' DBs.
+pub static ROCKSDB_MEMTABLES_BYTES: LazyLock<IntGauge> = LazyLock::new(|| {
+    IntGauge::new(
+        "shodh_rocksdb_memtables_bytes",
+        "Active+immutable memtable bytes summed across cached users' DBs",
+    )
+    .expect("ROCKSDB_MEMTABLES_BYTES metric must be valid at compile time")
+});
+
+/// Sum of table-reader (index/filter) bytes outside the block cache.
+pub static ROCKSDB_TABLE_READERS_BYTES: LazyLock<IntGauge> = LazyLock::new(|| {
+    IntGauge::new(
+        "shodh_rocksdb_table_readers_bytes",
+        "Estimated table-reader bytes outside the block cache, cached users' DBs",
+    )
+    .expect("ROCKSDB_TABLE_READERS_BYTES metric must be valid at compile time")
+});
+
+/// Resident set size for the server process, when available.
+pub static PROCESS_RSS_BYTES: LazyLock<IntGauge> = LazyLock::new(|| {
+    IntGauge::new(
+        "shodh_process_rss_bytes",
+        "Resident set size for the server process",
+    )
+    .expect("PROCESS_RSS_BYTES metric must be valid at compile time")
+});
+
+/// Peak resident set size for the server process, when available.
+pub static PROCESS_PEAK_RSS_BYTES: LazyLock<IntGauge> = LazyLock::new(|| {
+    IntGauge::new(
+        "shodh_process_peak_rss_bytes",
+        "Peak resident set size for the server process",
+    )
+    .expect("PROCESS_PEAK_RSS_BYTES metric must be valid at compile time")
+});
+
+/// Virtual memory size for the server process, when available.
+pub static PROCESS_VIRTUAL_BYTES: LazyLock<IntGauge> = LazyLock::new(|| {
+    IntGauge::new(
+        "shodh_process_virtual_bytes",
+        "Virtual memory size for the server process",
+    )
+    .expect("PROCESS_VIRTUAL_BYTES metric must be valid at compile time")
+});
+
+/// Current cgroup memory usage for the server, when available.
+pub static CGROUP_MEMORY_CURRENT_BYTES: LazyLock<IntGauge> = LazyLock::new(|| {
+    IntGauge::new(
+        "shodh_cgroup_memory_current_bytes",
+        "Current cgroup memory usage for the server process",
+    )
+    .expect("CGROUP_MEMORY_CURRENT_BYTES metric must be valid at compile time")
+});
+
+/// Peak cgroup memory usage for the server, when available.
+pub static CGROUP_MEMORY_PEAK_BYTES: LazyLock<IntGauge> = LazyLock::new(|| {
+    IntGauge::new(
+        "shodh_cgroup_memory_peak_bytes",
+        "Peak cgroup memory usage for the server process",
+    )
+    .expect("CGROUP_MEMORY_PEAK_BYTES metric must be valid at compile time")
 });
 
 // ============================================================================
@@ -226,7 +365,7 @@ pub static MEMORY_HEAP_BYTES_TOTAL: LazyLock<IntGauge> = LazyLock::new(|| {
 pub static VECTOR_INDEX_SIZE_TOTAL: LazyLock<IntGauge> = LazyLock::new(|| {
     IntGauge::new(
         "shodh_vector_index_size_total",
-        "Total number of vectors in all indices",
+        "Total number of vectors across currently cached user indices",
     )
     .expect("VECTOR_INDEX_SIZE_TOTAL metric must be valid at compile time")
 });
@@ -466,6 +605,49 @@ pub static EMBEDDING_CACHE_CONTENT_SIZE: LazyLock<IntGauge> = LazyLock::new(|| {
     .expect("EMBEDDING_CACHE_CONTENT_SIZE metric must be valid at compile time")
 });
 
+fn set_optional_gauge(gauge: &IntGauge, value: Option<u64>) {
+    if let Some(value) = value {
+        set_u64_gauge(gauge, value);
+    }
+}
+
+fn set_u64_gauge(gauge: &IntGauge, value: u64) {
+    gauge.set(value.min(i64::MAX as u64) as i64);
+}
+
+/// Update best-effort process/cgroup memory gauges.
+pub fn update_system_memory_metrics(diagnostics: &crate::system_memory::SystemMemoryDiagnostics) {
+    set_optional_gauge(&PROCESS_RSS_BYTES, diagnostics.process_rss_bytes);
+    set_optional_gauge(&PROCESS_PEAK_RSS_BYTES, diagnostics.process_peak_rss_bytes);
+    set_optional_gauge(&PROCESS_VIRTUAL_BYTES, diagnostics.process_virtual_bytes);
+    set_optional_gauge(
+        &CGROUP_MEMORY_CURRENT_BYTES,
+        diagnostics.cgroup_memory_current_bytes,
+    );
+    set_optional_gauge(
+        &CGROUP_MEMORY_PEAK_BYTES,
+        diagnostics.cgroup_memory_peak_bytes,
+    );
+}
+
+/// Update the RocksDB memory-decomposition gauges (the #90 instrument).
+pub fn update_rocksdb_memory_metrics(d: &crate::system_memory::RocksDbMemoryDiagnostics) {
+    set_u64_gauge(
+        &ROCKSDB_BLOCK_CACHE_USAGE_BYTES,
+        d.shared_block_cache_usage_bytes,
+    );
+    set_u64_gauge(
+        &ROCKSDB_BLOCK_CACHE_PINNED_BYTES,
+        d.shared_block_cache_pinned_bytes,
+    );
+    set_u64_gauge(
+        &ROCKSDB_BLOCK_CACHE_CAPACITY_BYTES,
+        d.shared_block_cache_capacity_bytes,
+    );
+    set_u64_gauge(&ROCKSDB_MEMTABLES_BYTES, d.user_memtables_bytes);
+    set_u64_gauge(&ROCKSDB_TABLE_READERS_BYTES, d.user_table_readers_bytes);
+}
+
 /// Register all metrics with the global registry
 ///
 /// # Returns
@@ -510,6 +692,21 @@ fn do_register_metrics() -> Result<(), MetricsError> {
     register!(MEMORY_RETRIEVE_DURATION, "MEMORY_RETRIEVE_DURATION");
     register!(MEMORY_RETRIEVE_RESULTS, "MEMORY_RETRIEVE_RESULTS");
 
+    // Ontological retrieval metrics
+    register!(
+        ONTOLOGICAL_INTENT_CONFIDENCE,
+        "ONTOLOGICAL_INTENT_CONFIDENCE"
+    );
+    register!(
+        ONTOLOGICAL_RERANK_BOOST_APPLIED,
+        "ONTOLOGICAL_RERANK_BOOST_APPLIED"
+    );
+    register!(ONTOLOGICAL_FALLBACK_TOTAL, "ONTOLOGICAL_FALLBACK_TOTAL");
+    register!(
+        ONTOLOGICAL_DENSITY_SKIP_TOTAL,
+        "ONTOLOGICAL_DENSITY_SKIP_TOTAL"
+    );
+
     // Embedding metrics
     register!(EMBEDDING_GENERATE_TOTAL, "EMBEDDING_GENERATE_TOTAL");
     register!(EMBEDDING_GENERATE_DURATION, "EMBEDDING_GENERATE_DURATION");
@@ -520,6 +717,25 @@ fn do_register_metrics() -> Result<(), MetricsError> {
     register!(ACTIVE_USERS, "ACTIVE_USERS");
     register!(MEMORIES_BY_TIER, "MEMORIES_BY_TIER");
     register!(MEMORY_HEAP_BYTES_TOTAL, "MEMORY_HEAP_BYTES_TOTAL");
+    register!(PROCESS_RSS_BYTES, "PROCESS_RSS_BYTES");
+    register!(PROCESS_PEAK_RSS_BYTES, "PROCESS_PEAK_RSS_BYTES");
+    register!(PROCESS_VIRTUAL_BYTES, "PROCESS_VIRTUAL_BYTES");
+    register!(CGROUP_MEMORY_CURRENT_BYTES, "CGROUP_MEMORY_CURRENT_BYTES");
+    register!(CGROUP_MEMORY_PEAK_BYTES, "CGROUP_MEMORY_PEAK_BYTES");
+    register!(
+        ROCKSDB_BLOCK_CACHE_USAGE_BYTES,
+        "ROCKSDB_BLOCK_CACHE_USAGE_BYTES"
+    );
+    register!(
+        ROCKSDB_BLOCK_CACHE_PINNED_BYTES,
+        "ROCKSDB_BLOCK_CACHE_PINNED_BYTES"
+    );
+    register!(
+        ROCKSDB_BLOCK_CACHE_CAPACITY_BYTES,
+        "ROCKSDB_BLOCK_CACHE_CAPACITY_BYTES"
+    );
+    register!(ROCKSDB_MEMTABLES_BYTES, "ROCKSDB_MEMTABLES_BYTES");
+    register!(ROCKSDB_TABLE_READERS_BYTES, "ROCKSDB_TABLE_READERS_BYTES");
 
     // Vector index metrics (aggregate)
     register!(VECTOR_INDEX_SIZE_TOTAL, "VECTOR_INDEX_SIZE_TOTAL");

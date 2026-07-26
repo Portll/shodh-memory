@@ -52,7 +52,7 @@ impl SemanticFactStore {
     pub fn store(&self, user_id: &str, fact: &SemanticFact) -> Result<()> {
         // Primary storage
         let key = format!("facts:{}:{}", user_id, fact.id);
-        let value = bincode::serde::encode_to_vec(fact, bincode::config::standard())?;
+        let value = crate::serialization::encode(fact)?;
         self.db.put(key.as_bytes(), &value)?;
 
         // Entity index - index by each related entity
@@ -90,8 +90,7 @@ impl SemanticFactStore {
         let key = format!("facts:{}:{}", user_id, fact_id);
         match self.db.get(key.as_bytes())? {
             Some(data) => {
-                let (fact, _): (SemanticFact, _) =
-                    bincode::serde::decode_from_slice(&data, bincode::config::standard())?;
+                let (fact, _) = crate::serialization::try_decode::<SemanticFact>(&data)?;
                 Ok(Some(fact))
             }
             None => Ok(None),
@@ -99,12 +98,27 @@ impl SemanticFactStore {
     }
 
     /// Update an existing fact (for reinforcement)
+    ///
+    /// Rebuilds entity and type indices in case content/entities changed.
     pub fn update(&self, user_id: &str, fact: &SemanticFact) -> Result<()> {
-        // Simply overwrite - indices stay valid since ID doesn't change
-        let key = format!("facts:{}:{}", user_id, fact.id);
-        let value = bincode::serde::encode_to_vec(fact, bincode::config::standard())?;
-        self.db.put(key.as_bytes(), &value)?;
-        Ok(())
+        // Clean up old indices if the fact existed (entities/type may have changed)
+        if let Some(old_fact) = self.get(user_id, &fact.id)? {
+            for entity in &old_fact.related_entities {
+                let entity_key = format!(
+                    "facts_by_entity:{}:{}:{}",
+                    user_id,
+                    entity.to_lowercase(),
+                    fact.id
+                );
+                let _ = self.db.delete(entity_key.as_bytes());
+            }
+            let old_type_name = format!("{:?}", old_fact.fact_type);
+            let old_type_key = format!("facts_by_type:{}:{}:{}", user_id, old_type_name, fact.id);
+            let _ = self.db.delete(old_type_key.as_bytes());
+        }
+
+        // Re-store with fresh indices
+        self.store(user_id, fact)
     }
 
     /// Delete a fact
@@ -164,12 +178,7 @@ impl SemanticFactStore {
                 continue;
             }
 
-            if let Ok(fact) = bincode::serde::decode_from_slice::<SemanticFact, _>(
-                &value,
-                bincode::config::standard(),
-            )
-            .map(|(v, _)| v)
-            {
+            if let Ok((fact, _)) = crate::serialization::try_decode::<SemanticFact>(&value) {
                 facts.push(fact);
                 if facts.len() >= limit {
                     break;
@@ -326,10 +335,7 @@ impl SemanticFactStore {
             if key_str.matches(':').count() > 2 {
                 continue;
             }
-            if let Ok((fact, _)) = bincode::serde::decode_from_slice::<SemanticFact, _>(
-                &value,
-                bincode::config::standard(),
-            ) {
+            if let Ok((fact, _)) = crate::serialization::try_decode::<SemanticFact>(&value) {
                 let millis = fact.created_at.timestamp_millis();
                 max_millis = Some(max_millis.map_or(millis, |cur| cur.max(millis)));
             }
@@ -431,14 +437,14 @@ impl SemanticFactStore {
                         }
 
                         // Passed all gates — rank by cosine
-                        if best_match.as_ref().map_or(true, |(s, _)| cosine > *s) {
+                        if best_match.as_ref().is_none_or(|(s, _)| cosine > *s) {
                             best_match = Some((cosine, fact));
                         }
                     }
                     _ => {
                         // No stored embedding — fall back to Jaccard-only for this candidate
                         if jaccard >= FACT_DEDUP_JACCARD_FALLBACK
-                            && best_match.as_ref().map_or(true, |(s, _)| jaccard > *s)
+                            && best_match.as_ref().is_none_or(|(s, _)| jaccard > *s)
                         {
                             best_match = Some((jaccard, fact));
                         }
@@ -465,7 +471,7 @@ impl SemanticFactStore {
     /// Stored separately from SemanticFact struct for backward compatibility.
     pub fn store_embedding(&self, user_id: &str, fact_id: &str, embedding: &[f32]) -> Result<()> {
         let key = format!("facts_embedding:{user_id}:{fact_id}");
-        let value = bincode::serde::encode_to_vec(embedding, bincode::config::standard())?;
+        let value = crate::serialization::encode(embedding)?;
         self.db.put(key.as_bytes(), &value)?;
         Ok(())
     }
@@ -475,8 +481,7 @@ impl SemanticFactStore {
         let key = format!("facts_embedding:{user_id}:{fact_id}");
         match self.db.get(key.as_bytes())? {
             Some(data) => {
-                let (embedding, _): (Vec<f32>, _) =
-                    bincode::serde::decode_from_slice(&data, bincode::config::standard())?;
+                let (embedding, _) = crate::serialization::try_decode::<Vec<f32>>(&data)?;
                 Ok(Some(embedding))
             }
             None => Ok(None),
@@ -525,6 +530,88 @@ impl SemanticFactStore {
         }
 
         Ok(users.into_iter().collect())
+    }
+
+    /// Purge duplicate facts — analogous to synaptic consolidation where
+    /// redundant traces merge into a single strong engram (Tononi & Cirelli 2014,
+    /// synaptic homeostasis hypothesis: sleep prunes redundant synapses while
+    /// strengthening unique traces).
+    ///
+    /// Groups facts by normalized text, keeps highest-support version,
+    /// merges source_memories from duplicates into the survivor.
+    pub fn purge_duplicates(&self, user_id: &str) -> Result<usize> {
+        let all_facts = self.list(user_id, 10_000)?;
+        if all_facts.is_empty() {
+            return Ok(0);
+        }
+
+        // Group by normalized text: lowercase, trimmed, collapsed whitespace
+        let mut groups: std::collections::HashMap<String, Vec<SemanticFact>> =
+            std::collections::HashMap::new();
+        for fact in all_facts {
+            let normalized: String = fact
+                .fact
+                .to_lowercase()
+                .split_whitespace()
+                .collect::<Vec<&str>>()
+                .join(" ");
+            groups.entry(normalized).or_default().push(fact);
+        }
+
+        let mut purged = 0;
+        for (_key, mut group) in groups {
+            if group.len() < 2 {
+                continue;
+            }
+
+            // Keep the fact with highest support_count (strongest trace)
+            group.sort_by(|a, b| b.support_count.cmp(&a.support_count));
+            let mut survivor = group.remove(0);
+
+            // Merge source_memories from duplicates into survivor
+            let mut all_sources: std::collections::HashSet<crate::memory::types::MemoryId> =
+                survivor.source_memories.iter().cloned().collect();
+            for dup in &group {
+                for src in &dup.source_memories {
+                    all_sources.insert(src.clone());
+                }
+                survivor.support_count += dup.support_count;
+            }
+            survivor.source_memories = all_sources.into_iter().collect();
+            survivor.last_reinforced = chrono::Utc::now();
+            self.update(user_id, &survivor)?;
+
+            // Delete duplicates
+            for dup in &group {
+                self.delete(user_id, &dup.id)?;
+                purged += 1;
+            }
+        }
+
+        Ok(purged)
+    }
+
+    /// Purge noise facts that predate the quality filter — analogous to
+    /// retroactive interference cleanup: the brain's consolidation process
+    /// revisits existing traces and prunes those that no longer pass the
+    /// hippocampal quality gate (Frankland & Bontempi 2005).
+    ///
+    /// Runs each stored fact through `is_knowledge_worthy()` and deletes
+    /// facts that fail (noise that was stored before the filter existed).
+    pub fn purge_noise_facts(&self, user_id: &str) -> Result<usize> {
+        use super::compression::SemanticConsolidator;
+
+        let all_facts = self.list(user_id, 10_000)?;
+        let mut purged = 0;
+
+        for fact in &all_facts {
+            if !SemanticConsolidator::is_knowledge_worthy(&fact.fact) {
+                self.delete(user_id, &fact.id)?;
+                purged += 1;
+            }
+        }
+
+        Ok(purged)
     }
 }
 

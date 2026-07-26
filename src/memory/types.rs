@@ -52,6 +52,63 @@ pub enum ExperienceType {
     Intention,
 }
 
+impl ExperienceType {
+    /// Write-time edge weight multiplier for graph ingestion.
+    ///
+    /// Intentional types (Decision, Learning, Discovery) get full weight.
+    /// Auto-generated noise types (CodeEdit, Command, FileAccess, Search) get
+    /// dampened to prevent their 6:1 volume advantage from dominating graph
+    /// traversal over intentional memories.
+    ///
+    /// Applied multiplicatively to `L1Working.initial_weight()` in
+    /// `process_experience_into_graph`.
+    pub fn edge_weight_multiplier(&self) -> f32 {
+        use crate::constants::*;
+        match self {
+            Self::Decision => EDGE_WEIGHT_MULT_DECISION,
+            Self::Learning => EDGE_WEIGHT_MULT_LEARNING,
+            Self::Discovery => EDGE_WEIGHT_MULT_DISCOVERY,
+            Self::Error => EDGE_WEIGHT_MULT_ERROR,
+            Self::Pattern => EDGE_WEIGHT_MULT_PATTERN,
+            Self::Observation => EDGE_WEIGHT_MULT_OBSERVATION,
+            Self::Context => EDGE_WEIGHT_MULT_CONTEXT,
+            Self::Task => EDGE_WEIGHT_MULT_TASK,
+            Self::Conversation => EDGE_WEIGHT_MULT_CONVERSATION,
+            Self::CodeEdit => EDGE_WEIGHT_MULT_CODE_EDIT,
+            Self::FileAccess => EDGE_WEIGHT_MULT_FILE_ACCESS,
+            Self::Search => EDGE_WEIGHT_MULT_SEARCH,
+            Self::Command => EDGE_WEIGHT_MULT_COMMAND,
+            Self::Intention => EDGE_WEIGHT_MULT_INTENTION,
+        }
+    }
+
+    /// Retrieval-time activation multiplier for spreading activation.
+    ///
+    /// Applied to `final_score` when resolving episodes to memories during
+    /// graph-based retrieval. Complementary to write-time dampening — stacks
+    /// multiplicatively. CodeEdit memories still surface through vector search
+    /// (Layers 1/3) when semantically relevant; only the graph path is dampened.
+    pub fn activation_multiplier(&self) -> f32 {
+        use crate::constants::*;
+        match self {
+            Self::Decision => ACTIVATION_MULT_DECISION,
+            Self::Learning => ACTIVATION_MULT_LEARNING,
+            Self::Discovery => ACTIVATION_MULT_DISCOVERY,
+            Self::Error => ACTIVATION_MULT_ERROR,
+            Self::Pattern => ACTIVATION_MULT_PATTERN,
+            Self::Observation => ACTIVATION_MULT_OBSERVATION,
+            Self::Context => ACTIVATION_MULT_CONTEXT,
+            Self::Task => ACTIVATION_MULT_TASK,
+            Self::Conversation => ACTIVATION_MULT_CONVERSATION,
+            Self::CodeEdit => ACTIVATION_MULT_CODE_EDIT,
+            Self::FileAccess => ACTIVATION_MULT_FILE_ACCESS,
+            Self::Search => ACTIVATION_MULT_SEARCH,
+            Self::Command => ACTIVATION_MULT_COMMAND,
+            Self::Intention => ACTIVATION_MULT_INTENTION,
+        }
+    }
+}
+
 /// Default experience type for minimal API calls
 fn default_experience_type() -> ExperienceType {
     ExperienceType::Observation
@@ -510,14 +567,6 @@ pub struct EpisodeContext {
     #[serde(default)]
     pub episode_start: Option<DateTime<Utc>>,
 
-    /// Is this the first memory in the episode?
-    #[serde(default)]
-    pub is_episode_start: bool,
-
-    /// Is this the last memory in the episode?
-    #[serde(default)]
-    pub is_episode_end: bool,
-
     /// Parent episode (for hierarchical episodes)
     /// E.g., a conversation within a larger task session
     #[serde(default)]
@@ -555,17 +604,6 @@ pub enum RelationshipType {
     Opposite,  // Antonym/opposite
 }
 
-/// Raw experience data to be stored (ENHANCED with smart defaults)
-///
-/// Only `content` is required. All other fields have intelligent defaults:
-/// - experience_type: Defaults to Observation
-/// - context: Optional (null by default)
-/// - entities: Empty vector (auto-extracted if empty)
-/// - metadata: Empty HashMap
-/// - embeddings: Optional (auto-generated)
-/// - related_memories: Empty vector
-/// - causal_chain: Empty vector
-/// - outcomes: Empty vector
 /// Structured NER entity record preserving type classification and confidence.
 /// Used to carry NER results from handler through to graph insertion
 /// without losing type information (Person, Organization, Location, Misc).
@@ -581,8 +619,60 @@ pub struct NerEntityRecord {
     /// Character offset of entity end in source content
     #[serde(default)]
     pub end_char: Option<usize>,
+    /// GLiNER fine label (schema leaf, e.g. "bridge") of the top-scoring span,
+    /// carried from Pass-1 NER through to graph insertion so `EntityNode.fine_type`
+    /// and the precise primary label survive. `None` on the rule-based path.
+    #[serde(default)]
+    pub fine_label: Option<String>,
 }
 
+/// Raw per-episode surprise components, computed at ingest from graph
+/// statistics already in hand in the entity-pair loop (PMI document
+/// frequencies, typing-chain counters, entity reputations). These are the
+/// FACTS of the episode's statistical shape — deliberately NOT a single
+/// weighted "anomaly score". Deviation scoring (z-scores against the user's
+/// rolling baseline) happens at READ time so thresholds stay tunable without
+/// re-ingesting, and every flag stays explainable component-by-component
+/// ("mean PMI 3σ below corpus norm; 60% never-seen entities").
+///
+/// Persisted as JSON under [`SURPRISE_METADATA_KEY`] in the graph episode's
+/// metadata map — additive, no storage schema change.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SurpriseComponents {
+    /// Mean birth-PMI across scored pairs: log2(N / (df_i·df_j)) at co=1.
+    /// LOW mean = the episode's pairs co-occur no more than chance given how
+    /// common the entities are — an unusual combination of familiar things.
+    pub mean_pmi: f32,
+    /// Fraction of this episode's entities never seen before (lexically new
+    /// to the name index; embedding-merge in add_entity may still dedup some).
+    pub novel_entity_ratio: f32,
+    /// Fraction of pairs the typing chain could NOT type (generic CoOccurs):
+    /// unrecognized structure. High = novel relational shape.
+    pub untyped_ratio: f32,
+    /// Fraction of pairs dropped by the PMI gate as chance-level co-occurrence.
+    pub pmi_gated_ratio: f32,
+    /// Fraction of pairs whose weaker endpoint has hub-like (low) selectivity.
+    pub low_selectivity_share: f32,
+    /// Number of entity pairs the components were computed over.
+    pub pairs_scored: u32,
+    /// Number of entities in the episode.
+    pub entities_total: u32,
+}
+
+/// Episode-metadata key under which [`SurpriseComponents`] is stored as JSON.
+pub const SURPRISE_METADATA_KEY: &str = "shodh.surprise";
+
+/// Raw experience data to be stored (ENHANCED with smart defaults)
+///
+/// Only `content` is required. All other fields have intelligent defaults:
+/// - experience_type: Defaults to Observation
+/// - context: Optional (null by default)
+/// - entities: Empty vector (auto-extracted if empty)
+/// - metadata: Empty HashMap
+/// - embeddings: Optional (auto-generated)
+/// - related_memories: Empty vector
+/// - causal_chain: Empty vector
+/// - outcomes: Empty vector
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Experience {
     /// Type of experience (defaults to Observation)
@@ -794,6 +884,11 @@ pub struct Experience {
     /// Pre-computed by handler to avoid redundant content parsing in downstream passes
     #[serde(default)]
     pub cooccurrence_pairs: Vec<(String, String)>,
+
+    /// Optional importance override (0.0-1.0). When set, bypasses calculate_importance().
+    /// Used by hooks and auto-ingest where importance is known from caller context.
+    #[serde(default)]
+    pub importance_override: Option<f32>,
 }
 
 impl Default for Experience {
@@ -842,6 +937,7 @@ impl Default for Experience {
             temporal_refs: Vec::new(),
             ner_entities: Vec::new(),
             cooccurrence_pairs: Vec::new(),
+            importance_override: None,
         }
     }
 }
@@ -881,9 +977,10 @@ pub struct EntityRef {
 }
 
 /// Memory tier in the cognitive hierarchy
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum MemoryTier {
     /// Active, immediate context (Cowan's focus of attention)
+    #[default]
     Working,
     /// Current task/session context
     Session,
@@ -891,12 +988,6 @@ pub enum MemoryTier {
     LongTerm,
     /// Compressed archival storage
     Archive,
-}
-
-impl Default for MemoryTier {
-    fn default() -> Self {
-        MemoryTier::Working
-    }
 }
 
 /// Type of change made to a memory
@@ -1080,6 +1171,7 @@ impl Memory {
     }
 
     /// Create a new memory linked to an external system (enables upsert)
+    #[allow(clippy::too_many_arguments)]
     pub fn new_with_external_id(
         id: MemoryId,
         experience: Experience,
@@ -1516,10 +1608,15 @@ impl MemoryTreeNode {
             "├── "
         };
 
-        // Truncate content for display
+        // Truncate content for display on a CHAR boundary, not a byte index:
+        // `&content[..57]` panics when byte 57 falls inside a multi-byte UTF-8
+        // codepoint (e.g. CJK/emoji content), and the `len() > 60` byte guard
+        // did not prevent that. `char_truncate` returns the whole string when it
+        // is already short, so an unchanged length means no ellipsis is needed.
         let content = &self.memory.experience.content;
-        let display_content = if content.len() > 60 {
-            format!("{}...", &content[..57])
+        let preview = crate::memory::char_truncate(content, 57);
+        let display_content = if preview.len() < content.len() {
+            format!("{preview}...")
         } else {
             content.clone()
         };
@@ -1972,11 +2069,27 @@ pub struct Query {
     /// This enables "future informs present" - pending reminders influence recall
     pub prospective_signals: Option<Vec<String>>,
 
+    // === Query-side NER (SHODH_QUERY_NER) ===
+    /// Entity names extracted from the query text by the NEURAL NER model,
+    /// annotated by the caller that owns the model (recall handler / eval
+    /// runner). When present, these AUGMENT the heuristic focal entities as
+    /// graph-leg seeds — the POS-heuristic extractor measurably tags verbs and
+    /// months as entities while missing real ones (audit 2026-06-10), and the
+    /// 17MB NER model that fixes this at ingest never saw queries until now.
+    pub ner_entities: Option<Vec<String>>,
+
     // === Episode Context (SHO-temporal) ===
     /// Episode ID for context-aware retrieval
     /// When set, memories from the same episode get a coherence boost
     /// This prevents episode bleeding where unrelated memories mix in results
     pub episode_id: Option<String>,
+
+    // === Session Context ===
+    /// Session ID for session-scoped retrieval
+    /// When set with Temporal retrieval mode, retrieves memories stored during
+    /// the specified session's time window. Enables "what did we discuss in
+    /// yesterday's session?" queries.
+    pub session_id: Option<String>,
 
     // === Scoring Parameters ===
     /// Weight for recency boost in unified scoring (0.0-1.0)
@@ -1990,6 +2103,13 @@ pub struct Query {
     // === Pagination (SHO-69) ===
     /// Offset for pagination (skip first N results)
     pub offset: usize,
+
+    // === Pipeline-Layer Attribution (RH-8, #270) ===
+    /// Which slice of the recall pipeline to run. Production callers leave
+    /// this at the default (`Full`) and get the existing behavior. The
+    /// recall harness sets lower modes to attribute quality deltas to
+    /// specific stages. See `LayerMode` docs.
+    pub layers: LayerMode,
 }
 
 /// Paginated search results with metadata for "load more" patterns (SHO-69)
@@ -2048,6 +2168,7 @@ impl Default for Query {
             user_id: None,
             query_text: None,
             query_embedding: None,
+            ner_entities: None,
             time_range: None,
             experience_types: None,
             importance_threshold: None,
@@ -2066,10 +2187,12 @@ impl Default for Query {
             confidence_range: None,
             prospective_signals: None,
             episode_id: None,
+            session_id: None,
             recency_weight: None,
             max_results: DEFAULT_MAX_RESULTS,
             retrieval_mode: RetrievalMode::Hybrid,
             offset: 0,
+            layers: LayerMode::Full,
         }
     }
 }
@@ -2183,24 +2306,22 @@ impl Query {
             }
         }
 
-        // Failures only filter
+        // Failures only filter — check both outcome_type strings AND is_failure boolean
         if self.failures_only {
-            let is_failure = memory
+            let outcome_is_failure = memory
                 .experience
                 .outcome_type
                 .as_ref()
                 .map(|o| o == "failure" || o == "failed" || o == "error")
                 .unwrap_or(false);
-            if !is_failure {
+            if !outcome_is_failure && !memory.experience.is_failure {
                 return false;
             }
         }
 
         // Anomalies only filter
-        if self.anomalies_only {
-            if !memory.experience.is_anomaly {
-                return false;
-            }
+        if self.anomalies_only && !memory.experience.is_anomaly {
+            return false;
         }
 
         // Severity filter
@@ -2361,6 +2482,74 @@ pub enum RetrievalMode {
     Spatial,       // Geo-location based retrieval
     Mission,       // Mission context retrieval
     ActionOutcome, // Reward-based learning retrieval
+}
+
+/// Pipeline-layer attribution mode for the recall harness (RH-8, #270).
+///
+/// Cumulative — each variant turns on one more pipeline stage on top of the
+/// prior. Production code never touches this; the default is `Full`. The
+/// recall harness drives lower modes from its CLI to attribute quality
+/// deltas to specific pipeline stages.
+///
+/// Ordering reflects "how much pipeline is active":
+/// `VamanaOnly < PlusSpreading < PlusBm25 < PlusRerank < PlusFacts < Full`.
+/// Stage gates inside `semantic_retrieve_inner` use `mode >= LayerMode::X`
+/// to enable the corresponding stage.
+///
+/// **Note on `PlusRerank`:** issue #270 labels this `+rerank` and describes
+/// it as "+ cross-encoder". This codebase has **no cross-encoder**. The only
+/// rerank present is the ontological rerank at Layer 4.9 (multiplicative
+/// boost when episode entity types match expected ontology labels). The
+/// label is preserved for spec fidelity; the documented stage is what
+/// actually runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum LayerMode {
+    /// Layer 3 vector ANN only. Score is raw cosine. No graph, no BM25,
+    /// no Layer 5 cognitive adjustments, no retrieval competition.
+    VamanaOnly,
+    /// + Layer 2 graph spreading activation. Ranking is the union of
+    /// vector and graph candidates ordered by raw fused score.
+    PlusSpreading,
+    /// + Layer 4 lexical/RRF fusion (vector + graph + BM25 via three-way
+    /// reciprocal rank fusion).
+    PlusBm25,
+    /// + Layer 4.9 ontological rerank (multiplicative entity-type boost).
+    /// Spec-aliased as `+rerank` in #270 — see enum-level docs.
+    PlusRerank,
+    /// + Layer 0.7 fact source pre-fetch and Layer 4.8 fact-source boost.
+    PlusFacts,
+    /// Production. Everything: temporal pre-filter (Layer 0.4), attribute
+    /// detection (0.5), temporal facts (0.6), Layer 5 unified scoring,
+    /// retrieval competition + Hebbian coactivation.
+    #[default]
+    Full,
+}
+
+impl LayerMode {
+    /// Stable string identifier emitted into the recall harness JSON
+    /// report. Matches the labels used in #270 exactly so downstream
+    /// tooling (markdown diff, dashboards) can rely on them.
+    pub fn report_key(self) -> &'static str {
+        match self {
+            Self::VamanaOnly => "vamana_only",
+            Self::PlusSpreading => "+spreading",
+            Self::PlusBm25 => "+bm25",
+            Self::PlusRerank => "+rerank",
+            Self::PlusFacts => "+facts",
+            Self::Full => "full",
+        }
+    }
+
+    /// All variants in ascending pipeline coverage order. Used by the
+    /// `--layer all` CLI expansion in the recall harness.
+    pub const ALL: [LayerMode; 6] = [
+        LayerMode::VamanaOnly,
+        LayerMode::PlusSpreading,
+        LayerMode::PlusBm25,
+        LayerMode::PlusRerank,
+        LayerMode::PlusFacts,
+        LayerMode::Full,
+    ];
 }
 
 /// Criteria for forgetting memories
@@ -2591,8 +2780,7 @@ impl SessionMemory {
 
     /// Add shared memory (zero-copy)
     pub fn add_shared(&mut self, memory: SharedMemory) -> anyhow::Result<()> {
-        let memory_size =
-            bincode::serde::encode_to_vec(&*memory, bincode::config::standard())?.len();
+        let memory_size = crate::serialization::encode_raw(&*memory)?.len();
 
         // Check if adding would exceed limit
         if self.current_size_bytes + memory_size > self.max_size_mb * 1024 * 1024 {
@@ -2858,6 +3046,94 @@ pub struct RetrievalStats {
     /// Not serialized - internal use only for wiring strengthening calls
     #[serde(skip)]
     pub traversed_edges: Vec<uuid::Uuid>,
+
+    /// Per-stage timing breakdown (only when debug=true)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stage_timings: Option<StageTiming>,
+
+    /// Per-memory score attribution (only when debug=true)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub score_attributions: Option<Vec<ScoreAttribution>>,
+}
+
+/// Per-stage timing breakdown in microseconds.
+///
+/// Covers the full retrieval pipeline from query analysis through final scoring.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct StageTiming {
+    /// Layers 0.4-0.7: temporal analysis, attribute detection, fact lookups
+    pub query_analysis_us: u64,
+    /// Embedding generation (cache hit = ~0, miss = ~80ms)
+    pub embedding_us: u64,
+    /// Layers 1-2: episode coherence + graph spreading activation
+    pub graph_expansion_us: u64,
+    /// Layer 3: Vamana ANN vector search
+    pub vector_search_us: u64,
+    /// Layer 4: BM25 + RRF fusion + all sub-boosts (4.5-4.9)
+    pub fusion_us: u64,
+    /// Layer 5: memory fetch + unified scoring + quality gate
+    pub scoring_us: u64,
+    /// Total end-to-end retrieval time
+    pub total_us: u64,
+}
+
+/// Per-memory score attribution — explains WHY a memory ranked where it did.
+///
+/// Each field represents a multiplicative factor applied to the base RRF score.
+/// A value of 1.0 means no effect; >1.0 means boost; <1.0 means suppression.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ScoreAttribution {
+    /// Memory ID (UUID string)
+    pub memory_id: String,
+    /// Base RRF fusion score (graph + hybrid combined)
+    pub rrf_base: f32,
+    /// Graph RRF contribution to the base score
+    pub graph_rrf: f32,
+    /// Hybrid (BM25 + vector) RRF contribution
+    pub hybrid_rrf: f32,
+    /// Hebbian boost from learned graph weights
+    pub hebbian_boost: f32,
+    /// Layer 4.5: attribute query boost multiplier
+    pub attribute_boost: f32,
+    /// Layer 4.45: temporal pre-filter boost multiplier
+    pub temporal_prefilter_boost: f32,
+    /// Layer 4.55: temporal fact boost multiplier
+    pub temporal_fact_boost: f32,
+    /// Layer 4.6: interference adjustment multiplier
+    pub interference_adjustment: f32,
+    /// Layer 4.7: prospective signal boost multiplier
+    pub prospective_boost: f32,
+    /// Layer 4.8: semantic fact source boost multiplier
+    pub fact_source_boost: f32,
+    /// Layer 4.9: ontological re-rank boost multiplier
+    pub ontological_boost: f32,
+    /// Layer 5: importance factor
+    pub importance_factor: f32,
+    /// Layer 5: recency decay factor
+    pub recency_factor: f32,
+    /// Layer 5: emotional arousal factor
+    pub arousal_factor: f32,
+    /// Layer 5: source credibility factor
+    pub credibility_factor: f32,
+    /// Layer 5: feedback momentum multiplier
+    pub feedback_multiplier: f32,
+    /// Quality gate factor (content richness)
+    pub quality_gate: f32,
+    /// Final computed score (after all multiplicative factors)
+    pub final_score: f32,
+    /// Which retrieval sources contributed this memory
+    pub sources: Vec<String>,
+}
+
+/// Result of semantic retrieval with optional diagnostics sidecar.
+///
+/// Used by `recall_with_diagnostics()` to return both memories and per-stage stats
+/// without breaking the 12+ callers of the existing `recall()` API.
+pub struct RetrievalResult {
+    /// Retrieved memories, scored and ranked
+    pub memories: Vec<SharedMemory>,
+    /// Retrieval diagnostics (populated when debug=true)
+    pub stats: Option<RetrievalStats>,
 }
 
 // =============================================================================
@@ -2958,8 +3234,10 @@ impl ProspectiveTrigger {
 /// Status of a prospective task
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum ProspectiveTaskStatus {
     /// Waiting for trigger condition
+    #[default]
     Pending,
     /// Trigger condition met, shown to user
     Triggered,
@@ -2967,12 +3245,6 @@ pub enum ProspectiveTaskStatus {
     Dismissed,
     /// Task expired without being triggered (optional cleanup)
     Expired,
-}
-
-impl Default for ProspectiveTaskStatus {
-    fn default() -> Self {
-        Self::Pending
-    }
 }
 
 /// A prospective memory task (reminder/intention)
@@ -3898,9 +4170,10 @@ impl Default for FileType {
 }
 
 /// How we learned about this file
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub enum LearnedFrom {
     /// User triggered batch indexing
+    #[default]
     ManualIndex,
     /// AI read the file content
     ReadAccess,
@@ -3908,12 +4181,6 @@ pub enum LearnedFrom {
     EditAccess,
     /// File was mentioned in conversation
     Mentioned,
-}
-
-impl Default for LearnedFrom {
-    fn default() -> Self {
-        LearnedFrom::ManualIndex
-    }
 }
 
 /// Learned knowledge about a file in a codebase
@@ -3998,6 +4265,7 @@ pub struct FileMemory {
 
 impl FileMemory {
     /// Create a new FileMemory from a file path
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         project_id: ProjectId,
         user_id: String,
@@ -4039,12 +4307,15 @@ impl FileMemory {
         self.updated_at = Utc::now();
         // Upgrade the learned_from if more meaningful
         // EditAccess > ReadAccess > Mentioned > ManualIndex
-        let should_upgrade = match (&self.learned_from, &learned_from) {
-            (LearnedFrom::ManualIndex, _) => true,
-            (LearnedFrom::Mentioned, LearnedFrom::ReadAccess | LearnedFrom::EditAccess) => true,
-            (LearnedFrom::ReadAccess, LearnedFrom::EditAccess) => true,
-            _ => false,
-        };
+        let should_upgrade = matches!(
+            (&self.learned_from, &learned_from),
+            (LearnedFrom::ManualIndex, _)
+                | (
+                    LearnedFrom::Mentioned,
+                    LearnedFrom::ReadAccess | LearnedFrom::EditAccess
+                )
+                | (LearnedFrom::ReadAccess, LearnedFrom::EditAccess)
+        );
         if should_upgrade {
             self.learned_from = learned_from;
         }
@@ -4228,6 +4499,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn surprise_components_json_roundtrip() {
+        // The components are persisted as JSON in episode metadata under
+        // SURPRISE_METADATA_KEY; the anomaly read path depends on this
+        // roundtrip staying stable.
+        let s = SurpriseComponents {
+            mean_pmi: -1.25,
+            novel_entity_ratio: 0.6,
+            untyped_ratio: 0.4,
+            pmi_gated_ratio: 0.1,
+            low_selectivity_share: 0.2,
+            pairs_scored: 10,
+            entities_total: 5,
+        };
+        let json = serde_json::to_string(&s).unwrap();
+        let back: SurpriseComponents = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.pairs_scored, 10);
+        assert_eq!(back.entities_total, 5);
+        assert!((back.mean_pmi - (-1.25)).abs() < f32::EPSILON);
+        assert!((back.novel_entity_ratio - 0.6).abs() < f32::EPSILON);
+        // Key is namespaced so it can't collide with user metadata.
+        assert!(SURPRISE_METADATA_KEY.starts_with("shodh."));
+    }
+
+    #[test]
     fn test_geo_filter_haversine_distance() {
         // San Francisco to Oakland (~13km)
         let sf = GeoFilter::new(37.7749, -122.4194, 100.0);
@@ -4315,5 +4610,191 @@ mod tests {
         assert!(query.geo_filter.is_some());
         assert_eq!(query.action_type, Some("landing".to_string()));
         assert_eq!(query.reward_range, Some((0.5, 1.0)));
+    }
+
+    #[test]
+    fn test_edge_weight_multiplier_intentional_types_full_weight() {
+        assert_eq!(ExperienceType::Decision.edge_weight_multiplier(), 1.0);
+        assert_eq!(ExperienceType::Learning.edge_weight_multiplier(), 1.0);
+        assert_eq!(ExperienceType::Discovery.edge_weight_multiplier(), 1.0);
+        assert_eq!(ExperienceType::Pattern.edge_weight_multiplier(), 1.0);
+    }
+
+    #[test]
+    fn test_edge_weight_multiplier_noise_types_dampened() {
+        let noise_types = [
+            ExperienceType::CodeEdit,
+            ExperienceType::Command,
+            ExperienceType::FileAccess,
+            ExperienceType::Search,
+        ];
+        for t in &noise_types {
+            let m = t.edge_weight_multiplier();
+            assert!(
+                m > 0.0 && m < 0.5,
+                "{:?} edge_weight_multiplier should be in (0.0, 0.5), got {}",
+                t,
+                m
+            );
+        }
+    }
+
+    #[test]
+    fn test_edge_weight_multiplier_mid_tier_types() {
+        // Conversation, Observation, Context, Task: intermediate dampening
+        assert!(ExperienceType::Conversation.edge_weight_multiplier() >= 0.4);
+        assert!(ExperienceType::Conversation.edge_weight_multiplier() <= 0.6);
+        assert!(ExperienceType::Observation.edge_weight_multiplier() >= 0.7);
+        assert!(ExperienceType::Task.edge_weight_multiplier() >= 0.7);
+    }
+
+    #[test]
+    fn test_activation_multiplier_intentional_types_full() {
+        assert_eq!(ExperienceType::Decision.activation_multiplier(), 1.0);
+        assert_eq!(ExperienceType::Learning.activation_multiplier(), 1.0);
+        assert_eq!(ExperienceType::Discovery.activation_multiplier(), 1.0);
+        assert_eq!(ExperienceType::Pattern.activation_multiplier(), 1.0);
+    }
+
+    #[test]
+    fn test_activation_multiplier_noise_types_dampened() {
+        let noise_types = [
+            ExperienceType::CodeEdit,
+            ExperienceType::Command,
+            ExperienceType::FileAccess,
+            ExperienceType::Search,
+        ];
+        for t in &noise_types {
+            let m = t.activation_multiplier();
+            assert!(
+                m > 0.0 && m < 0.5,
+                "{:?} activation_multiplier should be in (0.0, 0.5), got {}",
+                t,
+                m
+            );
+        }
+    }
+
+    #[test]
+    fn test_combined_dampening_effective() {
+        // Combined write × read dampening for CodeEdit should be < 0.15x of Decision
+        let code_edit_combined = ExperienceType::CodeEdit.edge_weight_multiplier()
+            * ExperienceType::CodeEdit.activation_multiplier();
+        let decision_combined = ExperienceType::Decision.edge_weight_multiplier()
+            * ExperienceType::Decision.activation_multiplier();
+        assert!(
+            code_edit_combined < 0.15,
+            "CodeEdit combined dampening should be < 0.15x, got {}",
+            code_edit_combined
+        );
+        assert_eq!(decision_combined, 1.0);
+    }
+
+    #[test]
+    fn test_auto_captured_tag_penalty_bounds() {
+        use crate::constants::{ASSISTANT_RESPONSE_TAG_PENALTY, AUTO_CAPTURED_TAG_PENALTY};
+
+        // Individual penalties should be in (0.8, 1.0) — meaningful but not devastating
+        assert!(
+            AUTO_CAPTURED_TAG_PENALTY > 0.80 && AUTO_CAPTURED_TAG_PENALTY < 1.0,
+            "AUTO_CAPTURED_TAG_PENALTY should be in (0.80, 1.0), got {}",
+            AUTO_CAPTURED_TAG_PENALTY
+        );
+        assert!(
+            ASSISTANT_RESPONSE_TAG_PENALTY > 0.80 && ASSISTANT_RESPONSE_TAG_PENALTY < 1.0,
+            "ASSISTANT_RESPONSE_TAG_PENALTY should be in (0.80, 1.0), got {}",
+            ASSISTANT_RESPONSE_TAG_PENALTY
+        );
+
+        // Combined penalty (both tags) should still be >= 0.5 — no cliff
+        let combined = AUTO_CAPTURED_TAG_PENALTY * ASSISTANT_RESPONSE_TAG_PENALTY;
+        assert!(
+            combined >= 0.5,
+            "Combined tag penalty should be >= 0.5, got {}",
+            combined
+        );
+    }
+
+    #[test]
+    fn test_full_pipeline_signal_reduction() {
+        // End-to-end: CodeEdit through graph + tag penalty vs Decision
+        // CodeEdit: edge_weight(0.3) × activation(0.4) × tag(0.85) = ~0.102
+        // Decision: edge_weight(1.0) × activation(1.0) × tag(1.0) = 1.0
+        use crate::constants::AUTO_CAPTURED_TAG_PENALTY;
+
+        let code_edit_full = ExperienceType::CodeEdit.edge_weight_multiplier()
+            * ExperienceType::CodeEdit.activation_multiplier()
+            * AUTO_CAPTURED_TAG_PENALTY;
+        let decision_full = ExperienceType::Decision.edge_weight_multiplier()
+            * ExperienceType::Decision.activation_multiplier()
+            * 1.0; // Decision has no auto-captured tag
+
+        assert!(
+            code_edit_full < 0.15,
+            "CodeEdit full pipeline should be < 0.15x, got {:.4}",
+            code_edit_full
+        );
+        assert_eq!(decision_full, 1.0);
+
+        // Signal ratio: Decision should be at least 6x stronger than CodeEdit
+        let ratio = decision_full / code_edit_full;
+        assert!(
+            ratio > 6.0,
+            "Decision/CodeEdit signal ratio should be > 6x, got {:.1}x",
+            ratio
+        );
+    }
+
+    // -------------------- RH-8 (#270) -----------------------------------
+    //
+    // LayerMode is the gate the recall harness uses to attribute quality
+    // deltas to specific pipeline stages. Production code never touches
+    // it — these tests pin the contract used by the harness CLI and the
+    // stage gates in `mod.rs`.
+
+    #[test]
+    fn layer_mode_default_is_full() {
+        assert_eq!(LayerMode::default(), LayerMode::Full);
+        // The Query default must also resolve to Full so existing call
+        // sites get unchanged behavior.
+        assert_eq!(Query::default().layers, LayerMode::Full);
+    }
+
+    #[test]
+    fn layer_mode_ordering_is_cumulative() {
+        // The whole point of the cumulative enum is that downstream code
+        // can write `if mode >= LayerMode::PlusBm25 { … }` and have BM25
+        // turn on for PlusBm25, PlusRerank, PlusFacts and Full.
+        assert!(LayerMode::VamanaOnly < LayerMode::PlusSpreading);
+        assert!(LayerMode::PlusSpreading < LayerMode::PlusBm25);
+        assert!(LayerMode::PlusBm25 < LayerMode::PlusRerank);
+        assert!(LayerMode::PlusRerank < LayerMode::PlusFacts);
+        assert!(LayerMode::PlusFacts < LayerMode::Full);
+    }
+
+    #[test]
+    fn layer_mode_report_keys_match_spec() {
+        // These string handles are part of the JSON schema consumed by
+        // `scripts/recall_diff.py` and the dashboard. They MUST match
+        // the labels in #270 character-for-character.
+        assert_eq!(LayerMode::VamanaOnly.report_key(), "vamana_only");
+        assert_eq!(LayerMode::PlusSpreading.report_key(), "+spreading");
+        assert_eq!(LayerMode::PlusBm25.report_key(), "+bm25");
+        assert_eq!(LayerMode::PlusRerank.report_key(), "+rerank");
+        assert_eq!(LayerMode::PlusFacts.report_key(), "+facts");
+        assert_eq!(LayerMode::Full.report_key(), "full");
+    }
+
+    #[test]
+    fn layer_mode_all_is_in_ascending_pipeline_order() {
+        // ALL must be sorted, contain every variant exactly once, and
+        // start at the smallest (VamanaOnly) — the harness relies on
+        // that order when iterating `--layer all`.
+        assert_eq!(LayerMode::ALL.len(), 6);
+        for w in LayerMode::ALL.windows(2) {
+            assert!(w[0] < w[1], "ALL must be strictly ascending");
+        }
+        assert_eq!(LayerMode::ALL.first().copied(), Some(LayerMode::VamanaOnly));
+        assert_eq!(LayerMode::ALL.last().copied(), Some(LayerMode::Full));
     }
 }
