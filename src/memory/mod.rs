@@ -27,12 +27,12 @@ pub mod retrieval;
 pub mod segmentation;
 pub mod sessions;
 pub mod storage;
-pub mod wavelet_sessions;
 pub mod temporal_facts;
 pub mod todo_formatter;
 pub mod todos;
 pub mod types;
 pub mod visualization;
+pub mod wavelet_sessions;
 
 use anyhow::{Context, Result};
 use parking_lot::RwLock;
@@ -311,9 +311,19 @@ pub struct MemorySystem {
     /// created_at or 0 if no facts exist.
     fact_extraction_watermark: std::sync::atomic::AtomicI64,
 
-    /// Cached wavelet-detected session map.
-    /// Invalidated when fact_extraction_needed is set (any new remember call).
-    session_map_cache: parking_lot::Mutex<Option<wavelet_sessions::SessionMap>>,
+    /// Cached wavelet-detected session map, tagged with the store generation it
+    /// was computed at. Served only while the generation still matches
+    /// `store_generation`; any new remember bumps the generation and thereby
+    /// invalidates the cache. Deliberately NOT keyed off `fact_extraction_needed`:
+    /// that flag is cleared by heavy maintenance cycles, which would mark a map
+    /// computed before newer memories as valid again (staleness), and it stays
+    /// set between remembers and the next heavy cycle, which would force a full
+    /// store re-scan on every ordinal-session recall in that window.
+    session_map_cache: parking_lot::Mutex<Option<(u64, wavelet_sessions::SessionMap)>>,
+
+    /// Monotonic count of memories stored; bumped on every remember path.
+    /// Used as the validity token for `session_map_cache`.
+    store_generation: std::sync::atomic::AtomicU64,
 
     /// Prediction cache for feedback prediction error weighting (VTA/Dopamine system).
     ///
@@ -762,6 +772,7 @@ impl MemorySystem {
             fact_extraction_watermark: std::sync::atomic::AtomicI64::new(0),
             // Wavelet session detection cache — recomputed when new memories arrive
             session_map_cache: parking_lot::Mutex::new(None),
+            store_generation: std::sync::atomic::AtomicU64::new(0),
             // Prediction cache for VTA/dopamine-inspired feedback error weighting
             // TTL 10 minutes, max 500 entries (~4KB)
             prediction_cache: moka::sync::Cache::builder()
@@ -1313,6 +1324,9 @@ impl MemorySystem {
         // Signal that fact extraction should run on next maintenance cycle
         self.fact_extraction_needed
             .store(true, std::sync::atomic::Ordering::Relaxed);
+        // New memory invalidates the cached wavelet session map
+        self.store_generation
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         Ok(memory_id)
     }
@@ -1437,6 +1451,9 @@ impl MemorySystem {
         // Signal that fact extraction should run on next maintenance cycle
         self.fact_extraction_needed
             .store(true, std::sync::atomic::Ordering::Relaxed);
+        // New memory invalidates the cached wavelet session map
+        self.store_generation
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         Ok(memory_id)
     }
@@ -5098,9 +5115,7 @@ impl MemorySystem {
         // Layer 5.9: Ordinal session resolution via wavelet-detected sessions
         {
             let ql = query_text.to_lowercase();
-            if let Some((ordinal, _noun)) =
-                wavelet_sessions::extract_ordinal_session_ref(&ql)
-            {
+            if let Some((ordinal, _noun)) = wavelet_sessions::extract_ordinal_session_ref(&ql) {
                 match self.get_or_compute_session_map() {
                     Ok(session_map) if ordinal <= session_map.sessions.len() => {
                         let target = &session_map.sessions[ordinal - 1];
@@ -5111,16 +5126,12 @@ impl MemorySystem {
                             if session_ids.contains(&mem.id) {
                                 let base = mem.score.unwrap_or(0.0);
                                 let mut cloned: Memory = mem.as_ref().clone();
-                                cloned.set_score(
-                                    base + crate::constants::ORDINAL_SESSION_BOOST,
-                                );
+                                cloned.set_score(base + crate::constants::ORDINAL_SESSION_BOOST);
                                 *mem = Arc::new(cloned);
                             }
                         }
                         memories.sort_by(|a, b| {
-                            b.score
-                                .unwrap_or(0.0)
-                                .total_cmp(&a.score.unwrap_or(0.0))
+                            b.score.unwrap_or(0.0).total_cmp(&a.score.unwrap_or(0.0))
                         });
                         tracing::info!(
                             "Layer 5.9: Ordinal '{}' resolved to session {} ({} memories)",
@@ -5130,10 +5141,7 @@ impl MemorySystem {
                         );
                     }
                     Ok(_) => {
-                        tracing::info!(
-                            "Layer 5.9: Ordinal {} out of range — demoting",
-                            ordinal
-                        );
+                        tracing::info!("Layer 5.9: Ordinal {} out of range — demoting", ordinal);
                         for mem in memories.iter_mut() {
                             let base = mem.score.unwrap_or(0.0);
                             let mut cloned: Memory = mem.as_ref().clone();
@@ -5845,19 +5853,23 @@ impl MemorySystem {
 
     /// Retrieve or recompute the wavelet-detected session map.
     ///
-    /// The session map is cached and only recomputed when new memories have been
-    /// stored (indicated by `fact_extraction_needed`). This keeps repeated
-    /// ordinal-resolution lookups within a single retrieval pipeline free of
-    /// redundant full-store scans.
+    /// The session map is cached tagged with `store_generation` and reused while
+    /// no new memories have been stored since it was computed. This keeps
+    /// repeated ordinal-resolution lookups free of redundant full-store scans
+    /// without ever serving a map that predates a newer memory.
     fn get_or_compute_session_map(&self) -> anyhow::Result<wavelet_sessions::SessionMap> {
+        // Snapshot the generation BEFORE scanning: if a memory lands while we
+        // compute, the stored tag won't match the new generation and the next
+        // lookup recomputes instead of trusting a possibly-incomplete map.
+        let generation = self
+            .store_generation
+            .load(std::sync::atomic::Ordering::Relaxed);
+
         // Check cache
         {
             let cache = self.session_map_cache.lock();
-            if let Some(ref map) = *cache {
-                if !self
-                    .fact_extraction_needed
-                    .load(std::sync::atomic::Ordering::Relaxed)
-                {
+            if let Some((cached_generation, ref map)) = *cache {
+                if cached_generation == generation {
                     return Ok(map.clone());
                 }
             }
@@ -5870,8 +5882,18 @@ impl MemorySystem {
 
         let map = wavelet_sessions::detect_sessions(&timestamps);
 
-        // Cache
-        *self.session_map_cache.lock() = Some(map.clone());
+        // Cache, tagged with the pre-scan generation. Don't clobber a fresher
+        // entry written by a concurrent recompute that started after ours.
+        {
+            let mut cache = self.session_map_cache.lock();
+            let is_fresher = match *cache {
+                Some((cached_generation, _)) => generation > cached_generation,
+                None => true,
+            };
+            if is_fresher {
+                *cache = Some((generation, map.clone()));
+            }
+        }
         Ok(map)
     }
 

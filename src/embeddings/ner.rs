@@ -501,30 +501,25 @@ impl NeuralNer {
 pub fn cold_start_extract_entities(text: &str, existing_entities: &[String]) -> Vec<String> {
     use std::collections::HashSet;
 
-    let existing_lower: HashSet<String> = existing_entities
-        .iter()
-        .map(|e| e.to_lowercase())
-        .collect();
+    let existing_lower: HashSet<String> =
+        existing_entities.iter().map(|e| e.to_lowercase()).collect();
 
     let mut extracted: Vec<String> = Vec::new();
     let mut seen: HashSet<String> = existing_lower;
 
     // Common stop words that appear capitalized at sentence starts
     let stop_words: HashSet<&str> = [
-        "the", "a", "an", "is", "are", "was", "were", "be", "been", "being",
-        "have", "has", "had", "do", "does", "did", "will", "would", "could",
-        "should", "may", "might", "shall", "can", "need", "must", "it", "its",
-        "this", "that", "these", "those", "i", "we", "you", "he", "she", "they",
-        "me", "him", "her", "us", "them", "my", "your", "his", "our", "their",
-        "what", "which", "who", "whom", "where", "when", "why", "how",
-        "not", "no", "nor", "but", "or", "and", "if", "then", "else",
-        "for", "from", "with", "without", "about", "between", "through",
-        "during", "before", "after", "above", "below", "to", "of", "in", "on",
-        "at", "by", "up", "out", "off", "over", "under", "again", "further",
-        "once", "here", "there", "all", "each", "every", "both", "few", "more",
-        "most", "other", "some", "such", "only", "own", "same", "so", "than",
-        "too", "very", "just", "because", "as", "until", "while", "also",
-        "however", "although", "since", "already", "still", "yet", "now",
+        "the", "a", "an", "is", "are", "was", "were", "be", "been", "being", "have", "has", "had",
+        "do", "does", "did", "will", "would", "could", "should", "may", "might", "shall", "can",
+        "need", "must", "it", "its", "this", "that", "these", "those", "i", "we", "you", "he",
+        "she", "they", "me", "him", "her", "us", "them", "my", "your", "his", "our", "their",
+        "what", "which", "who", "whom", "where", "when", "why", "how", "not", "no", "nor", "but",
+        "or", "and", "if", "then", "else", "for", "from", "with", "without", "about", "between",
+        "through", "during", "before", "after", "above", "below", "to", "of", "in", "on", "at",
+        "by", "up", "out", "off", "over", "under", "again", "further", "once", "here", "there",
+        "all", "each", "every", "both", "few", "more", "most", "other", "some", "such", "only",
+        "own", "same", "so", "than", "too", "very", "just", "because", "as", "until", "while",
+        "also", "however", "although", "since", "already", "still", "yet", "now",
     ]
     .into_iter()
     .collect();
@@ -556,8 +551,7 @@ pub fn cold_start_extract_entities(text: &str, existing_entities: &[String]) -> 
             true
         } else {
             let prev = words[i - 1];
-            prev.ends_with('.') || prev.ends_with('!') || prev.ends_with('?')
-                || prev.ends_with(':')
+            prev.ends_with('.') || prev.ends_with('!') || prev.ends_with('?') || prev.ends_with(':')
         };
 
         let lower = clean.to_lowercase();
@@ -593,7 +587,12 @@ pub fn cold_start_extract_entities(text: &str, existing_entities: &[String]) -> 
                     // Lowercase connector — only include if the NEXT word is capitalized
                     if j + 1 < words.len() {
                         let after = words[j + 1].trim_matches(|c: char| !c.is_alphanumeric());
-                        if after.chars().next().map(|c| c.is_uppercase()).unwrap_or(false) {
+                        if after
+                            .chars()
+                            .next()
+                            .map(|c| c.is_uppercase())
+                            .unwrap_or(false)
+                        {
                             entity_parts.push(next);
                             j += 1;
                         } else {
@@ -622,7 +621,9 @@ pub fn cold_start_extract_entities(text: &str, existing_entities: &[String]) -> 
 
     // --- 2. Email addresses ---
     for word in &words {
-        let clean = word.trim_matches(|c: char| !c.is_alphanumeric() && c != '@' && c != '.' && c != '-' && c != '_' && c != '+');
+        let clean = word.trim_matches(|c: char| {
+            !c.is_alphanumeric() && c != '@' && c != '.' && c != '-' && c != '_' && c != '+'
+        });
         if clean.contains('@') && clean.contains('.') {
             // Basic email validation: has @ with text before and after, has . after @
             let parts: Vec<&str> = clean.splitn(2, '@').collect();
@@ -638,10 +639,10 @@ pub fn cold_start_extract_entities(text: &str, existing_entities: &[String]) -> 
 
     // --- 3. URLs ---
     for word in &words {
-        let clean = word.trim_matches(|c: char| c == '(' || c == ')' || c == '<' || c == '>' || c == '"' || c == '\'');
-        if (clean.starts_with("http://") || clean.starts_with("https://"))
-            && clean.len() > 10
-        {
+        let clean = word.trim_matches(|c: char| {
+            c == '(' || c == ')' || c == '<' || c == '>' || c == '"' || c == '\''
+        });
+        if (clean.starts_with("http://") || clean.starts_with("https://")) && clean.len() > 10 {
             let lower = clean.to_lowercase();
             if !seen.contains(&lower) {
                 seen.insert(lower);
@@ -652,7 +653,9 @@ pub fn cold_start_extract_entities(text: &str, existing_entities: &[String]) -> 
 
     // --- 4. File paths ---
     for word in &words {
-        let clean = word.trim_matches(|c: char| c == '"' || c == '\'' || c == '`' || c == '(' || c == ')' || c == ',');
+        let clean = word.trim_matches(|c: char| {
+            c == '"' || c == '\'' || c == '`' || c == '(' || c == ')' || c == ','
+        });
         // Unix-style paths: /foo/bar or ./foo/bar
         if (clean.starts_with('/') || clean.starts_with("./") || clean.starts_with("../"))
             && clean.contains('/')
@@ -1041,7 +1044,9 @@ mod tests {
         let text = "Edit the file at /src/main.rs and ./config/settings.toml for configuration.";
         let entities = cold_start_extract_entities(text, &existing);
         assert!(
-            entities.iter().any(|e| e.contains("/src/main.rs") || e.contains("./config/settings.toml")),
+            entities
+                .iter()
+                .any(|e| e.contains("/src/main.rs") || e.contains("./config/settings.toml")),
             "Should extract file paths: {entities:?}"
         );
     }
@@ -1157,7 +1162,7 @@ mod tests {
         assert!(is_version_number("V1.0.0-beta.2"));
         assert!(!is_version_number("hello"));
         assert!(!is_version_number("v"));
-        assert!(!is_version_number("123"));  // No dot
+        assert!(!is_version_number("123")); // No dot
         assert!(!is_version_number(""));
     }
 }

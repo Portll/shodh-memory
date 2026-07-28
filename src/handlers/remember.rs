@@ -20,6 +20,15 @@ use crate::memory::{
 use crate::metrics;
 use crate::validation;
 
+/// Gate for cold-start entity additions. Cold-start extraction merges entities
+/// AFTER the NER path has already been filtered, so without this it would
+/// reintroduce exactly the structural junk (URLs, timestamps, hex-id fragments)
+/// that `state::is_structural_non_entity` rejects at ingest. Aggressive
+/// bootstrapping of sparse graphs is fine — bypassing entity hygiene is not.
+fn passes_entity_hygiene(name: &str) -> bool {
+    !super::state::is_structural_non_entity(name)
+}
+
 // =============================================================================
 // REQUEST/RESPONSE TYPES
 // =============================================================================
@@ -515,16 +524,16 @@ pub async fn remember(
                 boosted_extractor.extract_texts(&req.content)
             };
             for keyword in cold_start_keywords {
-                if seen.insert(keyword.to_lowercase()) {
+                if passes_entity_hygiene(&keyword) && seen.insert(keyword.to_lowercase()) {
                     merged_entities.push(keyword);
                 }
             }
 
             // Pattern-based extraction: proper nouns, emails, URLs, paths, versions, tech names
-            let cold_start_entities =
-                cold_start_extract_entities(&req.content, &merged_entities);
+            // (structural non-entities among them are rejected by the hygiene gate)
+            let cold_start_entities = cold_start_extract_entities(&req.content, &merged_entities);
             for entity in cold_start_entities {
-                if seen.insert(entity.to_lowercase()) {
+                if passes_entity_hygiene(&entity) && seen.insert(entity.to_lowercase()) {
                     merged_entities.push(entity);
                 }
             }
@@ -1059,12 +1068,12 @@ pub async fn batch_remember(
                 let boosted_extractor =
                     crate::embeddings::KeywordExtractor::with_config(boosted_config);
                 for keyword in boosted_extractor.extract_texts(&item.content) {
-                    if seen.insert(keyword.to_lowercase()) {
+                    if passes_entity_hygiene(&keyword) && seen.insert(keyword.to_lowercase()) {
                         merged.push(keyword);
                     }
                 }
                 for entity in cold_start_extract_entities(&item.content, &merged) {
-                    if seen.insert(entity.to_lowercase()) {
+                    if passes_entity_hygiene(&entity) && seen.insert(entity.to_lowercase()) {
                         merged.push(entity);
                     }
                 }
@@ -1278,12 +1287,12 @@ pub async fn upsert_memory(
             let boosted_extractor =
                 crate::embeddings::KeywordExtractor::with_config(boosted_config);
             for keyword in boosted_extractor.extract_texts(&req.content) {
-                if seen.insert(keyword.to_lowercase()) {
+                if passes_entity_hygiene(&keyword) && seen.insert(keyword.to_lowercase()) {
                     merged_entities.push(keyword);
                 }
             }
             for entity in cold_start_extract_entities(&req.content, &merged_entities) {
-                if seen.insert(entity.to_lowercase()) {
+                if passes_entity_hygiene(&entity) && seen.insert(entity.to_lowercase()) {
                     merged_entities.push(entity);
                 }
             }

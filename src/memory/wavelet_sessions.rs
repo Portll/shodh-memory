@@ -169,7 +169,12 @@ const SESSION_NOUNS: &[&str] = &[
 /// Returns `(ordinal_1based, matched_noun)` if found.
 pub fn extract_ordinal_session_ref(query: &str) -> Option<(usize, String)> {
     let lower = query.to_lowercase();
-    let words: Vec<&str> = lower.split_whitespace().collect();
+    // Strip surrounding punctuation so "meeting?" / "(second" still match.
+    let words: Vec<&str> = lower
+        .split_whitespace()
+        .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric()))
+        .filter(|w| !w.is_empty())
+        .collect();
 
     for pair in words.windows(2) {
         if let Some(ordinal) = parse_ordinal(pair[0]) {
@@ -216,7 +221,8 @@ mod tests {
         for (i, session) in map.sessions.iter().enumerate() {
             assert_eq!(session.ordinal, i + 1);
             assert_eq!(
-                session.count, 15,
+                session.count,
+                15,
                 "Session {} should have 15 memories",
                 i + 1
             );
