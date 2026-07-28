@@ -309,7 +309,15 @@ pub async fn handle_remember(sample: Sample, manager: Arc<MultiUserMemoryManager
     }
 
     let op_start = std::time::Instant::now();
-    let experience_type = parse_experience_type(req.memory_type.as_ref());
+    // Fire-and-forget subscriber: an invalid type is logged and dropped, matching
+    // the validation failures above (there is no reply channel to surface it on).
+    let experience_type = match parse_experience_type(req.memory_type.as_ref()) {
+        Ok(t) => t,
+        Err(e) => {
+            warn!(user_id = %req.user_id, "Validation failed: {}", e);
+            return;
+        }
+    };
 
     // Parallel NER + YAKE extraction (same as HTTP handler)
     let ner = manager.get_neural_ner();
@@ -729,6 +737,9 @@ pub async fn handle_recall(query: Query, manager: Arc<MultiUserMemoryManager>) {
                 created_at: m.created_at.to_rfc3339(),
                 score,
                 tier: format!("{:?}", m.tier),
+                // Debug-only field: the HTTP path fills it from retrieval stats
+                // when debug=true; the Zenoh query API has no debug flag.
+                score_attribution: None,
             }
         })
         .collect();
@@ -845,10 +856,13 @@ pub async fn handle_recall(query: Query, manager: Arc<MultiUserMemoryManager>) {
     };
 
     let has_recall_memories = !recall_memories.is_empty();
+    // Zenoh recall is not paginated: the returned set is the full result,
+    // so count mirrors the HTTP handler's recall_memories.len().
+    let count = recall_memories.len();
 
     let response = RecallResponse {
         memories: recall_memories,
-        count: total,
+        count,
         retrieval_stats: None,
         todos,
         todo_count,
@@ -917,7 +931,7 @@ pub async fn handle_recall(query: Query, manager: Arc<MultiUserMemoryManager>) {
 
     debug!(
         user_id = %user_id,
-        results = total,
+        results = count,
         "Zenoh recall completed"
     );
 }
