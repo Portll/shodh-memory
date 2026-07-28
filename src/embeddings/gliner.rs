@@ -390,7 +390,10 @@ impl GlinerTyper {
         let mut session = model
             .session
             .try_lock_for(std::time::Duration::from_secs(30))
-            .ok_or_else(|| anyhow::anyhow!("GLiNER session lock timeout (30s)"))?;
+            .ok_or_else(|| {
+                crate::metrics::NER_LOCK_TIMEOUT_TOTAL.inc();
+                anyhow::anyhow!("GLiNER session lock timeout (30s)")
+            })?;
 
         let outputs = session
             .run(ort::inputs![
