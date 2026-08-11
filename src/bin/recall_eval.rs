@@ -301,6 +301,18 @@ struct Args {
     /// see how edge decay erodes recall.
     #[arg(long, default_value_t = 0.0)]
     age_days: f64,
+
+    /// Override the suite's corpus fixture path. Diagnostic-only: lets a probe
+    /// run (e.g. a per-case funnel over a hand-picked subset) use a scratch
+    /// fixture without editing the checked-in suite files. The gated CI run
+    /// never sets this — the baseline is only meaningful against the canonical
+    /// fixtures, and `compare_to_baseline` still keys on `--suite`.
+    #[arg(long)]
+    corpus: Option<PathBuf>,
+
+    /// Override the suite's cases fixture path. Same contract as `--corpus`.
+    #[arg(long)]
+    cases: Option<PathBuf>,
 }
 
 fn main() {
@@ -367,10 +379,27 @@ fn run(args: &Args) -> Result<i32> {
 
     let git_sha = current_git_sha().unwrap_or_else(|_| "unknown".to_string());
 
-    let (corpus_path, cases_path) = match args.suite.fixture_paths() {
+    let (mut corpus_path, mut cases_path) = match args.suite.fixture_paths() {
         Some((c, q)) => (Some(c), Some(q)),
         None => (None, None),
     };
+    // Fixture overrides are diagnostic-only. A baseline comparison against a
+    // non-canonical fixture set would gate on numbers the baseline was never
+    // measured over — refuse the combination instead of emitting a misleading
+    // pass/fail.
+    if (args.corpus.is_some() || args.cases.is_some()) && args.baseline.is_some() {
+        anyhow::bail!(
+            "--corpus/--cases fixture overrides cannot be combined with --baseline: \
+             the checked-in baseline is only comparable against the suite's \
+             canonical fixtures"
+        );
+    }
+    if let Some(c) = &args.corpus {
+        corpus_path = Some(c.clone());
+    }
+    if let Some(q) = &args.cases {
+        cases_path = Some(q.clone());
+    }
     let inputs = RunInputs {
         storage_path: storage_path.clone(),
         corpus_path,

@@ -107,6 +107,10 @@ pub struct ListMemoryItem {
     pub tags: Vec<String>,
     pub created_at: String,
     pub tier: String,
+    /// `[lat, lon, alt]` when the memory carries coordinates; `None` otherwise.
+    /// Lets map surfaces plot the corpus without a per-memory fetch.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub geo_location: Option<[f64; 3]>,
 }
 
 /// Hard ceiling on the content preview returned by the memory-listing endpoints
@@ -357,6 +361,7 @@ pub async fn list_memories(
                 tags: m.experience.entities.clone(),
                 created_at: m.created_at.to_rfc3339(),
                 tier: format!("{:?}", m.tier),
+                geo_location: m.experience.geo_location,
             }
         })
         .collect();
@@ -481,6 +486,7 @@ async fn list_memories_inner(
                 tags: m.experience.entities.clone(),
                 created_at: m.created_at.to_rfc3339(),
                 tier: format!("{:?}", m.tier),
+                geo_location: m.experience.geo_location,
             }
         })
         .collect();

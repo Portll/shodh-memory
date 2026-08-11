@@ -1,0 +1,463 @@
+@import "tailwindcss";
+
+/* Inter, vendored — not fetched.
+   Linear is set in Inter, and the Segoe UI fallback was the largest remaining
+   perceptual gap. viteSingleFile inlines this woff2 as a data URI, so there is
+   still exactly one build artifact and the product renders identically with no
+   network — which the on-device claim requires.
+
+   Deliberately ONE file: the Latin weight-axis subset (48 kB). Importing the
+   whole @fontsource-variable/inter package pulls Cyrillic, Greek and Vietnamese
+   subsets plus italics and took the bundle from 241 kB to 534 kB — and because
+   base64 cannot be re-compressed, gzip went 75 kB → 296 kB. Italic is not used
+   anywhere in this UI; synthesised obliquing is acceptable if it ever is.
+
+   Licence: SIL OFL 1.1 — see src/assets/inter-LICENSE.txt. */
+@font-face {
+  font-family: "Inter Variable";
+  font-style: normal;
+  font-display: block;
+  font-weight: 100 900;
+  src: url("./assets/inter-latin-wght-normal.woff2") format("woff2");
+  unicode-range:
+    U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC,
+    U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193,
+    U+2212, U+2215, U+FEFF, U+FFFD;
+}
+
+/* Watermelon components ship with shadcn's `dark:` variants, so the variant
+   has to resolve. The product is dark-only — <html class="dark"> is set in
+   index.html and the token values below are the dark values. There is no
+   second theme to keep in sync. */
+@custom-variant dark (&:is(.dark *));
+
+/*
+  The token layer IS the design.
+
+  Watermelon's components consume shadcn's semantic variable names
+  (--background, --primary, --border, ...). Defining those names here is what
+  makes every component we pull from the registry land already looking like
+  this product, instead of looking like default shadcn and needing to be
+  restyled one at a time. Change a value here, not in a component.
+
+  This is measured, not assumed. Gridline's chrome — sidebar, navbar, shell,
+  nav items — uses 148 semantic utilities, 0 raw hex, and 0 hardcoded palette
+  classes. Every literal hue in that dashboard (emerald/violet/amber) sits in
+  its two *content* views, which are replaced wholesale. So the accent below
+  propagates through the ported chrome on its own.
+
+  The discipline, encoded:
+    - Neutral near-black, never blue-black. Depth is four close greys.
+    - Exactly one accent. It marks focus, the primary action, active nav —
+      nothing else. A second accent makes both mean nothing.
+    - Saturated colour is reserved for data (the graph), never for chrome.
+    - Small radii (4–8px), hairline borders, no gradients on surfaces.
+*/
+:root {
+  --background: #08090a;
+  --foreground: #f7f8f8;
+
+  --card: #0f1011;
+  --card-foreground: #f7f8f8;
+  --popover: #141516;
+  --popover-foreground: #f7f8f8;
+
+  /* The accent is taken from the shodh mark (src/assets/shodh-mark.png), a
+     low-poly elephant in reds and oranges, rather than picked. Its tones run
+     ~#e8342a to #f4622e.
+
+     Measured on #08090a: #f4622e is 6.29:1, #e8342a is 4.70:1. Both clear AA
+     for text, so contrast does not decide this. The brighter end is taken for
+     the headroom: the accent also has to carry 1px SVG strokes and 3px status
+     dots, which no text ratio covers, and it has to stay separable from
+     --destructive (#f2555a, 5.90:1) at a glance. */
+  --primary: #f4622e;
+  /* Near-black, NOT white. White on #f4622e is ~3.1:1 and fails AA — the
+     primary button would ship unreadable. Near-black on it is ~6:1. This pairs
+     with --primary and must be changed with it. */
+  --primary-foreground: #08090a;
+
+  --secondary: #141516;
+  --secondary-foreground: #f7f8f8;
+
+  /* `muted` is the resting surface; `muted-foreground` carries nearly all
+     label copy on this screen. */
+  --muted: #141516;
+  --muted-foreground: #8a8f98;
+
+  /* shadcn's `accent` is the hover/active *surface*, not the brand colour. */
+  --accent: #1a1b1e;
+  --accent-foreground: #f7f8f8;
+
+  /* Pink-red, not orange-red. With a warm accent, "alarm" has to be separable
+     from "chrome" by hue and not only by position — see the alarm/accent note
+     under the data hues below. */
+  --destructive: #f2555a;
+  --destructive-foreground: #ffffff;
+
+  /* Amber, for "worth a look" as distinct from "wrong". Not part of shadcn's
+     set; the anomalies view needs a middle rung between accent and destructive
+     and inventing one here is better than reaching for a palette class. */
+  --warn: #e5b567;
+
+  --border: #1c1d1f;
+  --input: #26282c;
+  --ring: #f4622e;
+
+  --radius: 0.5rem;
+
+  /* Data hues. Used by the knowledge graph and the readouts, never by chrome.
+     Chosen to stay legible on #08090a without competing with the accent.
+
+     `person` was #f2994a and `chart-5` #e0a355 — both orange, both now within
+     touching distance of the accent. A category hue that reads as "selected"
+     is worse than a duller category hue, so person moved to rose and the fifth
+     to teal. Nothing in the 10–40° band except the accent itself. */
+  --chart-1: #a599ff; /* technology */
+  --chart-2: #4ea7fc; /* org        */
+  --chart-3: #4cb782; /* location   */
+  --chart-4: #ec6f9e; /* person     */
+  --chart-5: #39b8b0;
+
+  --sidebar: #0f1011;
+  --sidebar-foreground: #f7f8f8;
+  --sidebar-primary: #f4622e;
+  --sidebar-primary-foreground: #08090a;
+  --sidebar-accent: #1a1b1e;
+  --sidebar-accent-foreground: #f7f8f8;
+  --sidebar-border: #1c1d1f;
+  --sidebar-ring: #f4622e;
+}
+
+/* Graph-only tokens. The canvas is not a Tailwind surface — d3 reads these
+   through getComputedStyle, so they live as plain custom properties and are
+   deliberately outside the shadcn set.
+
+   The accent-vs-alarm collision is settled here, because this is the only
+   place both appear on one surface. `node-active` means "the current selection
+   reached this" — that is focus, so it takes the accent. Anomalous means "this
+   deviates from baseline" — that is an alarm, so it takes --destructive, which
+   is deliberately pink-red rather than orange-red. If those two ever converge,
+   the alarm stops reading as one, which is the failure mode worth guarding. */
+:root {
+  --node-technology: #a599ff;
+  --node-org: #4ea7fc;
+  --node-location: #4cb782;
+  --node-person: #ec6f9e;
+  --node-active: #f4622e;
+  --node-anomalous: #f2555a;
+  --edge-strong: #4a4d55;
+  --edge-medium: #35373d;
+  --edge-weak: #26282c;
+
+  /* Edge consolidation tiers — L1 working → L2 episodic → L3 semantic.
+
+     An ORDINAL ramp, not three categories: the tiers are a progression from
+     new-and-volatile to proven to consolidated, so they are three steps of one
+     cool, desaturated slate family. Three unrelated hues would read as kinds
+     and would compete with the node-type colours, which own categorical colour
+     on this canvas.
+
+     The ramp brightens with consolidation because the ground is near-black:
+     on #08090a, "deep and solid" means MORE present, not darker. L1 sits just
+     above the resting edge greys; L3 is the most legible thing among the edges
+     without ever reaching the accent.
+
+     Deliberately low saturation, to stay clear of --node-org (#4ea7fc), which
+     is a saturated sky blue in the same hue neighbourhood, and well outside
+     the accent's orange band, the destructive pink-red and the warn amber. */
+  --edge-l1: #3f4a57;
+  --edge-l2: #64768c;
+  --edge-l3: #96abc4;
+
+  --live: #4cb782;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-warn: var(--warn);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+
+  --color-chart-1: var(--chart-1);
+  --color-chart-2: var(--chart-2);
+  --color-chart-3: var(--chart-3);
+  --color-chart-4: var(--chart-4);
+  --color-chart-5: var(--chart-5);
+
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-ring: var(--sidebar-ring);
+
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+
+  /* Linear sets text tight. Negative tracking on display sizes is a large part
+     of why its type reads as product chrome rather than a marketing page. */
+  --tracking-tighter: -0.03em;
+  --tracking-tight: -0.02em;
+  --tracking-normal: -0.011em;
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+
+  html {
+    font-family:
+      "Inter Variable", "Inter", "Segoe UI Variable Text", "Segoe UI",
+      system-ui, -apple-system, sans-serif;
+    letter-spacing: -0.011em;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+
+  body {
+    @apply bg-background text-foreground;
+    font-size: 13px;
+    margin: 0;
+    height: 100vh;
+    overflow: hidden;
+  }
+
+  ::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: #2b2d31;
+    border-radius: 4px;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: #3a3d43;
+  }
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  /* A dashboard someone reads for an hour must honour this. */
+  @media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+    }
+  }
+}
+
+@utility mono {
+  font-family: "Berkeley Mono", "SF Mono", ui-monospace, Consolas, monospace;
+  font-feature-settings: "zero" 1;
+  font-variant-numeric: tabular-nums;
+}
+
+/* The graticule the Gridline direction is named for. A measured surface rather
+   than a flat void: it gives the stage a sense of extent, and it is the same
+   ruling the graph canvas will be plotted against once it lands, so the empty
+   state and the populated one share a floor.
+
+   Masked to fade at the edges. An edge-to-edge grid reads as a spreadsheet;
+   one that falls away reads as a field the content sits on. */
+@utility graticule {
+  background-image:
+    linear-gradient(to right, var(--border) 1px, transparent 1px),
+    linear-gradient(to bottom, var(--border) 1px, transparent 1px);
+  background-size: 56px 56px;
+  background-position: center center;
+  opacity: 0.5;
+  mask-image: radial-gradient(
+    ellipse 75% 65% at 50% 50%,
+    #000 25%,
+    transparent 78%
+  );
+}
+
+/* Rendered assistant markdown. Scoped under .md so model output can never
+   restyle the chrome; sized to the 13px body the rest of the product runs.
+   Colours come from the same tokens as everything else — saturated colour
+   stays reserved for data, so links are foreground+underline, not accent. */
+.md > :first-child {
+  margin-top: 0;
+}
+.md > :last-child {
+  margin-bottom: 0;
+}
+.md p,
+.md ul,
+.md ol,
+.md pre,
+.md blockquote,
+.md table {
+  margin: 0.55em 0;
+}
+.md h1,
+.md h2,
+.md h3,
+.md h4,
+.md h5,
+.md h6 {
+  margin: 0.9em 0 0.35em;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+}
+.md h1 {
+  font-size: 15px;
+}
+.md h2 {
+  font-size: 14px;
+}
+.md h3,
+.md h4,
+.md h5,
+.md h6 {
+  font-size: 13px;
+}
+.md ul,
+.md ol {
+  padding-left: 1.4em;
+}
+.md ul {
+  list-style: disc;
+}
+.md ol {
+  list-style: decimal;
+}
+.md li {
+  margin: 0.18em 0;
+}
+.md a {
+  color: var(--foreground);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  text-decoration-color: var(--muted-foreground);
+}
+.md a:hover {
+  text-decoration-color: var(--foreground);
+}
+.md code {
+  font-family: "Berkeley Mono", "SF Mono", ui-monospace, Consolas, monospace;
+  font-size: 12px;
+  background: var(--muted);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.08em 0.35em;
+}
+.md pre {
+  background: var(--muted);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.7em 0.85em;
+  overflow-x: auto;
+}
+.md pre code {
+  background: transparent;
+  border: 0;
+  padding: 0;
+}
+.md blockquote {
+  border-left: 2px solid var(--border);
+  padding-left: 0.85em;
+  color: var(--muted-foreground);
+}
+.md hr {
+  border: 0;
+  border-top: 1px solid var(--border);
+  margin: 0.9em 0;
+}
+.md table {
+  border-collapse: collapse;
+  display: block;
+  overflow-x: auto;
+  font-size: 12px;
+}
+.md th,
+.md td {
+  border: 1px solid var(--border);
+  padding: 0.3em 0.6em;
+  text-align: left;
+}
+.md th {
+  color: var(--muted-foreground);
+  font-weight: 500;
+}
+
+/* A memory citation the model printed ([mem:id]) rendered as the handle it
+   is. Accent-coloured: a citation is precisely a focus target — clicking it
+   opens that memory's evidence. */
+.mem-cite {
+  font-family: "Berkeley Mono", "SF Mono", ui-monospace, Consolas, monospace;
+  font-size: 11px;
+  color: var(--primary);
+  background: color-mix(in srgb, var(--primary) 10%, transparent);
+  border: 1px solid color-mix(in srgb, var(--primary) 30%, transparent);
+  border-radius: 4px;
+  padding: 0 0.35em;
+  cursor: pointer;
+  vertical-align: baseline;
+}
+.mem-cite:hover {
+  background: color-mix(in srgb, var(--primary) 18%, transparent);
+}
+.mem-cite:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--ring);
+}
+
+/* Activation travelling along an edge. A short dash on a long gap, so exactly
+   one pulse is in flight per edge; the offset is animated rather than the
+   geometry, which keeps it off the layout path.
+
+   This is the product's actual mechanism, not decoration — the reason a memory
+   nobody searched for surfaces is that activation propagates. Showing it move
+   is the most honest thing this illustration can do.
+
+   The global prefers-reduced-motion rule in @layer base forces every animation
+   to one iteration at 0.01ms, which lands these at dashoffset 0 — a resting
+   diagram with no motion. That is the correct fallback and needs no branch. */
+@keyframes shodh-activation-flow {
+  from {
+    stroke-dashoffset: var(--flow-span);
+  }
+  to {
+    stroke-dashoffset: 0;
+  }
+}
+
+@keyframes shodh-node-pulse {
+  0%,
+  70%,
+  100% {
+    opacity: 0.25;
+    transform: scale(1);
+  }
+  20% {
+    opacity: 1;
+    transform: scale(1.6);
+  }
+}

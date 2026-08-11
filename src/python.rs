@@ -477,6 +477,10 @@ impl PyMemorySystem {
             ner_entities: vec![],
             cooccurrence_pairs: vec![],
             importance_override: None,
+            // Toponyms are resolved by `gazetteer::resolve_ner_locations` from the
+            // NER records, which the direct Python API never produces (see
+            // `ner_entities` above). No NER records means no toponyms to resolve.
+            toponyms: vec![],
         };
 
         let memory_id = self
@@ -797,6 +801,9 @@ impl PyMemorySystem {
             terrain_type,
             confidence_range,
             prospective_signals: None,
+            // Query-side NER seeds come from the caller that owns the NER model.
+            // The Python API takes the query as plain text and runs no model, so
+            // the graph leg falls back to the heuristic focal entities.
             ner_entities: None,
             episode_id: None,
             recency_weight: None,
@@ -1872,6 +1879,8 @@ impl PyMemorySystem {
             terrain_type: None,
             confidence_range: None,
             prospective_signals: None,
+            // See `recall()` above: no NER model on the Python path, so no
+            // query-side entity seeds for the graph leg.
             ner_entities: None,
             episode_id: None,
             recency_weight: None,

@@ -336,6 +336,9 @@ mod tests {
                     created_at: chrono::Utc::now(),
                     last_reinforced: chrono::Utc::now(),
                     fact_type: FactType::Pattern,
+                    invalidated_at: None,
+                    invalidated_by: None,
+                    contradicts: Vec::new(),
                 };
                 store.store(user_id, &fact).unwrap();
             }

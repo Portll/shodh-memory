@@ -53,6 +53,7 @@ fn create_entity_from_ner(
         is_proper_noun: is_proper,
         selectivity: None,
         fine_type: None,
+        kb_id: None,
     }
 }
 
@@ -84,6 +85,7 @@ fn create_entity(
         is_proper_noun: is_proper,
         selectivity: None,
         fine_type: None,
+        kb_id: None,
     }
 }
 
@@ -115,6 +117,7 @@ fn create_relationship(
         endpoint_selectivity: None,
         forman_curvature: None,
         provenance: Vec::new(),
+        promoted_at: None,
     }
 }
 

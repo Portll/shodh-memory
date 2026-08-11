@@ -154,13 +154,29 @@ pub fn ideal_single_step(spec: DecaySpec, age_days: f64) -> f32 {
 mod tests {
     use super::*;
 
-    /// Documents the bug: under the real ~6h cadence, a potentiated L3 edge
-    /// (which the model claims is "near-permanent") is crushed to the strength
-    /// floor within weeks, far below what the hybrid model intends at the same
-    /// age. This test is the regression rig — when the decay fix lands, the gap
-    /// between cadenced and ideal should collapse.
+    /// This test used to document a bug: under the real ~6h cadence a
+    /// potentiated L3 edge — the tier the model calls "near-permanent" — was
+    /// crushed to the strength floor within weeks, far below what the hybrid
+    /// model intends at the same age, because each `decay_at` call resets
+    /// `last_activated` and so never feeds a long elapsed time into the
+    /// power-law leg. Its docstring said "when the decay fix lands, the gap
+    /// between cadenced and ideal should collapse".
+    ///
+    /// **It has landed, and the gap is gone for L3.** Giving L3 its own time
+    /// scale (`decay::L3_TIME_SCALE_VS_L2` ≈ 0.0215) moves its crossover out to
+    /// ~140 real days, so the whole first-30-days window is now in the
+    /// *exponential* leg — and exponential decay is memoryless, i.e. cadence
+    /// invariant: N steps of h compose exactly into one jump of N·h. The
+    /// assertions below are inverted accordingly, and this is now the rig that
+    /// keeps them collapsed.
+    ///
+    /// Derivation for the value asserted (L3, potentiated ⇒ λ = 0.693 × 0.5 =
+    /// 0.3465/day, entirely within the exponential leg):
+    ///   scaled age = 30 × 0.0215054 = 0.6451613 days
+    ///   f          = exp(-0.3465 × 0.6451613) = exp(-0.2235483) = 0.7996772
+    ///   strength   = 0.7 × 0.7996772 = 0.5597740
     #[test]
-    fn cadenced_decay_floors_l3_far_below_intended() {
+    fn cadenced_and_intended_l3_decay_now_agree() {
         let spec = DecaySpec {
             tier: EdgeTier::L3Semantic,
             initial_strength: 0.7,
@@ -171,26 +187,55 @@ mod tests {
         let cadenced_30d = traj.final_strength();
         let intended_30d = ideal_single_step(spec, 30.0);
 
-        // The model intends a meaningful heavy-tail strength at 30 days...
+        // The model intends a substantial strength at 30 days...
         assert!(
             intended_30d > 0.1,
-            "intended (single-step power-law) strength at 30d should be substantial, got {intended_30d}"
+            "intended strength at 30d should be substantial, got {intended_30d}"
         );
-        // ...but the cadenced (production) path has floored it.
+        // ...and the cadenced (production) path now delivers it.
+        assert!(
+            (cadenced_30d - 0.559_774).abs() < 1e-3,
+            "cadenced L3 strength at 30d should be ~0.5598, got {cadenced_30d}"
+        );
+        // Cadence invariance: the two paths agree to within f32 accumulation
+        // noise over 120 steps. This is the property the fix bought.
+        assert!(
+            (cadenced_30d - intended_30d).abs() < 1e-3,
+            "cadenced {cadenced_30d} and intended {intended_30d} must now agree"
+        );
+        // And it never reaches the floor at all inside the window.
+        assert!(
+            traj.floored_at_days.is_none(),
+            "a potentiated L3 edge must no longer floor within 30 days, floored at {:?}",
+            traj.floored_at_days
+        );
+    }
+
+    /// The cadence artefact itself is NOT fixed — it is only routed around for
+    /// L3. L2 still crosses into the power-law leg at 3 days, so under the 6h
+    /// production cadence it is still crushed relative to what the model
+    /// intends. Pinning this keeps the remaining defect visible instead of
+    /// letting the L3 fix read as "decay is solved".
+    #[test]
+    fn cadence_artefact_still_bites_l2() {
+        let spec = DecaySpec {
+            tier: EdgeTier::L2Episodic,
+            initial_strength: 0.7,
+            ltp_status: LtpStatus::Full,
+        };
+
+        let traj = simulate(spec, 30.0, PRODUCTION_CADENCE_HOURS);
+        let cadenced_30d = traj.final_strength();
+        let intended_30d = ideal_single_step(spec, 30.0);
+
         assert!(
             cadenced_30d <= LTP_MIN_STRENGTH * 1.5,
-            "cadenced strength at 30d should be at/near the floor, got {cadenced_30d}"
+            "cadenced L2 strength at 30d is still at/near the floor, got {cadenced_30d}"
         );
-        // The gap is large — this is the bug's magnitude.
         assert!(
             intended_30d > cadenced_30d * 5.0,
-            "intended {intended_30d} should dwarf cadenced {cadenced_30d}"
+            "the L2 gap is still large: intended {intended_30d} vs cadenced {cadenced_30d}"
         );
-        // And it floored well before 30 days.
-        let floored = traj
-            .floored_at_days
-            .expect("a potentiated L3 edge should floor under cadence");
-        assert!(floored < 20.0, "L3 floored at {floored}d under cadence");
     }
 
     /// Sanity: a single decay step DOES exercise the power-law branch (matches

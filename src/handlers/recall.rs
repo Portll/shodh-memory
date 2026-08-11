@@ -42,6 +42,28 @@ use crate::validation;
 /// Application state type alias
 pub type AppState = std::sync::Arc<MultiUserMemoryManager>;
 
+/// Validate and build a `GeoFilter` from the `geo_lat`/`geo_lon`/`geo_radius_meters` triple
+/// shared by `recall` and `paginated_recall`. All three must be provided together, or none —
+/// a partial triple is a 400 `InvalidInput`, not a silent no-op.
+pub(crate) fn build_geo_filter(
+    lat: Option<f64>,
+    lon: Option<f64>,
+    radius: Option<f64>,
+) -> Result<Option<GeoFilter>, AppError> {
+    match (lat, lon, radius) {
+        (Some(lat), Some(lon), Some(radius)) => {
+            validation::validate_geo_filter(lat, lon, radius).map_validation_err("geo_filter")?;
+            Ok(Some(GeoFilter::new(lat, lon, radius)))
+        }
+        (None, None, None) => Ok(None),
+        _ => Err(AppError::InvalidInput {
+            field: "geo_filter".to_string(),
+            reason: "geo_lat, geo_lon, and geo_radius_meters must all be provided together"
+                .to_string(),
+        }),
+    }
+}
+
 /// Map API mode string to RetrievalMode enum.
 /// Defaults to Hybrid for unknown values (backward compat).
 fn parse_retrieval_mode(mode: &str) -> RetrievalMode {
@@ -348,6 +370,7 @@ pub struct RecallByDateRequest {
 #[tracing::instrument(skip(state), fields(user_id = %req.user_id, query = %req.query))]
 pub async fn recall(
     State(state): State<AppState>,
+    trace: Option<axum::Extension<crate::handlers::trace::OpTrace>>,
     Json(req): Json<RecallRequest>,
 ) -> Result<Json<RecallResponse>, AppError> {
     let op_start = std::time::Instant::now();
@@ -389,20 +412,7 @@ pub async fn recall(
     }
 
     // Validate and build geo_filter from lat/lon/radius triple
-    let geo_filter = match (req.geo_lat, req.geo_lon, req.geo_radius_meters) {
-        (Some(lat), Some(lon), Some(radius)) => {
-            validation::validate_geo_filter(lat, lon, radius).map_validation_err("geo_filter")?;
-            Some(GeoFilter::new(lat, lon, radius))
-        }
-        (None, None, None) => None,
-        _ => {
-            return Err(AppError::InvalidInput {
-                field: "geo_filter".to_string(),
-                reason: "geo_lat, geo_lon, and geo_radius_meters must all be provided together"
-                    .to_string(),
-            });
-        }
-    };
+    let geo_filter = build_geo_filter(req.geo_lat, req.geo_lon, req.geo_radius_meters)?;
 
     // Build reward range from min/max pair
     let reward_range = match (req.reward_min, req.reward_max) {
@@ -812,6 +822,8 @@ pub async fn recall(
                     content: m.experience.content.clone(),
                     memory_type: Some(format!("{:?}", m.experience.experience_type)),
                     tags: m.experience.entities.clone(),
+                    geo_location: m.experience.geo_location,
+                    toponyms: m.experience.toponyms.clone(),
                 },
                 importance: m.importance(),
                 created_at: m.created_at.to_rfc3339(),
@@ -1105,6 +1117,18 @@ pub async fn recall(
                 avg_score,
             },
         );
+    }
+
+    // Trace enrichment (witnessed-op capture): identity + the evidence set —
+    // which memories this recall actually surfaced. The middleware owns the
+    // rest of the record.
+    if let Some(axum::Extension(trace)) = &trace {
+        trace.set_identity(&req.user_id, req.session_id.as_deref());
+        trace.push_evidence(recall_memories.iter().map(|m| m.id.clone()));
+        trace.set_summary(format!(
+            "query: {}",
+            req.query.chars().take(200).collect::<String>()
+        ));
     }
 
     // Build reminder count for response
@@ -1669,20 +1693,33 @@ pub async fn proactive_context(
             tokio::task::spawn_blocking(move || {
                 let memory_guard = memory_sys_for_reinforce.read();
 
-                // Reinforce helpful memories (importance boost)
+                // MomentumPolicy::Skip on both calls: Phase 3 above already drove
+                // each of these memories' momentum EMA with its own graded,
+                // confidence-weighted signal, and `helpful_ids` / `misleading_ids`
+                // are just the classification of that same evidence. Letting
+                // reinforce_recall apply momentum again would charge one
+                // observation twice — and the second charge is a blunt ±1.0 at
+                // confidence 1.0 that swamps the graded value and inflates
+                // signal_count, which raises effective_inertia and makes the
+                // memory harder to correct later. What this path still wants from
+                // reinforce_recall is everything else it does: importance,
+                // coactivation, and entity-edge Hebbian updates.
                 if !helpful_ids.is_empty() {
-                    if let Err(e) = memory_guard
-                        .reinforce_recall(&helpful_ids, crate::memory::RetrievalOutcome::Helpful)
-                    {
+                    if let Err(e) = memory_guard.reinforce_recall_with_momentum(
+                        &helpful_ids,
+                        crate::memory::RetrievalOutcome::Helpful,
+                        crate::memory::MomentumPolicy::Skip,
+                    ) {
                         tracing::warn!("Failed to reinforce helpful memories: {}", e);
                     }
                 }
 
                 // Weaken misleading memories (importance decay)
                 if !misleading_ids.is_empty() {
-                    if let Err(e) = memory_guard.reinforce_recall(
+                    if let Err(e) = memory_guard.reinforce_recall_with_momentum(
                         &misleading_ids,
                         crate::memory::RetrievalOutcome::Misleading,
+                        crate::memory::MomentumPolicy::Skip,
                     ) {
                         tracing::warn!("Failed to weaken misleading memories: {}", e);
                     }
@@ -3139,6 +3176,8 @@ pub async fn recall_tracked(
                     content: m.experience.content.clone(),
                     memory_type: Some(format!("{:?}", m.experience.experience_type)),
                     tags: m.experience.entities.clone(),
+                    geo_location: m.experience.geo_location,
+                    toponyms: m.experience.toponyms.clone(),
                 },
                 importance: m.importance(),
                 created_at: m.created_at.to_rfc3339(),
@@ -3453,29 +3492,42 @@ pub struct PaginatedRecallResponse {
 /// Useful for large memory stores where results need to be paged through.
 pub async fn paginated_recall(
     State(state): State<AppState>,
+    trace: Option<axum::Extension<crate::handlers::trace::OpTrace>>,
     Json(req): Json<RecallRequest>,
 ) -> Result<Json<PaginatedRecallResponse>, AppError> {
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
     validation::validate_max_results(req.limit).map_validation_err("limit")?;
     validation::validate_query_text(&req.query).map_validation_err("query")?;
+    // Review C2: an unvalidated session_id would pass through to the oplog
+    // append, be rejected there, and silently suppress the witnessed record
+    // while the caller sees 200 — a caller-controlled audit-trail bypass.
+    if let Some(sid) = &req.session_id {
+        validation::validate_session_id(sid).map_validation_err("session_id")?;
+    }
 
     let retrieval_mode = parse_retrieval_mode(&req.mode);
 
     // Validate and build geo_filter
-    let geo_filter = match (req.geo_lat, req.geo_lon, req.geo_radius_meters) {
-        (Some(lat), Some(lon), Some(radius)) => {
-            validation::validate_geo_filter(lat, lon, radius).map_validation_err("geo_filter")?;
-            Some(GeoFilter::new(lat, lon, radius))
-        }
-        (None, None, None) => None,
-        _ => {
+    let geo_filter = build_geo_filter(req.geo_lat, req.geo_lon, req.geo_radius_meters)?;
+
+    // Pre-flight validation for robotics retrieval modes.
+    // Catch missing required parameters here (400) instead of deep in the retrieval
+    // engine where errors get wrapped as INTERNAL_ERROR (500). Mirrors `recall`'s guard.
+    match retrieval_mode {
+        RetrievalMode::Spatial if geo_filter.is_none() => {
             return Err(AppError::InvalidInput {
                 field: "geo_filter".to_string(),
-                reason: "geo_lat, geo_lon, and geo_radius_meters must all be provided together"
-                    .to_string(),
+                reason: "spatial mode requires geo_lat, geo_lon, and geo_radius_meters".to_string(),
             });
         }
-    };
+        RetrievalMode::Mission if req.mission_id.is_none() => {
+            return Err(AppError::InvalidInput {
+                field: "mission_id".to_string(),
+                reason: "mission mode requires mission_id parameter".to_string(),
+            });
+        }
+        _ => {}
+    }
 
     let reward_range = match (req.reward_min, req.reward_max) {
         (Some(min), Some(max)) => Some((min, max)),
@@ -3540,6 +3592,8 @@ pub async fn paginated_recall(
                     content: m.experience.content.clone(),
                     memory_type: Some(format!("{:?}", m.experience.experience_type)),
                     tags: m.experience.entities.clone(),
+                    geo_location: m.experience.geo_location,
+                    toponyms: m.experience.toponyms.clone(),
                 },
                 importance: m.importance(),
                 created_at: m.created_at.to_rfc3339(),
@@ -3549,6 +3603,16 @@ pub async fn paginated_recall(
             }
         })
         .collect();
+
+    // Trace enrichment (witnessed-op capture): identity + surfaced page ids.
+    if let Some(axum::Extension(trace)) = &trace {
+        trace.set_identity(&req.user_id, req.session_id.as_deref());
+        trace.push_evidence(memories.iter().map(|m| m.id.clone()));
+        trace.set_summary(format!(
+            "query: {}",
+            req.query.chars().take(200).collect::<String>()
+        ));
+    }
 
     Ok(Json(PaginatedRecallResponse {
         memories,
@@ -3602,5 +3666,21 @@ mod layer_mode_parsing_tests {
         assert_eq!(parse_layer_mode("Full"), None); // case-sensitive on purpose
         assert_eq!(parse_layer_mode("+SPREADING"), None);
         assert_eq!(parse_layer_mode(""), None);
+    }
+}
+
+#[cfg(test)]
+mod geo_filter_builder_tests {
+    use super::build_geo_filter;
+
+    #[test]
+    fn build_geo_filter_all_or_none() {
+        assert!(build_geo_filter(Some(39.0), Some(-76.0), Some(1000.0))
+            .unwrap()
+            .is_some());
+        assert!(build_geo_filter(None, None, None).unwrap().is_none());
+        assert!(build_geo_filter(Some(39.0), None, None).is_err()); // partial → 400
+        assert!(build_geo_filter(Some(999.0), Some(-76.0), Some(1000.0)).is_err());
+        // invalid lat
     }
 }

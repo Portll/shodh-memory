@@ -20,7 +20,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -29,14 +29,14 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y llvm-dev libclang-dev clang
 
       - name: Cache MiniLM embedder
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.cache/shodh-memory/models
           key: shodh-models-minilm-c9745ed1
 
       - name: Cache GLiNER typer assets
         id: gliner-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: models/gliner-bi-edge
           key: gliner-bi-edge-onnx-v1

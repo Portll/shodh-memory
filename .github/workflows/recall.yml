@@ -65,7 +65,7 @@ jobs:
     # 60min keeps headroom for cold builds and unusually slow runners.
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -86,7 +86,7 @@ jobs:
       # Assets are published as a repo release and cached by tag.
       - name: Cache GLiNER typer assets
         id: gliner-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: models/gliner-bi-edge
           key: gliner-bi-edge-onnx-v1
@@ -99,6 +99,40 @@ jobs:
           mkdir -p models/gliner-bi-edge
           gh release download gliner-bi-edge-onnx-v1 --repo "$GITHUB_REPOSITORY" --dir models/gliner-bi-edge
           ls -la models/gliner-bi-edge
+
+      # Pre-supply the MiniLM embedder the same way ci.yml's Build job does
+      # (shared cache keys — a warm cache means neither workflow touches
+      # HuggingFace). Without this the eval binary downloads MiniLM at runtime,
+      # and one HF hiccup fails the gate as `infrastructure` — which is exactly
+      # how run 31227613424 went red on a PR whose quality deltas were +0.0000.
+      # SHODH_ALLOW_SIMPLIFIED_EMBEDDINGS is never set here: degrading the
+      # embedder would make the recall numbers meaningless.
+      - name: Cache MiniLM embedder weights
+        id: minilm-cache
+        uses: actions/cache@v6
+        with:
+          path: models/minilm-l6
+          key: minilm-l6-c9745ed1-v1
+
+      - name: Fetch MiniLM embedder weights
+        if: steps.minilm-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p models/minilm-l6
+          BASE="https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/c9745ed1d9f207416be6d2e6f8de32d1f16199bf"
+          curl -fL --retry 5 --retry-delay 5 --connect-timeout 30 -o models/minilm-l6/model_quantized.onnx "$BASE/onnx/model_quint8_avx2.onnx"
+          curl -fL --retry 5 --retry-delay 5 --connect-timeout 30 -o models/minilm-l6/tokenizer.json "$BASE/tokenizer.json"
+          ls -la models/minilm-l6
+
+      - name: Verify model assets (hard gate — refuse to run on missing/degraded assets)
+        run: |
+          SHODH_MODEL_PATH="${{ github.workspace }}/models/minilm-l6"
+          SHODH_GLINER_MODEL_PATH="${{ github.workspace }}/models/gliner-bi-edge"
+          test -s "$SHODH_MODEL_PATH/model_quantized.onnx" || { echo "::error::MiniLM weights missing"; exit 1; }
+          test -s "$SHODH_MODEL_PATH/tokenizer.json" || { echo "::error::MiniLM tokenizer missing"; exit 1; }
+          test -s "$SHODH_GLINER_MODEL_PATH/model.onnx" || { echo "::error::GLiNER model missing — refusing to measure fallback NER"; exit 1; }
+          test -s "$SHODH_GLINER_MODEL_PATH/tokenizer.json" || { echo "::error::GLiNER tokenizer missing"; exit 1; }
+          test -s "$SHODH_GLINER_MODEL_PATH/label_embeddings.bin" || { echo "::error::GLiNER label embeddings missing"; exit 1; }
 
       - name: Verify baseline is checked in
         run: |
@@ -118,6 +152,7 @@ jobs:
       - name: Run L1 smoke suite vs. baseline
         id: run_eval
         env:
+          SHODH_MODEL_PATH: ${{ github.workspace }}/models/minilm-l6
           SHODH_GLINER_MODEL_PATH: ${{ github.workspace }}/models/gliner-bi-edge
         run: |
           set +e
@@ -157,7 +192,7 @@ jobs:
 
       - name: Upload JSON report
         if: always() && hashFiles('current.json') != ''
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: recall-eval-report
           path: |

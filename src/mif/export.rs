@@ -407,6 +407,7 @@ fn convert_todo(t: &Todo) -> MifTodo {
         comments,
         related_memory_ids: t.related_memory_ids.iter().map(|id| id.0).collect(),
         external_id: t.external_id.clone(),
+        blocked_by: t.blocked_by.iter().map(|id| id.0).collect(),
     }
 }
 
@@ -569,6 +570,7 @@ fn relation_type_to_string(r: &crate::graph_memory::RelationType) -> String {
         RelationType::AlternativeTo => "alternative_to",
         RelationType::AssignedTo => "assigned_to",
         RelationType::Approves => "approves",
+        RelationType::Precedes => "precedes",
         RelationType::Custom(s) => return s.to_lowercase(),
     }
     .to_string()
@@ -628,6 +630,7 @@ mod tests {
             is_proper_noun: true,
             selectivity: None,
             fine_type: Some("bridge".to_string()),
+            kb_id: None,
         };
         graph.add_entity(entity).unwrap();
 
@@ -678,6 +681,7 @@ mod tests {
             is_proper_noun: false,
             selectivity: None,
             fine_type: None,
+            kb_id: None,
         };
         graph.add_entity(entity).unwrap();
 

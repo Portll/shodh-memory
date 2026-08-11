@@ -4,7 +4,7 @@
 //! Includes live browser-based graph visualization with SSE updates.
 
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Path, State},
     response::{Html, Json},
 };
 use serde::{Deserialize, Serialize};
@@ -202,12 +202,6 @@ pub async fn build_visualization(
     Ok(Json(stats))
 }
 
-/// Query parameters for graph view
-#[derive(Debug, Deserialize)]
-pub struct GraphViewParams {
-    pub user_id: Option<String>,
-}
-
 /// Graph node for d3.js visualization
 #[derive(Debug, Serialize)]
 pub struct GraphNode {
@@ -247,17 +241,91 @@ pub struct GraphDataStats {
     pub l3_edges: usize,
 }
 
-/// GET /graph/view - Serve interactive graph visualization HTML
-pub async fn graph_view(Query(params): Query<GraphViewParams>) -> Html<String> {
-    let user_id = params.user_id.unwrap_or_else(|| "default".to_string());
-    Html(generate_graph_html(&user_id))
+/// Tombstone served by the two retired built-in web UIs (`/dashboard` and
+/// `/graph/view`).
+///
+/// Both were hand-maintained forks of the same single-page dashboard that
+/// `front/` (the `shodh-front` crate) now owns, and they had drifted apart —
+/// `/dashboard` was ~773 lines behind the canonical page and lacked the
+/// identity selector and multi-user union-merge entirely, while `/graph/view`
+/// predated the current graph API and still read the older
+/// `/api/graph/data/{user}` + `/api/events/sse` pair rather than
+/// `/api/graph/{user}/universe` + `/api/events` (both older endpoints remain
+/// mounted and are unaffected by this change). Keeping three copies of one UI in
+/// sync cost real commits (e.g. a colour-map change that had to touch two
+/// files), so the forks are retired rather than forked again.
+///
+/// This page is deliberately **static**: it interpolates nothing from the
+/// request, so — unlike the HTML it replaces, which had to escape `user_id`
+/// against reflected XSS — it cannot echo attacker-controlled input at all.
+///
+/// It is a 200 with an explanation rather than a 30x redirect because
+/// `shodh-front` is a separate binary on a separate port that this server
+/// neither launches nor can detect: a blind redirect to a port that may have
+/// nothing listening would turn a working page into a browser connection
+/// error, and this server has no way to know the front's real address.
+const MOVED_HTML: &str = r#"<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>shodh — this surface has moved</title>
+<style>
+  :root{color-scheme:dark;}
+  body{margin:0;min-height:100vh;display:grid;place-items:center;
+    background:#0b0e14;color:#dfe7f0;
+    font:15px/1.6 Inter,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;}
+  main{max-width:620px;padding:32px 28px;border:1px solid #1c2534;border-radius:12px;
+    background:linear-gradient(180deg,#0e131c,#0a0d14);}
+  h1{margin:0 0 4px;font-size:19px;letter-spacing:.2px;font-weight:600;}
+  .tag{font:600 9.5px/1 "Cascadia Code",Consolas,monospace;letter-spacing:.9px;
+    text-transform:uppercase;color:#ff9a5c;margin-bottom:14px;}
+  p{margin:0 0 12px;color:#9fb2c2;}
+  a.go{display:inline-block;margin:6px 0 16px;padding:9px 16px;border-radius:8px;
+    border:1px solid #2e4a66;background:rgba(120,175,214,.12);
+    color:#82a0dc;text-decoration:none;font-weight:600;}
+  a.go:hover{background:rgba(120,175,214,.2);}
+  code{font-family:"Cascadia Code",Consolas,monospace;font-size:12.5px;color:#c9b280;}
+  ul{margin:0;padding-left:18px;color:#9fb2c2;}
+  li{margin-bottom:6px;}
+  .fine{margin-top:18px;padding-top:14px;border-top:1px solid #1c2534;
+    font-size:12.5px;color:#6f7f8f;}
+</style>
+</head>
+<body>
+<main>
+  <div class="tag">retired surface</div>
+  <h1>The built-in web UI has moved.</h1>
+  <p><code>/dashboard</code> and <code>/graph/view</code> were forks of the same
+     single-page dashboard and had drifted apart. There is now one canonical web
+     surface: <strong>shodh-front</strong>.</p>
+  <a class="go" href="http://127.0.0.1:8787/">Open shodh-front &rarr;</a>
+  <ul>
+    <li>shodh-front is a separate binary. Start it with
+        <code>cargo run --release --manifest-path front/Cargo.toml</code>.</li>
+    <li>It listens on <code>127.0.0.1:8787</code> by default —
+        set <code>SHODH_FRONT_PORT</code> to change that.</li>
+    <li>It reverse-proxies <code>/api/*</code> to this server
+        (<code>SHODH_API_URL</code>, default <code>http://127.0.0.1:3030</code>)
+        and injects <code>SHODH_API_KEY</code> as <code>X-API-Key</code>,
+        so the page itself holds no credentials.</li>
+  </ul>
+  <p class="fine">This server's <code>/api/*</code> endpoints are unchanged —
+     only the two bundled HTML pages were removed. For a terminal UI,
+     run <code>shodh tui</code>.</p>
+</main>
+</body>
+</html>
+"#;
+
+/// GET /graph/view - retired; the canonical graph UI is the shodh-front crate.
+pub async fn graph_view() -> Html<&'static str> {
+    Html(MOVED_HTML)
 }
 
-/// GET /dashboard - LLM-free memory dashboard: deterministic search (/api/recall)
-/// + the knowledge graph with typed relationships and document provenance
-/// (/api/graph/{user}/export). The web parallel to the TUI, served by shodh itself.
-pub async fn dashboard() -> Html<String> {
-    Html(include_str!("dashboard.html").to_string())
+/// GET /dashboard - retired; the canonical web dashboard is the shodh-front crate.
+pub async fn dashboard() -> Html<&'static str> {
+    Html(MOVED_HTML)
 }
 
 /// GET /api/graph/data/{user_id} - Get graph data as JSON for d3.js
@@ -396,17 +464,4 @@ pub async fn get_graph_data(
         nodes,
         edges,
     }))
-}
-
-/// Generate the HTML page for graph visualization (includes 2D/3D toggle)
-fn generate_graph_html(user_id: &str) -> String {
-    let html = include_str!("graph_view.html");
-    // HTML-escape user_id to prevent reflected XSS via query parameter injection
-    let escaped = user_id
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&#x27;");
-    html.replace("{{USER_ID}}", &escaped)
 }

@@ -47,8 +47,11 @@ impl CausalRelation {
     ///
     /// When edge A→B has relation R, traversing B→A should show R.inverse().
     /// True pairs: Caused↔ResolvedBy. Directional relations (InformedBy,
-    /// TriggeredBy) are self-inverse because the from/to already encodes
-    /// directionality — "A informed-by B" reversed is "B informed A".
+    /// TriggeredBy) are self-inverse because the from/to already encodes the
+    /// direction: the edge label does not change when you walk it backwards,
+    /// only the sentence you read off it does. Edge A→B labelled InformedBy
+    /// reads "A informed B" forwards and "B was informed by A" backwards, and
+    /// both describe the same stored edge.
     pub fn inverse(&self) -> Self {
         match self {
             CausalRelation::Caused => CausalRelation::ResolvedBy,
@@ -82,7 +85,14 @@ impl CausalRelation {
         match self {
             CausalRelation::Caused => "caused",
             CausalRelation::ResolvedBy => "was resolved by",
-            CausalRelation::InformedBy => "was informed by",
+            // "informed", not "was informed by": every relation here is read
+            // FROM → TO, and the inference table writes (Learning, Decision) =>
+            // InformedBy with from = the learning that informed the decision
+            // (`infer_by_types`, and its own comment "observation informed a
+            // decision"). The passive reading inverted the causal arrow. The
+            // "-By" in the variant name is a label, not the sentence — the same
+            // is already true of TriggeredBy, which reads "triggered".
+            CausalRelation::InformedBy => "informed",
             CausalRelation::SupersededBy => "was superseded by",
             CausalRelation::TriggeredBy => "triggered",
             CausalRelation::BranchedFrom => "branched from",
@@ -468,8 +478,29 @@ impl LineageGraph {
         Ok(edges)
     }
 
-    /// List all edges for a user
+    /// List a user's lineage edges, newest first.
+    ///
+    /// `limit` bounds what is RETURNED, not what is scanned. The scan itself is
+    /// capped separately at [`EDGE_SCAN_LIMIT`] because the two limits answer
+    /// different questions: the caller says how many edges it wants, and the
+    /// cap says how much of the store we are willing to read to rank them.
+    ///
+    /// Truncating during the scan and sorting afterwards — which is what this
+    /// did — makes "newest first" untrue: it returns the newest members of an
+    /// arbitrary storage-order prefix, so an edge created a minute ago is
+    /// invisible behind `limit` older ones that happen to sort earlier by key.
+    /// A caller asking for the ten most recent edges got ten edges that were
+    /// merely recent among the first ten found.
     pub fn list_edges(&self, user_id: &str, limit: usize) -> Result<Vec<LineageEdge>> {
+        /// How many edges a single listing will read before it stops ranking.
+        ///
+        /// Ordering by recency requires seeing every candidate, but a user with
+        /// a very large lineage graph should not turn one listing into an
+        /// unbounded scan. Ten thousand matches the cap `stats()` already uses
+        /// for the same trade-off. Beyond it the result is still newest-first
+        /// within what was read, which is the same guarantee `stats()` gives.
+        const EDGE_SCAN_LIMIT: usize = 10_000;
+
         let prefix = format!("lineage:edges:{}:", user_id);
         let mut edges = Vec::new();
 
@@ -488,14 +519,15 @@ impl LineageGraph {
 
             if let Ok((edge, _)) = crate::serialization::try_decode::<LineageEdge>(&value) {
                 edges.push(edge);
-                if edges.len() >= limit {
+                if edges.len() >= EDGE_SCAN_LIMIT {
                     break;
                 }
             }
         }
 
-        // Sort by creation time (newest first)
+        // Rank the whole scanned set, THEN cut to what the caller asked for.
         edges.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        edges.truncate(limit);
         Ok(edges)
     }
 
@@ -1299,6 +1331,13 @@ impl LineageGraph {
         queue.push_back((memory_id.clone(), 0));
         visited.insert(memory_id.clone());
 
+        // Deepest hop actually walked. `path` and `edges` gain one entry per
+        // newly-visited node, so `path.len() - 1` is the node count and equals
+        // `edges.len()` in every trace — it is not a depth. Reporting it as one
+        // made a max_depth=5 request print "Depth reached: 31 │ Edges: 31" and
+        // a model reading that mistrusts its own parameters.
+        let mut depth_reached = 0usize;
+
         while let Some((current_id, depth)) = queue.pop_front() {
             if depth >= max_depth {
                 continue;
@@ -1332,17 +1371,17 @@ impl LineageGraph {
                     path.push(next_id.clone());
                     edges.push(edge);
                     queue.push_back((next_id, depth + 1));
+                    depth_reached = depth_reached.max(depth + 1);
                 }
             }
         }
 
-        let depth = path.len().saturating_sub(1);
         Ok(LineageTrace {
             root: memory_id.clone(),
             direction,
             edges,
             path,
-            depth,
+            depth: depth_reached,
         })
     }
 
@@ -1533,6 +1572,63 @@ mod tests {
 
         let to_edges = graph.get_edges_to("user-1", &to1).unwrap();
         assert_eq!(to_edges.len(), 1);
+    }
+
+    /// Every relation's verb must read correctly FROM → TO.
+    ///
+    /// This is the test whose absence let `InformedBy` describe itself as "was
+    /// informed by" while the inference table wrote `(Learning, Decision) =>
+    /// InformedBy` — from = the learning that informed the decision. The
+    /// sentence inverted the causal arrow, and nothing caught it because
+    /// `description()` has no callers inside this crate: it is rendered by
+    /// clients, so a wrong verb is invisible here and wrong everywhere else.
+    ///
+    /// Read each assertion as a sentence with the edge's endpoints substituted
+    /// in. "-By" in a variant name is a label, not the sentence: `TriggeredBy`
+    /// has always read "triggered" for the same reason.
+    #[test]
+    fn every_relation_reads_correctly_from_source_to_target() {
+        // (Error, Task) => Caused — "the error caused the task"
+        assert_eq!(CausalRelation::Caused.description(), "caused");
+        // (Task, Learning) => ResolvedBy — "the task was resolved by the learning"
+        assert_eq!(CausalRelation::ResolvedBy.description(), "was resolved by");
+        // (Learning, Decision) => InformedBy — "the learning informed the decision"
+        assert_eq!(CausalRelation::InformedBy.description(), "informed");
+        // (Discovery, Task) => TriggeredBy — "the discovery triggered the task"
+        assert_eq!(CausalRelation::TriggeredBy.description(), "triggered");
+        // (Decision, Decision) => SupersededBy, from = the earlier decision —
+        // "the older decision was superseded by the newer one"
+        assert_eq!(
+            CausalRelation::SupersededBy.description(),
+            "was superseded by"
+        );
+        // Branch anchoring writes from = pivot, to = origin
+        assert_eq!(CausalRelation::BranchedFrom.description(), "branched from");
+        assert_eq!(CausalRelation::RelatedTo.description(), "is related to");
+    }
+
+    /// `from` is the EARLIER memory, and the inferred relation must agree.
+    ///
+    /// Pins the convention the verbs above depend on: `infer_relation(a, b)`
+    /// treats `a` as the cause-side memory. If that ever flips, the sentences
+    /// become wrong even though every individual verb is still "correct".
+    #[test]
+    fn inference_reads_the_earlier_memory_as_the_source() {
+        let (graph, _dir) = create_test_graph();
+
+        let learning = create_test_memory(ExperienceType::Learning, vec!["auth", "login"]);
+        let mut decision = create_test_memory(ExperienceType::Decision, vec!["auth", "login"]);
+        decision.created_at = learning.created_at + Duration::days(1);
+
+        let (relation, _) = graph
+            .infer_relation(&learning, &decision)
+            .expect("learning → decision is a known type pair");
+        assert_eq!(relation, CausalRelation::InformedBy);
+        // The whole sentence, as a client would render it.
+        assert_eq!(
+            format!("learning {} decision", relation.description()),
+            "learning informed decision"
+        );
     }
 
     #[test]

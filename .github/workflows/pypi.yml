@@ -17,7 +17,7 @@ jobs:
     runs-on: ubuntu-latest
     container: quay.io/pypa/manylinux_2_28_x86_64
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install dependencies
         run: |
@@ -106,7 +106,7 @@ jobs:
         shell: bash
 
       - name: Upload wheels
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: wheels-linux
           path: dist/*.whl
@@ -115,9 +115,9 @@ jobs:
     name: Build macOS ARM64 wheels
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.11'
 
@@ -204,7 +204,7 @@ jobs:
           unzip -l dist/*.whl
 
       - name: Upload wheels
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: wheels-macos-arm
           path: dist/*.whl
@@ -213,9 +213,9 @@ jobs:
     name: Build macOS x64 wheels
     runs-on: macos-latest  # ARM runner, cross-compile to x64
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.11'
 
@@ -304,7 +304,7 @@ jobs:
           unzip -l dist/*.whl
 
       - name: Upload wheels
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: wheels-macos-x64
           path: dist/*.whl
@@ -313,9 +313,9 @@ jobs:
     name: Build Windows wheels
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.11'
 
@@ -410,7 +410,7 @@ jobs:
           Get-ChildItem wheel_inspect -Recurse | Select-Object FullName
 
       - name: Upload wheels
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: wheels-windows
           path: dist/*.whl
@@ -419,9 +419,9 @@ jobs:
     name: Build source distribution
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.11'
 
@@ -432,7 +432,7 @@ jobs:
         run: maturin sdist --out dist
 
       - name: Upload sdist
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: sdist
           path: dist/*.tar.gz
@@ -448,7 +448,7 @@ jobs:
 
     steps:
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true

@@ -407,6 +407,7 @@ pub fn build_rich_context(
 #[tracing::instrument(skip(state), fields(user_id = %req.user_id))]
 pub async fn remember(
     State(state): State<AppState>,
+    trace: Option<axum::Extension<crate::handlers::trace::OpTrace>>,
     Json(req): Json<RememberRequest>,
 ) -> Result<Json<RememberResponse>, AppError> {
     let op_start = std::time::Instant::now();
@@ -439,8 +440,15 @@ pub async fn remember(
                         fine_label: e.fine_label,
                     })
                     .collect::<Vec<NerEntityRecord>>(),
+                // Reaching here means BOTH the neural typer and the rule-based
+                // fallback failed — the memory is about to be stored with no
+                // typed entities at all, which starves graph labelling and the
+                // toponym gazetteer. That is not a debug-level event.
                 Err(e) => {
-                    tracing::debug!("NER extraction failed: {}", e);
+                    tracing::warn!(
+                        "NER extraction failed on remember — storing memory with NO typed \
+                         entities: {e}"
+                    );
                     Vec::new()
                 }
             }
@@ -683,6 +691,11 @@ pub async fn remember(
         }
     }
 
+    // Resolve place mentions to coordinates. Deliberately NOT written to
+    // geo_location: that field means "recorded here" and feeds the geohash
+    // radius index, while these are places the content merely talks about.
+    let toponyms = crate::gazetteer::resolve_ner_locations(&ner_entities);
+
     let experience = Experience {
         content: req.content.clone(),
         experience_type,
@@ -690,6 +703,7 @@ pub async fn remember(
         tags: merged_entities,
         context,
         ner_entities,
+        toponyms,
         importance_override: req.importance.map(|v| v.clamp(0.0, 1.0)),
         metadata: req.metadata,
         robot_id: req.robot_id.clone(),
@@ -718,7 +732,11 @@ pub async fn remember(
         .get_user_memory(&req.user_id)
         .map_err(AppError::Internal)?;
 
-    let memory_id = {
+    // `_detailed` so a content-hash dedup hit reports whether it MERGED
+    // enrichment into the stored memory. Without that signal the merged entity
+    // set would reach RocksDB and BM25 but never the graph, because the
+    // episode already exists and the graph pass is idempotent.
+    let outcome = {
         let memory = memory.clone();
         let exp_clone = experience.clone();
         let created_at = req.created_at;
@@ -728,15 +746,22 @@ pub async fn remember(
         tokio::task::spawn_blocking(move || {
             let memory_guard = memory.read();
             if agent_id.is_some() || run_id.is_some() {
-                memory_guard.remember_with_agent(exp_clone, created_at, agent_id, run_id)
+                memory_guard.remember_with_agent_detailed(exp_clone, created_at, agent_id, run_id)
             } else {
-                memory_guard.remember(exp_clone, created_at)
+                memory_guard.remember_detailed(exp_clone, created_at)
             }
         })
         .await
         .map_err(|e| AppError::Internal(anyhow::anyhow!("Blocking task panicked: {e}")))?
         .map_err(AppError::Internal)?
     };
+    let memory_id = outcome.id.clone();
+
+    // A merge that added entities makes the memory's stored experience RICHER
+    // than the one this request carried, so every downstream pass (graph, NER
+    // embeddings, temporal facts) must run on the merged copy, not the request.
+    let needs_graph_rebuild = outcome.needs_graph_rebuild();
+    let experience = outcome.merged_experience.clone().unwrap_or(experience);
 
     // Record metrics + session + broadcast BEFORE returning response (fast, <1ms)
     let duration = op_start.elapsed().as_secs_f64();
@@ -835,12 +860,27 @@ pub async fn remember(
             // on the SSE stream so live consumers (dashboard anomaly feed) see
             // each episode's statistical shape as it lands. Read-time deviation
             // scoring stays in /api/anomalies; this event carries the raw facts.
-            match state.process_experience_into_graph(
-                &user_id,
-                &experience,
-                &memory_id,
-                entity_embeddings.as_ref(),
-            ) {
+            let graph_pass = if needs_graph_rebuild {
+                // The episode exists and was built from the pre-merge entity
+                // set, so the idempotency guard would skip it. Demolish and
+                // rebuild from the MERGED experience — see
+                // `AppState::rebuild_experience_graph`.
+                state.rebuild_experience_graph(
+                    &user_id,
+                    &experience,
+                    &memory_id,
+                    entity_embeddings.as_ref(),
+                )
+            } else {
+                state.process_experience_into_graph(
+                    &user_id,
+                    &experience,
+                    &memory_id,
+                    entity_embeddings.as_ref(),
+                )
+            };
+
+            match graph_pass {
                 Ok(Some(surprise)) => {
                     state.emit_event(MemoryEvent {
                         event_type: "surprise".to_string(),
@@ -925,6 +965,14 @@ pub async fn remember(
         });
     }
 
+    // Trace enrichment (witnessed-op capture): the stored memory id is this
+    // op's evidence. RememberRequest carries no session_id — the middleware's
+    // session-store fallback covers it (same store this handler already uses).
+    if let Some(axum::Extension(trace)) = &trace {
+        trace.set_identity(&req.user_id, None);
+        trace.push_evidence([response_id.clone()]);
+    }
+
     Ok(Json(RememberResponse {
         id: response_id,
         success: true,
@@ -935,12 +983,20 @@ pub async fn remember(
 #[tracing::instrument(skip(state), fields(user_id = %req.user_id, batch_size = req.memories.len()))]
 pub async fn batch_remember(
     State(state): State<AppState>,
+    trace: Option<axum::Extension<crate::handlers::trace::OpTrace>>,
     Json(req): Json<BatchRememberRequest>,
 ) -> Result<Json<BatchRememberResponse>, AppError> {
     let op_start = std::time::Instant::now();
     let batch_size = req.memories.len();
 
     validation::validate_user_id(&req.user_id).map_validation_err("user_id")?;
+
+    // Trace identity set at the TOP so every success path — including the
+    // empty-batch early return below — is enriched (review I3: a 200 with
+    // zero records was being counted as a capture failure).
+    if let Some(axum::Extension(trace)) = &trace {
+        trace.set_identity(&req.user_id, None);
+    }
 
     if req.memories.is_empty() {
         return Ok(Json(BatchRememberResponse {
@@ -1035,7 +1091,10 @@ pub async fn batch_remember(
                     })
                     .collect(),
                 Err(e) => {
-                    tracing::debug!("NER extraction failed for batch item {}: {}", index, e);
+                    tracing::warn!(
+                        "NER extraction failed for batch item {index} — storing memory with NO \
+                         typed entities: {e}"
+                    );
                     Vec::new()
                 }
             };
@@ -1104,6 +1163,8 @@ pub async fn batch_remember(
             item.preceding_memory_id.clone(),
         );
 
+        let toponyms = crate::gazetteer::resolve_ner_locations(&ner_records);
+
         let experience = Experience {
             content: item.content,
             experience_type,
@@ -1111,6 +1172,7 @@ pub async fn batch_remember(
             tags: merged_entities,
             context,
             ner_entities: ner_records,
+            toponyms,
             importance_override: item.importance.map(|v| v.clamp(0.0, 1.0)),
             ..Default::default()
         };
@@ -1124,14 +1186,20 @@ pub async fn batch_remember(
         let experiences = experiences_with_index;
         tokio::task::spawn_blocking(move || {
             let memory_guard = memory.read();
-            let mut results: Vec<(usize, String, Experience)> =
+            // (index, memory_id, experience-to-graph, rebuild-required).
+            // The experience carried forward is the MERGED one when a dedup hit
+            // enriched the stored memory, so the graph pass below sees the union
+            // rather than just this item's own entities.
+            let mut results: Vec<(usize, String, Experience, bool)> =
                 Vec::with_capacity(experiences.len());
             let mut errors: Vec<BatchErrorItem> = Vec::new();
 
             for (index, experience, created_at) in experiences {
-                match memory_guard.remember(experience.clone(), created_at) {
-                    Ok(id) => {
-                        results.push((index, id.0.to_string(), experience));
+                match memory_guard.remember_detailed(experience.clone(), created_at) {
+                    Ok(outcome) => {
+                        let rebuild = outcome.needs_graph_rebuild();
+                        let effective = outcome.merged_experience.unwrap_or(experience);
+                        results.push((index, outcome.id.0.to_string(), effective, rebuild));
                     }
                     Err(e) => {
                         errors.push(BatchErrorItem {
@@ -1147,7 +1215,10 @@ pub async fn batch_remember(
         .map_err(|e| AppError::Internal(anyhow::anyhow!("Blocking task panicked: {e}")))?
     };
 
-    let memory_ids: Vec<String> = memory_results.iter().map(|(_, id, _)| id.clone()).collect();
+    let memory_ids: Vec<String> = memory_results
+        .iter()
+        .map(|(_, id, _, _)| id.clone())
+        .collect();
     let created = memory_ids.len();
 
     let mut all_errors = validation_errors;
@@ -1157,12 +1228,15 @@ pub async fn batch_remember(
 
     // Build episodic graph for each stored memory (enables multi-hop retrieval)
     // Then fire-and-forget lineage inference for each.
-    for (_, id_str, experience) in &memory_results {
+    for (_, id_str, experience, rebuild) in &memory_results {
         if let Ok(uuid) = uuid::Uuid::parse_str(id_str) {
             let memory_id = crate::memory::MemoryId(uuid);
-            if let Err(e) =
+            let graph_pass = if *rebuild {
+                state.rebuild_experience_graph(&req.user_id, experience, &memory_id, None)
+            } else {
                 state.process_experience_into_graph(&req.user_id, experience, &memory_id, None)
-            {
+            };
+            if let Err(e) = graph_pass {
                 tracing::debug!("Graph processing failed for {} (non-fatal): {}", id_str, e);
             }
             spawn_lineage_inference(state.clone(), req.user_id.clone(), memory_id);
@@ -1182,6 +1256,13 @@ pub async fn batch_remember(
         metrics::MEMORY_STORE_TOTAL
             .with_label_values(&["error"])
             .inc();
+    }
+
+    // Trace enrichment (witnessed-op capture): all created ids are evidence.
+    if let Some(axum::Extension(trace)) = &trace {
+        trace.set_identity(&req.user_id, None);
+        trace.push_evidence(memory_ids.iter().cloned());
+        trace.set_summary(format!("batch: {created} created, {failed} failed"));
     }
 
     Ok(Json(BatchRememberResponse {
@@ -1235,7 +1316,9 @@ pub async fn upsert_memory(
             })
             .collect(),
         Err(e) => {
-            tracing::debug!("NER extraction failed in upsert: {}", e);
+            tracing::warn!(
+                "NER extraction failed in upsert — storing memory with NO typed entities: {e}"
+            );
             Vec::new()
         }
     };
@@ -1308,12 +1391,15 @@ pub async fn upsert_memory(
         merged_entities.truncate(validation::MAX_ENTITIES_PER_MEMORY);
     }
 
+    let toponyms = crate::gazetteer::resolve_ner_locations(&ner_entities);
+
     let experience = Experience {
         content: req.content.clone(),
         experience_type,
         entities: merged_entities.clone(),
         tags: merged_entities,
         ner_entities,
+        toponyms,
         importance_override: req.importance.map(|v| v.clamp(0.0, 1.0)),
         ..Default::default()
     };
@@ -1352,32 +1438,17 @@ pub async fn upsert_memory(
         .map_err(|e| AppError::Internal(anyhow::anyhow!("Blocking task panicked: {e}")))?
     };
 
-    // Build episodic graph for multi-hop retrieval
-    // On updates, clean up the old episode's edges/entities first to prevent
-    // stale graph data from accumulating (entity_episodes index, orphan edges).
-    if was_update {
-        if let Ok(graph) = state.get_user_graph(&req.user_id) {
-            let graph_guard = graph.read();
-            match graph_guard.delete_episode(&memory_id.0) {
-                Ok(true) => {
-                    tracing::debug!(
-                        "Cleaned up old episode {} before graph rebuild",
-                        &memory_id.0.to_string()[..8]
-                    );
-                }
-                Ok(false) => {} // No prior episode existed
-                Err(e) => {
-                    tracing::debug!(
-                        "Old episode cleanup failed for {} (non-fatal): {}",
-                        &memory_id.0.to_string()[..8],
-                        e
-                    );
-                }
-            }
-        }
-    }
-    if let Err(e) = state.process_experience_into_graph(&req.user_id, &experience, &memory_id, None)
-    {
+    // Build episodic graph for multi-hop retrieval.
+    // On updates the old episode must be demolished first, or the idempotency
+    // guard in process_experience_into_graph would keep the stale entity set.
+    // Shared with the dedup-merge path in `remember` — see
+    // `AppState::rebuild_experience_graph`.
+    let graph_result = if was_update {
+        state.rebuild_experience_graph(&req.user_id, &experience, &memory_id, None)
+    } else {
+        state.process_experience_into_graph(&req.user_id, &experience, &memory_id, None)
+    };
+    if let Err(e) = graph_result {
         tracing::debug!("Graph processing failed (non-fatal): {}", e);
     }
 

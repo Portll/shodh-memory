@@ -1,0 +1,5 @@
+# Third-party reference clone of the Watermelon UI registry (29MB, 1073 items).
+# Browsed to choose components; never built, never shipped, never committed.
+# Re-create with:
+#   git clone --depth 1 https://github.com/WatermelonCorp/watermellon-registry.git front/watermelon-registry
+watermelon-registry/

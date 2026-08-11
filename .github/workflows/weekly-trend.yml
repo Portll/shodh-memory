@@ -29,8 +29,13 @@ jobs:
   trend:
     runs-on: ubuntu-latest
     timeout-minutes: 330
+    env:
+      # Production typer is GLiNER bi-edge — measured, never the fallback.
+      # (Same pattern as recall.yml / batched-guard.yml / diag-onnx-probe.yml —
+      # without this, the ~149MB bundle gets re-downloaded from scratch every run.)
+      SHODH_GLINER_MODEL_PATH: ${{ github.workspace }}/models/gliner-bi-edge
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -42,8 +47,36 @@ jobs:
       - name: Build recall-eval
         run: cargo build --release --bin recall-eval
 
+      - name: Cache GLiNER typer assets
+        id: gliner-cache
+        uses: actions/cache@v6
+        with:
+          path: models/gliner-bi-edge
+          key: gliner-bi-edge-onnx-v1
+
+      - name: Fetch GLiNER typer assets
+        if: steps.gliner-cache.outputs.cache-hit != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p models/gliner-bi-edge
+          gh release download gliner-bi-edge-onnx-v1 --repo "$GITHUB_REPOSITORY" --dir models/gliner-bi-edge
+          ls -la models/gliner-bi-edge
+
+      - name: Verify GLiNER assets (same hard gate as batched-guard.yml)
+        run: |
+          # NeuralNer::new (src/embeddings/ner.rs:231) never hard-fails on a
+          # missing/incomplete bundle at SHODH_GLINER_MODEL_PATH — it silently
+          # degrades to the rule-based fallback NER instead. Trend numbers on
+          # the fallback NER would be measuring the wrong system, so refuse to
+          # run rather than post a silently-wrong recall@10 to issue #367.
+          GD=models/gliner-bi-edge
+          test -s "$GD/model.onnx"           || { echo "::error::GLiNER model missing — refusing to eval on fallback NER"; exit 1; }
+          test -s "$GD/tokenizer.json"        || { echo "::error::GLiNER tokenizer missing"; exit 1; }
+          test -s "$GD/label_embeddings.bin" || { echo "::error::GLiNER label embeddings missing"; exit 1; }
+
       - name: Cache embedder model
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.cache/shodh-memory/models
           key: shodh-models-minilm-c9745ed1
@@ -110,7 +143,7 @@ jobs:
 
       - name: Upload logs
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: weekly-trend-logs
           path: |

@@ -410,6 +410,108 @@ async fn remember_basic() {
     );
 }
 
+/// END-TO-END NER EMISSION — `POST /api/remember` → `GET /api/memory/{id}`.
+///
+/// Pins the whole remember path in one assertion chain: GLiNER types the
+/// content, the `LOC` records survive into the stored `Experience`, and the
+/// gazetteer resolves them into `toponyms`. No layer below this had coverage of
+/// the production typer through the HTTP handler — which is why a report of
+/// `ner_entities: []` could not be answered by running the suite.
+///
+/// The GLiNER assets are a hard requirement rather than a skip condition: a
+/// test that returns early when the model is absent cannot fail, so it cannot
+/// answer the question either. CI provisions `SHODH_GLINER_MODEL_PATH` and
+/// already refuses to run without it.
+#[tokio::test]
+async fn remember_persists_ner_entities_end_to_end() {
+    use shodh_memory::embeddings::gliner::GlinerConfig;
+
+    let gliner = GlinerConfig::from_env();
+    assert!(
+        gliner.assets_present(),
+        "GLiNER assets missing at {:?} — this test pins the PRODUCTION remember path and must \
+         not silently pass on the rule-based fallback. Set SHODH_GLINER_MODEL_PATH.",
+        gliner.model_path
+    );
+
+    let h = Harness::new();
+    let content = "The annual conference was held in Baltimore before moving to Norfolk.";
+
+    let (status, body) = json_of(
+        h.app(),
+        authed_post(
+            "/api/remember",
+            json!({ "user_id": "ner-emission-user", "content": content }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "remember failed: {body}");
+
+    let memory_id = body
+        .get("id")
+        .or_else(|| body.get("memory_id"))
+        .and_then(|v| v.as_str())
+        .unwrap_or_else(|| panic!("remember response has no id: {body}"))
+        .to_string();
+
+    let (status, fetched) = json_of(
+        h.app(),
+        authed_get(&format!(
+            "/api/memory/{memory_id}?user_id=ner-emission-user"
+        )),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "get_memory failed: {fetched}");
+
+    // `MemoryWithHierarchy` flattens the memory, so `experience` sits at the
+    // response root. `toponyms` is NOT under `experience`: it is `#[serde(skip)]`
+    // there and carried at the `MemoryFlat` tail, so it surfaces at the root too.
+    let ner_entities = fetched
+        .pointer("/experience/ner_entities")
+        .and_then(|v| v.as_array())
+        .unwrap_or_else(|| panic!("no experience.ner_entities in response: {fetched}"));
+
+    assert!(
+        !ner_entities.is_empty(),
+        "remember stored ZERO ner_entities for {content:?} while GLiNER was loaded — emission \
+         is broken. The gazetteer sees no LOC records and every downstream consumer falls back \
+         to the untyped keyword path. Full memory: {fetched}"
+    );
+
+    let locations: Vec<&str> = ner_entities
+        .iter()
+        .filter(|e| e.get("entity_type").and_then(|t| t.as_str()) == Some("LOC"))
+        .filter_map(|e| e.get("text").and_then(|t| t.as_str()))
+        .collect();
+    for expected in ["Baltimore", "Norfolk"] {
+        assert!(
+            locations.iter().any(|t| t.eq_ignore_ascii_case(expected)),
+            "expected a LOC record for {expected:?}; got LOC records {locations:?} out of \
+             {ner_entities:?}"
+        );
+    }
+
+    // The gazetteer is the first consumer that reads ONLY `LOC` records, which
+    // makes it the sharpest downstream detector of an emission break: zero LOC
+    // records and it resolves nothing, indistinguishable from a memory that
+    // names no places. Pin the resolution, not just the entity.
+    let toponyms = fetched
+        .pointer("/toponyms")
+        .and_then(|v| v.as_array())
+        .unwrap_or_else(|| panic!("no toponyms in response: {fetched}"));
+    let resolved: Vec<&str> = toponyms
+        .iter()
+        .filter_map(|t| t.get("name").and_then(|n| n.as_str()))
+        .collect();
+    for expected in ["Baltimore", "Norfolk"] {
+        assert!(
+            resolved.iter().any(|n| n.eq_ignore_ascii_case(expected)),
+            "NER emitted a LOC record for {expected:?} but the gazetteer resolved {resolved:?} — \
+             the toponym half of the remember path is broken"
+        );
+    }
+}
+
 #[tokio::test]
 async fn remember_with_tags_and_type() {
     let h = Harness::new();
@@ -1143,6 +1245,314 @@ async fn list_todos_empty() {
     assert!(status.is_success());
 }
 
+/// Regression (capability-map F19): `list_todos` with a `query` that is a
+/// literal prefix of an existing todo's content returned nothing. The lexical
+/// path of hybrid search must guarantee exact word matches surface.
+#[tokio::test]
+async fn list_todos_query_finds_exact_word_match() {
+    let h = Harness::new();
+
+    let (status, body) = json_of(
+        h.app(),
+        authed_post(
+            "/api/todos/add",
+            json!({"user_id": "test-user", "content": "Audit-2 parent task"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "create todo: {body}");
+
+    let (status, body) = json_of(
+        h.app(),
+        authed_post(
+            "/api/todos",
+            json!({"user_id": "test-user", "query": "Audit-2 parent"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let todos = body["todos"].as_array().expect("todos array");
+    assert!(
+        todos
+            .iter()
+            .any(|t| t["content"].as_str() == Some("Audit-2 parent task")),
+        "query must find the todo whose content it literally prefixes: {body}"
+    );
+}
+
+/// Regression (capability-map F15): `reorder_todo` accepted any direction and
+/// silently treated it as "down". Invalid directions must be a 400 that names
+/// the accepted values.
+#[tokio::test]
+async fn reorder_todo_rejects_invalid_direction() {
+    let h = Harness::new();
+
+    let (_, body) = json_of(
+        h.app(),
+        authed_post(
+            "/api/todos/add",
+            json!({"user_id": "test-user", "content": "Reorder me"}),
+        ),
+    )
+    .await;
+    let todo_id = body["todo"]["id"].as_str().expect("todo id").to_string();
+
+    let (status, body) = json_of(
+        h.app(),
+        authed_post(
+            &format!("/api/todos/{todo_id}/reorder"),
+            json!({"user_id": "test-user", "direction": "sideways"}),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "invalid direction must be rejected, got: {body}"
+    );
+    assert!(
+        body.to_string().contains("up"),
+        "error should name accepted values: {body}"
+    );
+
+    // Valid direction still works
+    let (status, _) = json_of(
+        h.app(),
+        authed_post(
+            &format!("/api/todos/{todo_id}/reorder"),
+            json!({"user_id": "test-user", "direction": "up"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+/// Regression (capability-map F7): comment ids were never rendered, making
+/// `update_todo_comment` / `delete_todo_comment` unreachable for clients that
+/// read formatted output. Both the add confirmation and the list must carry
+/// the id, and the id must actually drive update and delete.
+#[tokio::test]
+async fn todo_comment_ids_are_discoverable_and_usable() {
+    let h = Harness::new();
+
+    let (_, body) = json_of(
+        h.app(),
+        authed_post(
+            "/api/todos/add",
+            json!({"user_id": "test-user", "content": "Comment target"}),
+        ),
+    )
+    .await;
+    let todo_id = body["todo"]["id"].as_str().expect("todo id").to_string();
+
+    let (status, body) = json_of(
+        h.app(),
+        authed_post(
+            &format!("/api/todos/{todo_id}/comments"),
+            json!({"user_id": "test-user", "content": "an audit comment"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "add comment: {body}");
+    let comment_id = body["comment"]["id"]
+        .as_str()
+        .expect("comment id")
+        .to_string();
+    assert!(
+        body["formatted"]
+            .as_str()
+            .unwrap_or("")
+            .contains(&comment_id),
+        "add confirmation must render the comment id: {body}"
+    );
+
+    let (status, body) = json_of(
+        h.app(),
+        authed_get(&format!("/api/todos/{todo_id}/comments?user_id=test-user")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        body["formatted"]
+            .as_str()
+            .unwrap_or("")
+            .contains(&comment_id),
+        "comment list must render ids: {body}"
+    );
+
+    // The rendered id drives update...
+    let (status, body) = json_of(
+        h.app(),
+        authed_post(
+            &format!("/api/todos/{todo_id}/comments/{comment_id}/update"),
+            json!({"user_id": "test-user", "content": "edited"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "update comment: {body}");
+
+    // ...and delete
+    let (status, body) = json_of(
+        h.app(),
+        authed_delete(&format!(
+            "/api/todos/{todo_id}/comments/{comment_id}?user_id=test-user"
+        )),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "delete comment: {body}");
+    assert_eq!(body["success"], json!(true));
+}
+
+/// Regression (capability-map F8): the subtasks endpoint returned a header and
+/// a count with no rows. The formatted output must render the children.
+#[tokio::test]
+async fn subtasks_listing_renders_rows() {
+    let h = Harness::new();
+
+    let (_, body) = json_of(
+        h.app(),
+        authed_post(
+            "/api/todos/add",
+            json!({"user_id": "test-user", "content": "Parent task"}),
+        ),
+    )
+    .await;
+    let parent_id = body["todo"]["id"].as_str().expect("parent id").to_string();
+
+    let (status, body) = json_of(
+        h.app(),
+        authed_post(
+            "/api/todos/add",
+            json!({
+                "user_id": "test-user",
+                "content": "Child task row",
+                "parent_id": parent_id
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "create subtask: {body}");
+    assert_eq!(
+        body["todo"]["parent_id"].as_str(),
+        Some(parent_id.as_str()),
+        "child must be parented: {body}"
+    );
+
+    let (status, body) = json_of(
+        h.app(),
+        authed_get(&format!(
+            "/api/todos/{parent_id}/subtasks?user_id=test-user"
+        )),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["count"], json!(1), "one subtask expected: {body}");
+    assert!(
+        body["formatted"]
+            .as_str()
+            .unwrap_or("")
+            .contains("Child task row"),
+        "formatted subtask list must render the rows, not just a count: {body}"
+    );
+}
+
+/// Structured dependencies end to end: create with blocked_by, reject a
+/// dependency cycle with 400, and surface the newly unblocked todo on
+/// completion of its last blocker.
+#[tokio::test]
+async fn todo_blocked_by_dependency_flow() {
+    let h = Harness::new();
+
+    let (_, body) = json_of(
+        h.app(),
+        authed_post(
+            "/api/todos/add",
+            json!({"user_id": "test-user", "content": "Blocker task"}),
+        ),
+    )
+    .await;
+    let blocker_id = body["todo"]["id"].as_str().expect("blocker id").to_string();
+
+    // Create a dependent todo referencing the blocker by UUID
+    let (status, body) = json_of(
+        h.app(),
+        authed_post(
+            "/api/todos/add",
+            json!({
+                "user_id": "test-user",
+                "content": "Dependent task",
+                "blocked_by": [blocker_id]
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "create dependent: {body}");
+    let dependent_id = body["todo"]["id"]
+        .as_str()
+        .expect("dependent id")
+        .to_string();
+    assert_eq!(
+        body["todo"]["blocked_by"].as_array().map(|a| a.len()),
+        Some(1),
+        "dependency must be stored: {body}"
+    );
+
+    // Unknown reference is rejected
+    let (status, _) = json_of(
+        h.app(),
+        authed_post(
+            "/api/todos/add",
+            json!({
+                "user_id": "test-user",
+                "content": "Bad dep",
+                "blocked_by": ["NOPE-999"]
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "unknown dependency ref");
+
+    // Cycle: blocker cannot depend on dependent (dependent already waits on it)
+    let (status, body) = json_of(
+        h.app(),
+        authed_post(
+            &format!("/api/todos/{blocker_id}/update"),
+            json!({"user_id": "test-user", "blocked_by": [dependent_id]}),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "dependency cycle must be rejected: {body}"
+    );
+
+    // Completing the blocker surfaces the dependent as unblocked
+    let (status, body) = json_of(
+        h.app(),
+        authed_post(
+            &format!("/api/todos/{blocker_id}/complete"),
+            json!({"user_id": "test-user"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "complete blocker: {body}");
+    let unblocked = body["unblocked"].as_array().expect("unblocked array");
+    assert!(
+        unblocked
+            .iter()
+            .any(|t| t["content"].as_str() == Some("Dependent task")),
+        "completing the last blocker must surface the dependent as unblocked: {body}"
+    );
+    assert!(
+        body["formatted"]
+            .as_str()
+            .unwrap_or("")
+            .contains("Unblocked"),
+        "formatted completion must mention what was unblocked: {body}"
+    );
+}
+
 #[tokio::test]
 async fn todo_stats_empty() {
     let h = Harness::new();
@@ -1273,6 +1683,36 @@ async fn verify_index_empty() {
     )
     .await;
     assert!(status.is_success());
+}
+
+/// Regression (capability-map F17): with no `since`, the consolidation report
+/// covered only the last hour while clients document a 24-hour default, so it
+/// reported "no activity" on stores that consolidated earlier the same day.
+/// The default window must span 24 hours.
+#[tokio::test]
+async fn consolidation_report_defaults_to_24h_window() {
+    let h = Harness::new();
+    let (status, body) = json_of(
+        h.app(),
+        authed_post("/api/consolidation/report", json!({"user_id": "test-user"})),
+    )
+    .await;
+    assert!(status.is_success(), "consolidation report: {body}");
+
+    let start = body["period"]["start"]
+        .as_str()
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .expect("period.start");
+    let end = body["period"]["end"]
+        .as_str()
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .expect("period.end");
+
+    let window_mins = (end - start).num_minutes();
+    assert!(
+        (window_mins - 24 * 60).abs() <= 5,
+        "default report window must span ~24h, got {window_mins} minutes"
+    );
 }
 
 #[tokio::test]
@@ -1488,5 +1928,290 @@ async fn remember_then_list() {
     assert!(
         count.unwrap_or(0) >= 1,
         "stats should show at least 1 memory: {body}"
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Capability-map defects: recall tag filter, lineage depth, backup reporting
+// ═══════════════════════════════════════════════════════════════════════
+
+/// `/api/recall`'s `tags` filter compared tags exactly while the storage tag
+/// index (`search_by_tags`) normalises to lowercase, so `recall_by_tags(["X"])`
+/// matched a memory tagged "x" and `recall(tags: ["X"])` returned nothing. An
+/// agent reading "No memories found" concludes the corpus has no such memory.
+#[tokio::test]
+async fn recall_tag_filter_matches_regardless_of_case() {
+    let h = Harness::new();
+
+    let (status, _) = json_of(
+        h.app(),
+        authed_post(
+            "/api/remember",
+            json!({
+                "user_id": "tag-case",
+                "content": "The Seagirt terminal gate processed a seasonal high of truck transactions.",
+                "tags": ["seagirt", "Terminal Gate"]
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Every casing of a tag that exists must find the memory.
+    for tag in ["seagirt", "Seagirt", "SEAGIRT"] {
+        let (status, body) = json_of(
+            h.app(),
+            authed_post(
+                "/api/recall",
+                json!({"user_id": "tag-case", "query": "terminal", "limit": 10, "tags": [tag]}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "recall with tags=[{tag}] failed");
+        let count = recall_count(&body);
+        assert!(
+            count >= 1,
+            "tags=[{tag}] should match the seeded memory: {body}"
+        );
+    }
+
+    // A tag stored with capitals is equally reachable in lower case.
+    let (status, body) = json_of(
+        h.app(),
+        authed_post(
+            "/api/recall",
+            json!({"user_id": "tag-case", "query": "terminal", "limit": 10, "tags": ["terminal gate"]}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        recall_count(&body) >= 1,
+        "lower-cased query of a capitalised tag should match: {body}"
+    );
+
+    // The filter must still exclude: a tag nothing carries returns nothing.
+    let (status, body) = json_of(
+        h.app(),
+        authed_post(
+            "/api/recall",
+            json!({"user_id": "tag-case", "query": "terminal", "limit": 10, "tags": ["no-such-tag"]}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        recall_count(&body),
+        0,
+        "an absent tag must still filter everything out: {body}"
+    );
+}
+
+fn recall_count(body: &serde_json::Value) -> u64 {
+    body["count"]
+        .as_u64()
+        .or_else(|| body["memories"].as_array().map(|a| a.len() as u64))
+        .unwrap_or(0)
+}
+
+/// `/api/lineage/trace` reported a `depth` that was the count of visited nodes,
+/// so it always equalled `edges.len()` — a 5-hop request on a wide fan printed
+/// "Depth reached: 31 │ Edges: 31". Depth must be the hop distance actually
+/// walked, and can never exceed the requested `max_depth`.
+#[tokio::test]
+async fn lineage_trace_depth_is_hop_distance_not_edge_count() {
+    let h = Harness::new();
+    let user = "lineage-depth";
+
+    // A fan: one root with three direct children, so edges (3) > depth (1).
+    let mut ids = Vec::new();
+    for i in 0..4 {
+        let (status, body) = json_of(
+            h.app(),
+            authed_post(
+                "/api/remember",
+                json!({"user_id": user, "content": format!("lineage depth node {i}")}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let id = body["memory_id"]
+            .as_str()
+            .or_else(|| body["id"].as_str())
+            .unwrap_or_else(|| panic!("no id in remember response: {body}"))
+            .to_string();
+        ids.push(id);
+    }
+
+    for target in ids.iter().skip(1) {
+        let (status, body) = json_of(
+            h.app(),
+            authed_post(
+                "/api/lineage/link",
+                json!({
+                    "user_id": user,
+                    "from_memory_id": ids[0],
+                    "to_memory_id": target,
+                    "relation": "Caused"
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "failed to link {target}: {body}");
+    }
+
+    let (status, body) = json_of(
+        h.app(),
+        authed_post(
+            "/api/lineage/trace",
+            json!({"user_id": user, "memory_id": ids[0], "direction": "forward", "max_depth": 1}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let depth = body["depth"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("no depth: {body}"));
+    let edges = body["edges"].as_array().map(|a| a.len()).unwrap_or(0);
+
+    // The explicit fan is three edges. Automatic extraction may add more, so
+    // assert a floor rather than an exact count — the point of the test is the
+    // relationship between depth and edges, not the edge total.
+    assert!(
+        edges >= 3,
+        "expected at least the three fan-out edges: {body}"
+    );
+    assert_eq!(
+        depth, 1,
+        "one hop was requested and one hop was walked; depth reported {depth} \
+         against {edges} edges, which is the edge count, not a depth: {body}"
+    );
+    assert!(
+        depth <= 1,
+        "depth must never exceed the requested max_depth of 1: {body}"
+    );
+}
+
+/// `backup_restore` reported `["graph"]` while its description promised it
+/// "replaces all current data". The main memories DB is restored too — by
+/// `restore_comprehensive_backup`, which propagates failure — it was simply
+/// never named in the response, so an operator reading it would believe the
+/// memories had not come back.
+#[tokio::test]
+async fn backup_restore_reports_every_store_it_restored() {
+    let h = Harness::new();
+    let user = "backup-report";
+
+    let (status, _) = json_of(
+        h.app(),
+        authed_post(
+            "/api/remember",
+            json!({"user_id": user, "content": "a memory worth backing up"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, body) = json_of(
+        h.app(),
+        authed_post("/api/backup/create", json!({"user_id": user})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "backup create failed: {body}");
+    assert_eq!(body["success"], json!(true), "backup create failed: {body}");
+    let backup_id = body["backup"]["backup_id"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("no backup_id: {body}"));
+
+    // The count rendered as "Memories" must be a memory count, not a raw key
+    // count over the whole column family (which reported 897 for 88 memories).
+    let memory_count = body["backup"]["memory_count"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("no memory_count: {body}"));
+    assert_eq!(
+        memory_count, 1,
+        "memory_count must count memories, not every RocksDB key: {body}"
+    );
+
+    let (status, body) = json_of(
+        h.app(),
+        authed_post(
+            "/api/backup/restore",
+            json!({"user_id": user, "backup_id": backup_id}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "restore failed: {body}");
+
+    let restored: Vec<String> = body["restored_stores"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no restored_stores: {body}"))
+        .iter()
+        .filter_map(|v| v.as_str().map(str::to_string))
+        .collect();
+
+    assert!(
+        restored.iter().any(|s| s == "memories"),
+        "the memories DB is restored and must be reported: {restored:?}"
+    );
+    // Whatever is reported must be reported once — the vector index used to be
+    // pushed once per file found in the backup directory.
+    let mut deduped = restored.clone();
+    deduped.sort();
+    deduped.dedup();
+    assert_eq!(
+        deduped.len(),
+        restored.len(),
+        "restored_stores contains duplicates: {restored:?}"
+    );
+}
+
+/// Restoring a backup id that does not exist is a not-found condition, not a
+/// server fault. It surfaced as HTTP 500 `INTERNAL_ERROR: NotFound`, which a
+/// client cannot distinguish from a real backend failure.
+#[tokio::test]
+async fn backup_restore_unknown_id_is_not_found_not_server_error() {
+    let h = Harness::new();
+    let user = "backup-missing";
+
+    let (status, _) = json_of(
+        h.app(),
+        authed_post(
+            "/api/remember",
+            json!({"user_id": user, "content": "seed so the user exists"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Create one backup so the user's backup directory exists — the failure
+    // under test is "that id is not among them", not "no backups at all".
+    let (status, body) = json_of(
+        h.app(),
+        authed_post("/api/backup/create", json!({"user_id": user})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["success"], json!(true), "backup create failed: {body}");
+
+    let (status, body) = json_of(
+        h.app(),
+        authed_post(
+            "/api/backup/restore",
+            json!({"user_id": user, "backup_id": 424242}),
+        ),
+    )
+    .await;
+
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "unknown backup id should be 404, got {status}: {body}"
+    );
+    assert_eq!(
+        body["code"].as_str(),
+        Some("BACKUP_NOT_FOUND"),
+        "a structured code lets a client tell 'no such backup' from 'server broken': {body}"
     );
 }

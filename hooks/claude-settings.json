@@ -3,70 +3,62 @@
   "hooks": {
     "SessionStart": [
       {
-        "matcher": {},
         "hooks": [
           {
             "type": "command",
-            "command": "bun run $SHODH_HOOKS_DIR/memory-hook.ts SessionStart"
+            "command": "bun run \"$SHODH_HOOKS_DIR/memory-hook.ts\" SessionStart"
           }
         ]
       }
     ],
     "UserPromptSubmit": [
       {
-        "matcher": {},
         "hooks": [
           {
             "type": "command",
-            "command": "bun run $SHODH_HOOKS_DIR/memory-hook.ts UserPromptSubmit"
+            "command": "bun run \"$SHODH_HOOKS_DIR/memory-hook.ts\" UserPromptSubmit"
           }
         ]
       }
     ],
     "Stop": [
       {
-        "matcher": {},
         "hooks": [
           {
             "type": "command",
-            "command": "bun run $SHODH_HOOKS_DIR/memory-hook.ts Stop"
+            "command": "bun run \"$SHODH_HOOKS_DIR/memory-hook.ts\" Stop"
           }
         ]
       }
     ],
     "PreToolUse": [
       {
-        "matcher": {
-          "tool_name": ["Edit", "Write", "Bash"]
-        },
+        "matcher": "Edit|Write|Bash",
         "hooks": [
           {
             "type": "command",
-            "command": "bun run $SHODH_HOOKS_DIR/memory-hook.ts PreToolUse"
+            "command": "bun run \"$SHODH_HOOKS_DIR/memory-hook.ts\" PreToolUse"
           }
         ]
       }
     ],
     "PostToolUse": [
       {
-        "matcher": {
-          "tool_name": ["Edit", "Write", "Bash", "TodoWrite", "Read", "Task"]
-        },
+        "matcher": "Edit|Write|Bash|TodoWrite|Read|Task",
         "hooks": [
           {
             "type": "command",
-            "command": "bun run $SHODH_HOOKS_DIR/memory-hook.ts PostToolUse"
+            "command": "bun run \"$SHODH_HOOKS_DIR/memory-hook.ts\" PostToolUse"
           }
         ]
       }
     ],
     "SubagentStop": [
       {
-        "matcher": {},
         "hooks": [
           {
             "type": "command",
-            "command": "bun run $SHODH_HOOKS_DIR/memory-hook.ts SubagentStop"
+            "command": "bun run \"$SHODH_HOOKS_DIR/memory-hook.ts\" SubagentStop"
           }
         ]
       }

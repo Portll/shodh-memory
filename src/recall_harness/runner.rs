@@ -423,7 +423,7 @@ pub fn run_smoke_suite_with_ranks(inputs: &RunInputs) -> Result<ReportWithRanks>
                 .expect("repeat 0 must have mode");
             (
                 mode.report_key().to_string(),
-                build_per_case_records(&cases, &mp.per_case, &mp.ranks),
+                build_per_case_records(&cases, &mp.per_case, &mp.ranks, &mp.deep_ranks),
             )
         })
         .collect();
@@ -450,14 +450,17 @@ pub fn run_smoke_suite_with_ranks(inputs: &RunInputs) -> Result<ReportWithRanks>
 
 /// Build per-case diagnostics from one mode's aligned outputs.
 ///
-/// `metrics[i]`, `ranks[i]`, and `cases[i]` must describe the same query (the
-/// runner guarantees this by pushing all three in lockstep over `cases`).
-/// `missed` is the set of relevant `corpus_item_id`s absent from the top-`k`
-/// retrieved list, which is what makes a weak case actionable.
+/// `metrics[i]`, `ranks[i]`, `deep_ranks[i]`, and `cases[i]` must describe the
+/// same query (the runner guarantees this by pushing them in lockstep over
+/// `cases`). `missed` is the set of relevant `corpus_item_id`s absent from the
+/// top-`k` PRODUCTION list, which is what makes a weak case actionable; the
+/// `recall_at_50/100` fields read the `RECALL_DIAG_K`-deep list, which is a
+/// separate query at a deeper operating point (see `run_one_pass`).
 fn build_per_case_records(
     cases: &[SmokeCase],
     metrics: &[Metrics],
     ranks: &[CaseRankList],
+    deep_ranks: &[CaseRankList],
 ) -> Vec<PerCaseRecord> {
     cases
         .iter()
@@ -477,9 +480,11 @@ fn build_per_case_records(
                 .filter(|id| !topk.contains(id.as_str()))
                 .collect();
             let relevant_total = case.relevant.len();
-            // Recall over wider cutoffs of the same retrieved list. When the
-            // harness queries with a diagnostic `max_results` (RECALL_DIAG_K),
-            // these split "gold ranked >10" from "gold never retrieved".
+            // Recall over wider cutoffs of the DEEP list (RECALL_DIAG_K).
+            // These split "gold ranked >10 at depth diag_k" from "gold never
+            // retrieved at any depth". Measured at the diag_k operating point,
+            // not the production one — the headline fields above stay on the
+            // unperturbed production list.
             let gold: HashSet<&str> = case
                 .relevant
                 .iter()
@@ -489,7 +494,7 @@ fn build_per_case_records(
                 if gold.is_empty() {
                     return 0.0;
                 }
-                let topn: HashSet<&str> = ranks[i]
+                let topn: HashSet<&str> = deep_ranks[i]
                     .retrieved
                     .iter()
                     .take(k)
@@ -522,6 +527,13 @@ struct ModePassResult {
     by_category_cases: HashMap<SmokeCategory, Vec<Metrics>>,
     latencies_ms: Vec<f64>,
     ranks: Vec<CaseRankList>,
+    /// `RECALL_DIAG_K`-deep rank lists, aligned with `ranks`. Sourced from a
+    /// SECOND recall per case at `max_results = diag_k` so the production
+    /// query (which feeds `ranks`, headline metrics, latency, and the RH-11
+    /// determinism gate) is never perturbed by the diagnostic. When the
+    /// diagnostic is off this is a copy of `ranks`. Diagnostic side channel
+    /// only — never folded into gated aggregates or the determinism check.
+    deep_ranks: Vec<CaseRankList>,
 }
 
 /// Output of one ingest pass plus N mode-keyed query passes over the
@@ -650,9 +662,19 @@ fn run_one_pass(
     let mut per_mode: BTreeMap<LayerMode, ModePassResult> = BTreeMap::new();
     let mut failures: Vec<Failure> = Vec::new();
 
-    // Diagnostic cutoff: when RECALL_DIAG_K is set, fetch a wider list so the
-    // per-case recall@50/@100 fields are meaningful. Headline metrics still cut
-    // at SMOKE_K. Defaults to SMOKE_K (no behavior change). Parse once per pass.
+    // Diagnostic cutoff: when RECALL_DIAG_K is set, a SECOND recall per case
+    // fetches a `diag_k`-deep list so the per-case recall@50/@100 fields are
+    // meaningful. The deep fetch is a separate query on purpose: `max_results`
+    // is an OPERATING POINT, not a view — it sizes the vector candidate pool
+    // (`max_results * 3`, semantic_retrieve_inner Layer 3) and the rerank
+    // budget (`max_results * 2`, Layer 4.9) — so the previous design, which
+    // folded `diag_k` into the one production query, silently changed the
+    // headline numbers whenever the diagnostic was on (measured on the
+    // LoCoMo-100 gate: open_domain recall@10 0.275 → 0.150 under
+    // RECALL_DIAG_K=100). Headline metrics, rank lists (RH-11 determinism),
+    // latency, and the fusion-feature export all come exclusively from the
+    // production-depth query below. Defaults to SMOKE_K (no deep query, no
+    // behavior change). Parse once per pass.
     let diag_k = std::env::var("RECALL_DIAG_K")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
@@ -674,11 +696,12 @@ fn run_one_pass(
         let mut latencies_ms = Vec::with_capacity(cases.len());
         let mut by_category_cases: HashMap<SmokeCategory, Vec<Metrics>> = HashMap::new();
         let mut ranks: Vec<CaseRankList> = Vec::with_capacity(cases.len());
+        let mut deep_ranks: Vec<CaseRankList> = Vec::with_capacity(cases.len());
 
         for case in cases {
             let mut query = Query {
                 query_text: Some(case.query.clone()),
-                max_results: diag_k,
+                max_results: SMOKE_K,
                 layers: *mode,
                 ..Default::default()
             };
@@ -751,6 +774,60 @@ fn run_one_pass(
                 );
             }
 
+            // Depth diagnostics: a second, production-shaped recall at
+            // `max_results = diag_k` feeds ONLY the per-case recall@50/@100
+            // fields (see the diag_k comment above for why it must not be the
+            // same query). The two lists are different operating points by
+            // construction — the deeper vector pool admits new competitors, so
+            // a gold item's deep rank can even sit below its production rank;
+            // that is inherent to fetching a deeper list, not an
+            // inconsistency. The deep query is side-effect-free because the
+            // harness pins SHODH_RECALL_READONLY=1 (pin_harness_threads), so
+            // it cannot contaminate Hebbian/access state between cases.
+            let deep_retrieved: Vec<String> = if diag_k > SMOKE_K {
+                let mut deep_query = Query {
+                    query_text: Some(case.query.clone()),
+                    max_results: diag_k,
+                    layers: *mode,
+                    ..Default::default()
+                };
+                manager.annotate_query_ner(&mut deep_query);
+                match system.read().recall(&deep_query) {
+                    Ok(deep) => deep
+                        .iter()
+                        .map(|m| {
+                            uuid_to_corpus_id
+                                .get(&m.id.0)
+                                .cloned()
+                                .unwrap_or_else(|| format!("<unknown:{}>", m.id.0))
+                        })
+                        .collect(),
+                    Err(e) => {
+                        failures.push(Failure {
+                            kind: "case".to_string(),
+                            detail: format!(
+                                "diagnostic deep recall (RECALL_DIAG_K={diag_k}) failed for {} [mode={}]: {e:#}",
+                                case.id,
+                                mode.report_key()
+                            ),
+                        });
+                        Vec::new()
+                    }
+                }
+            } else {
+                // Diagnostic off: the depth fields degrade to the production
+                // list, exactly as before the two-query split.
+                ranks
+                    .last()
+                    .expect("production rank list was pushed above")
+                    .retrieved
+                    .clone()
+            };
+            deep_ranks.push(CaseRankList {
+                case_id: case.id.clone(),
+                retrieved: deep_retrieved,
+            });
+
             // Only emit the "missing relevance map" failure once across modes
             // — the relevance map is a function of fixtures + ingest, not
             // the mode, so duplicating it would clutter the failure list.
@@ -779,6 +856,7 @@ fn run_one_pass(
                 by_category_cases,
                 latencies_ms,
                 ranks,
+                deep_ranks,
             },
         );
     }
@@ -1340,7 +1418,6 @@ pub fn analyze_ablation(inputs: &RunInputs) -> Result<AblationReport> {
         ),
         ("baseline (facts on)", vec![]),
         ("graph-off", vec![("SHODH_GRAPH_FUSION_WEIGHT", "0")]),
-        ("+spread-fix", vec![("SHODH_SPREAD_FIX", "1")]),
         ("+graph-expand(K5)", vec![("SHODH_GRAPH_EXPAND_K", "5")]),
         (
             "+graph-expand+margin",
@@ -1349,10 +1426,29 @@ pub fn analyze_ablation(inputs: &RunInputs) -> Result<AblationReport> {
                 ("SHODH_GRAPH_EXPAND_MIN_STRENGTH", "0.3"),
             ],
         ),
+        // Graph-leg boost form. The semantic leg modulates score multiplicatively with
+        // the canonical scales; this leg adds the pre-migration GRAPH_* scales. Measures
+        // whether unifying the form helps the graph leg survive fusion. See
+        // constants.rs GRAPH_RECENCY_BOOST_SCALE.
         (
-            "+expand+spread-fix",
-            vec![("SHODH_GRAPH_EXPAND_K", "5"), ("SHODH_SPREAD_FIX", "1")],
+            "+graph-boost-mult",
+            vec![("SHODH_GRAPH_BOOST_MULTIPLICATIVE", "1")],
         ),
+        (
+            "+graph-boost-mult+expand",
+            vec![
+                ("SHODH_GRAPH_BOOST_MULTIPLICATIVE", "1"),
+                ("SHODH_GRAPH_EXPAND_K", "5"),
+            ],
+        ),
+        // NOTE: the former `+spread-fix` / `+expand+spread-fix` arms are gone. They set
+        // SHODH_SPREAD_FIX, which only reached the legacy BFS spread — but SHODH_PPR
+        // defaults ON and its branch precedes that path, so the flag could not execute
+        // and those two rows silently duplicated `baseline` and `+graph-expand(K5)`.
+        // The flag itself has been deleted as falsified (see graph_retrieval.rs).
+        // An arm that cannot differ from baseline is worse than no arm: it reports a
+        // number attributable to nothing. Before adding a row here, confirm the config
+        // it sets can actually reach the code path it names.
     ];
 
     let mut rows: Vec<AblationRow> = Vec::with_capacity(configs.len());
@@ -2961,7 +3057,9 @@ mod tests {
             },
         ];
 
-        let recs = build_per_case_records(&cases, &metrics, &ranks);
+        // Diagnostic off: the deep list is a copy of the production list, so
+        // the depth fields degrade to plain wider cutoffs of the same list.
+        let recs = build_per_case_records(&cases, &metrics, &ranks, &ranks);
         assert_eq!(recs.len(), 2);
 
         let r0 = &recs[0];
@@ -2972,8 +3070,8 @@ mod tests {
         assert_eq!(r0.missed, vec!["ssm-002".to_string()]);
         assert_eq!(r0.recall_at_k, 0.5);
         assert_eq!(r0.ndcg_at_k, 0.6);
-        // Wider cutoffs recompute from the full retrieved list vs gold: case 1
-        // found ssm-001 but not ssm-002, so 1/2 at every cutoff.
+        // Wider cutoffs recompute from the deep list vs gold: case 1 found
+        // ssm-001 but not ssm-002, so 1/2 at every cutoff.
         assert_eq!(r0.recall_at_50, 0.5);
         assert_eq!(r0.recall_at_100, 0.5);
 
@@ -2983,6 +3081,30 @@ mod tests {
         assert!(r1.missed.is_empty());
         assert_eq!(r1.recall_at_50, 1.0);
         assert_eq!(r1.recall_at_100, 1.0);
+
+        // Diagnostic on (RECALL_DIAG_K semantics): the deep list comes from a
+        // SEPARATE deeper query. A gold item absent from the production top-k
+        // but present in the deep list must still be flagged `missed` (headline
+        // fields stay on the production list) while recall@50/@100 count it —
+        // the exact split that turns "gold ranked >10 at depth" and "gold never
+        // retrieved at any depth" into different numbers.
+        let deep_ranks = vec![
+            CaseRankList {
+                case_id: "smoke-001".into(),
+                retrieved: vec!["ssm-001".into(), "ssm-099".into(), "ssm-002".into()],
+            },
+            CaseRankList {
+                case_id: "smoke-002".into(),
+                retrieved: vec!["ssm-010".into()],
+            },
+        ];
+        let recs = build_per_case_records(&cases, &metrics, &ranks, &deep_ranks);
+        let r0 = &recs[0];
+        assert_eq!(r0.missed, vec!["ssm-002".to_string()]);
+        assert_eq!(r0.relevant_found, 1);
+        assert_eq!(r0.recall_at_k, 0.5);
+        assert_eq!(r0.recall_at_50, 1.0);
+        assert_eq!(r0.recall_at_100, 1.0);
     }
 
     /// Smoke test the full runner end-to-end against the canonical fixtures.

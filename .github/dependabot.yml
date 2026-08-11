@@ -1,0 +1,89 @@
+version: 2
+
+# Grouped, weekly, and capped. Ungrouped daily updates across five manifests
+# produce more PRs than a merge train under branch protection can absorb —
+# every merge re-stales the rest — so each ecosystem opens at most a couple of
+# PRs a week and patch/minor bumps travel together.
+#
+# Security advisories bypass `open-pull-requests-limit` and are raised
+# individually and immediately; that is the behaviour we actually want on.
+
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 3
+    groups:
+      cargo-patch-and-minor:
+        update-types:
+          - patch
+          - minor
+        # `ort` is a release candidate (2.0.0-rc.x). Cargo classifies rc-to-rc
+        # as a patch bump, but a release candidate makes no API-stability
+        # promise, so it does not belong in a group whose whole premise is
+        # "safe to merge on green". rc.11 -> rc.13 made `ort::Error` generic
+        # and broke every `anyhow::Context` call on a session builder
+        # (src/embeddings/gliner.rs, src/embeddings/minilm.rs) — it takes the
+        # entire embedding and NER stack down with it. Excluded so it arrives
+        # as its own reviewable PR with the migration attached.
+        exclude-patterns:
+          - "ort"
+    commit-message:
+      prefix: "deps"
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 2
+    groups:
+      actions:
+        patterns:
+          - "*"
+    commit-message:
+      prefix: "ci"
+
+  - package-ecosystem: npm
+    directory: /mcp-server
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 2
+    groups:
+      npm-patch-and-minor:
+        update-types:
+          - patch
+          - minor
+    commit-message:
+      prefix: "deps(mcp-server)"
+
+  - package-ecosystem: npm
+    directory: /seat
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 2
+    groups:
+      npm-patch-and-minor:
+        update-types:
+          - patch
+          - minor
+    commit-message:
+      prefix: "deps(seat)"
+
+  - package-ecosystem: npm
+    directory: /front/ui
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 2
+    groups:
+      npm-patch-and-minor:
+        update-types:
+          - patch
+          - minor
+    commit-message:
+      prefix: "deps(front)"

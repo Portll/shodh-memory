@@ -46,7 +46,7 @@ jobs:
             ort_lib_name: onnxruntime.dll
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -152,7 +152,7 @@ jobs:
           Compress-Archive -Path "package\*" -DestinationPath "${{ matrix.name }}.zip"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.name }}
           path: ${{ matrix.name }}.*
@@ -162,10 +162,10 @@ jobs:
     name: Build (aarch64-unknown-linux-gnu)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Build Docker image
         run: |
@@ -215,7 +215,7 @@ jobs:
           tar -czvf shodh-memory-linux-arm64.tar.gz -C package .
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: shodh-memory-linux-arm64
           path: shodh-memory-linux-arm64.tar.gz
@@ -225,15 +225,15 @@ jobs:
     needs: [build-native, build-linux-arm64]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Download artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: artifacts
 
       - name: Create Release
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v3
         with:
           files: artifacts/**/*
           generate_release_notes: true

@@ -13,7 +13,8 @@ use crate::constants::{
     COMPRESSION_IMPORTANCE_LOW, CONSOLIDATION_CLUSTER_SIZE_CAP, CONSOLIDATION_JACCARD_THRESHOLD,
     CONSOLIDATION_MAX_CANDIDATES_PER_MEMORY, CONSOLIDATION_MIN_AGE_DAYS, CONSOLIDATION_MIN_SUPPORT,
     CONSOLIDATION_MIN_SUPPORT_LARGE, CONSOLIDATION_MIN_SUPPORT_MEDIUM,
-    CONSOLIDATION_MIN_SUPPORT_SMALL, MAX_COMPRESSION_RATIO, MAX_DECOMPRESSED_SIZE,
+    CONSOLIDATION_MIN_SUPPORT_SMALL, CONSOLIDATION_SALIENT_MIN_CONTENT_WORDS,
+    MAX_COMPRESSION_RATIO, MAX_DECOMPRESSED_SIZE,
 };
 use crate::embeddings::keywords::KeywordExtractor;
 
@@ -339,7 +340,16 @@ impl CompressionPipeline {
                 ));
             }
 
-            let experience: Experience = crate::serialization::decode_raw(&decompressed)?;
+            let mut experience: Experience = crate::serialization::decode_raw(&decompressed)?;
+
+            // `Experience::toponyms` is `#[serde(skip)]` — it rides at the tail
+            // of `MemoryFlat` rather than inside the `Experience` encoding, so
+            // it is NOT in this blob. The compressed memory kept it on its outer
+            // experience (compress_lz4 clones the memory and only adds metadata
+            // keys), so carry it across; otherwise decompression would silently
+            // drop resolved places and LZ4 compression would stop being
+            // lossless, contrary to `is_lossless`.
+            experience.toponyms = memory.experience.toponyms.clone();
 
             // Restore the memory
             let mut restored = memory.clone();
@@ -416,6 +426,78 @@ pub struct SemanticFact {
     pub last_reinforced: chrono::DateTime<chrono::Utc>,
     /// Category of fact (preference, capability, relationship, procedure)
     pub fact_type: FactType,
+
+    // =========================================================================
+    // Invalidation / contradiction (trailing fields — postcard-positional).
+    //
+    // Before these, a fact could never be CORRECTED, only out-waited.
+    // `RelationshipEdge` has carried `invalidated_at` + `invalidate_relationship`
+    // + traversal that honours it for a long time; none of that machinery
+    // extended to facts. Worse, the polarity check in `find_similar` is a DEDUP
+    // guard: a claim and its negation did not merge, so they coexisted as two
+    // rows, unlinked, each ratcheting its own confidence and each extending its
+    // own half-life. The better supported a wrong fact was, the more durable it
+    // became.
+    //
+    // These mirror the edge pattern. `#[serde(default)]` plus
+    // `FACT_DEFAULT_SUFFIX` let facts written before they existed decode.
+    // =========================================================================
+    /// When this fact was superseded. `Some` means it must not influence
+    /// retrieval, must not accrue further support, and must not extend its
+    /// half-life — but it is RETAINED, not deleted, so the correction has an
+    /// auditable "what it replaced".
+    #[serde(default)]
+    pub invalidated_at: Option<chrono::DateTime<chrono::Utc>>,
+
+    /// Provenance of the invalidation: the id of the fact that superseded this
+    /// one. `None` alongside `Some(invalidated_at)` means it was invalidated
+    /// directly rather than by a competing fact.
+    #[serde(default)]
+    pub invalidated_by: Option<String>,
+
+    /// Ids of facts this one is in direct contradiction with, in both
+    /// directions — the surviving fact records what it superseded, and the
+    /// superseded one records its victor. This is the LINK the polarity guard
+    /// never created.
+    #[serde(default)]
+    pub contradicts: Vec<String>,
+}
+
+impl SemanticFact {
+    /// True when this fact still counts as knowledge.
+    ///
+    /// The single predicate every consumer must go through — scoring, half-life
+    /// decay, support accrual and narrative building. An invalidated fact stays
+    /// in the store for audit but stops being evidence.
+    #[inline]
+    pub fn is_active(&self) -> bool {
+        self.invalidated_at.is_none()
+    }
+
+    /// Mark this fact as superseded by `winner_id` at `now`.
+    ///
+    /// Idempotent: re-invalidating keeps the FIRST invalidation timestamp, so
+    /// the audit trail records when the fact stopped being believed, not the
+    /// last time something noticed.
+    pub fn invalidate(&mut self, winner_id: Option<&str>, now: chrono::DateTime<chrono::Utc>) {
+        if self.invalidated_at.is_none() {
+            self.invalidated_at = Some(now);
+            self.invalidated_by = winner_id.map(|s| s.to_string());
+        }
+        if let Some(id) = winner_id {
+            if !self.contradicts.iter().any(|c| c == id) {
+                self.contradicts.push(id.to_string());
+            }
+        }
+    }
+
+    /// Record a contradiction link without invalidating (used on the winning
+    /// side, which stays active but must remember what it displaced).
+    pub fn link_contradiction(&mut self, other_id: &str) {
+        if !self.contradicts.iter().any(|c| c == other_id) {
+            self.contradicts.push(other_id.to_string());
+        }
+    }
 }
 
 /// Types of semantic facts
@@ -478,6 +560,12 @@ pub struct CausalFactLink {
 pub struct ConsolidationResult {
     /// Number of memories processed
     pub memories_processed: usize,
+    /// Number of memories that passed the age gate (`min_age_days`) and were
+    /// actually run through extraction. Callers use this to detect that part
+    /// of the corpus is still aging in: when it is smaller than the input,
+    /// memories exist that will only become consolidatable on a LATER cycle,
+    /// so extraction must run again even if nothing new is written.
+    pub memories_eligible: usize,
     /// Number of new facts extracted
     pub facts_extracted: usize,
     /// Number of existing facts reinforced
@@ -507,6 +595,18 @@ pub struct SemanticConsolidator {
 struct PatternCluster {
     /// Stemmed token set representing this cluster (union of all members)
     stem_set: HashSet<String>,
+    /// Negation polarity of the centroid (see `facts::detect_polarity`).
+    ///
+    /// A cluster means "the same claim restated" — the definition
+    /// `SemanticFactStore::find_similar` enforces at dedup time, where
+    /// polarity is a hard gate. Clustering must enforce the same invariant:
+    /// negation is often a one-word difference ("no", "not"), so a claim and
+    /// its correction usually share enough stems to clear the Jaccard
+    /// threshold. Without this gate they merge into ONE cluster, a single
+    /// representative is minted, and the contradiction machinery downstream
+    /// never sees the losing side — the correction is silently swallowed at
+    /// extraction, before arbitration could record it.
+    polarity: bool,
     /// All candidate entries: (pattern_text, memory_id, confidence)
     members: Vec<(String, MemoryId, f32)>,
 }
@@ -559,10 +659,16 @@ impl SemanticConsolidator {
             .iter()
             .filter(|m| (now - m.created_at).num_days() >= self.min_age_days)
             .collect();
+        result.memories_eligible = eligible.len();
 
         if eligible.is_empty() {
             return result;
         }
+
+        // Memory creation times, needed twice: to order candidates before
+        // clustering and to order minted facts before ingest (see below).
+        let created_by_id: HashMap<&MemoryId, chrono::DateTime<chrono::Utc>> =
+            eligible.iter().map(|m| (&m.id, m.created_at)).collect();
 
         // Phase 1: Extract candidates using multi-extractor pipeline
         let mut all_candidates: Vec<(String, MemoryId, f32)> = Vec::new();
@@ -576,6 +682,25 @@ impl SemanticConsolidator {
         if all_candidates.is_empty() {
             return result;
         }
+
+        // Deterministic clustering: greedy cluster assignment depends on
+        // candidate order, and the input arrives in storage iteration order —
+        // random UUIDs, so two ingests of the same corpus clustered (and
+        // minted) differently. Anchor on (evidence age, text): the same
+        // corpus always clusters the same way, and cluster centroids freeze
+        // at the EARLIEST phrasing of a claim, which is also the natural
+        // anchor for "later restatements corroborate the original".
+        all_candidates.sort_by(|a, b| {
+            let ta = created_by_id
+                .get(&a.1)
+                .copied()
+                .unwrap_or(chrono::DateTime::<chrono::Utc>::MIN_UTC);
+            let tb = created_by_id
+                .get(&b.1)
+                .copied()
+                .unwrap_or(chrono::DateTime::<chrono::Utc>::MIN_UTC);
+            ta.cmp(&tb).then_with(|| a.0.cmp(&b.0))
+        });
 
         // Phase 2: Group by stemmed-token Jaccard similarity
         let clusters =
@@ -620,6 +745,9 @@ impl SemanticConsolidator {
                     created_at: now,
                     last_reinforced: now,
                     fact_type,
+                    invalidated_at: None,
+                    invalidated_by: None,
+                    contradicts: Vec::new(),
                 };
 
                 result.new_fact_ids.push(fact.id.clone());
@@ -627,6 +755,34 @@ impl SemanticConsolidator {
                 result.facts_extracted += 1;
             }
         }
+
+        // Order minted facts by the recency of their newest supporting memory,
+        // OLDEST CLAIM FIRST. Callers ingest facts in this order, and
+        // `SemanticFactStore::ingest_candidate` resolves a contradiction tie
+        // in favour of the incoming candidate — so ingest order is the
+        // recency signal arbitration acts on. Without this sort the order was
+        // storage iteration order (random UUIDs): a batch containing both a
+        // claim and its later correction — exactly what a bulk-seeded store
+        // produces — settled on whichever side happened to be ingested last,
+        // a coin flip per store. With it, the side supported by the newest
+        // evidence is ingested last and wins, which is the documented
+        // "recency is the default because a later contradiction is usually a
+        // correction" policy applied to batches.
+        let newest_evidence = |fact: &SemanticFact| {
+            fact.source_memories
+                .iter()
+                .filter_map(|id| created_by_id.get(id).copied())
+                .max()
+                .unwrap_or(chrono::DateTime::<chrono::Utc>::MIN_UTC)
+        };
+        result.new_facts.sort_by(|a, b| {
+            newest_evidence(a)
+                .cmp(&newest_evidence(b))
+                // Text tie-break: same-instant cohorts (bulk seeds) must
+                // still ingest in a repeatable order.
+                .then_with(|| a.fact.cmp(&b.fact))
+        });
+        result.new_fact_ids = result.new_facts.iter().map(|f| f.id.clone()).collect();
 
         result
     }
@@ -683,6 +839,7 @@ impl SemanticConsolidator {
             if tokens.is_empty() {
                 continue;
             }
+            let polarity = crate::memory::facts::detect_polarity(&pattern.to_lowercase());
 
             // Find best matching cluster (that hasn't hit the size cap)
             let mut best_idx = None;
@@ -690,6 +847,11 @@ impl SemanticConsolidator {
             for (i, cluster) in clusters.iter().enumerate() {
                 // Skip full clusters — they no longer accept members
                 if cluster.members.len() >= CONSOLIDATION_CLUSTER_SIZE_CAP {
+                    continue;
+                }
+                // A negated statement is never a restatement of the claim it
+                // negates — see the polarity note on `PatternCluster`.
+                if cluster.polarity != polarity {
                     continue;
                 }
                 let sim = Self::jaccard_similarity(&tokens, &cluster.stem_set);
@@ -710,6 +872,7 @@ impl SemanticConsolidator {
                 // Create new cluster with this candidate as centroid
                 clusters.push(PatternCluster {
                     stem_set: tokens,
+                    polarity,
                     members: vec![(pattern.clone(), memory_id.clone(), *confidence)],
                 });
             }
@@ -729,12 +892,29 @@ impl SemanticConsolidator {
 
     // ── Multi-Extractor Pipeline ────────────────────────────────────────────
 
-    /// Extract fact candidates from a single memory using type-gated extractors.
+    /// Extract fact candidates from a single memory.
     ///
-    /// Models prefrontal selective attention: not all extractors run on all
-    /// memory types. Operational traces (Context, Command, CodeEdit, FileAccess,
-    /// Search) produce zero candidates. Low-importance Observation/Conversation
-    /// memories are filtered to prevent auto-ingest noise from becoming facts.
+    /// Models prefrontal selective attention: operational traces (Context,
+    /// Command, CodeEdit, FileAccess, Search) are execution logs rather than
+    /// knowledge and produce zero candidates outright.
+    ///
+    /// Everything past that reject runs two layers. Four SPECIALIST extractors
+    /// stay type-gated, because each looks for a distinct rhetorical shape and
+    /// only certain experience types plausibly carry it: procedures in
+    /// Decision/Learning/Task, definitions in Learning/Discovery/Pattern,
+    /// failure patterns in Error/…, stated preferences in
+    /// Decision/Conversation. One GENERAL declarative extractor then runs on
+    /// every surviving type, because a plain factual sentence has no rhetorical
+    /// marker to gate on and belongs to no single experience type. Without that
+    /// second layer the pipeline was four keyword banks and nothing else, so
+    /// ordinary declarative prose — the bulk of what users actually store —
+    /// produced no candidates at all.
+    ///
+    /// Low-importance memories are no longer suppressed here: importance scales
+    /// candidate CONFIDENCE, and `is_knowledge_worthy` (which enumerates the
+    /// actual auto-ingest noise: session lifecycle, tool logs, todo chatter,
+    /// protocol fragments) is what rejects noise, by naming it rather than by
+    /// proxying it through a score the default experience type cannot reach.
     fn extract_fact_candidates(&self, memory: &Memory) -> Vec<(String, f32)> {
         let mut candidates = Vec::new();
         let content = &memory.experience.content;
@@ -827,13 +1007,46 @@ impl SemanticConsolidator {
             }
         }
 
-        // Salient fallback: Observation only, importance-gated, requires entity match
-        if *exp_type == ExperienceType::Observation && importance >= 0.5 {
-            if let Some(fact) = self.extract_salient_statement(content, &memory.experience.entities)
-            {
-                if Self::is_fact_shaped(&fact) {
-                    candidates.push((fact, importance * 0.6));
-                }
+        // Declarative extractor: the general path, and the ONLY route an ordinary
+        // factual sentence has. It runs on every experience type that survived the
+        // operational reject above.
+        //
+        // It used to read `*exp_type == ExperienceType::Observation && importance
+        // >= 0.5`, and `extract_salient_statement` additionally refused any
+        // sentence that did not literally contain one of `experience.entities`.
+        // Three filters in series on the only general route, every one of them
+        // failing CLOSED, which is why ordinary corpora minted zero facts and the
+        // whole downstream semantic layer — clustering, reinforcement, and the
+        // contradiction/invalidation machinery — ran on an empty input:
+        //
+        //   * TYPE. `remember` defaults `memory_type` to `Observation`
+        //     (`handlers::remember::parse_experience_type`), so the default type
+        //     was the only one served. `Conversation`, `Task` and `Intention`
+        //     reached ZERO extractors for plain prose, because the other four are
+        //     keyword banks — copula markers, error nouns, sentence-initial
+        //     imperative verbs, first-person preference markers — that a sentence
+        //     like "Initial reports said four crew members were injured in the
+        //     collapse" matches none of.
+        //   * IMPORTANCE. `calculate_importance` scores `Observation` with the
+        //     0.05 `_` catch-all type weight, so a rich 15-word observation with
+        //     three entities lands near 0.23. The DEFAULT experience type could
+        //     not clear a 0.5 bar — the gate was unreachable for the population it
+        //     was written to serve.
+        //   * ENTITIES. The entity requirement depended on NER emission, an
+        //     upstream signal that is empty for whole classes of records; when it
+        //     emits nothing, the semantic layer silently produces nothing.
+        //
+        // Both surviving signals are now WEIGHTS rather than gates: `importance`
+        // still scales this candidate's confidence, and entity mentions still rank
+        // which sentence is chosen. What decides whether a candidate becomes a
+        // FACT is corroboration — `CONSOLIDATION_MIN_SUPPORT` requires the same
+        // pattern from at least two DISTINCT memories. That is the filter the
+        // architecture documents (constants.rs, the BCM sliding threshold), it is
+        // strictly stronger evidence than "an optional upstream field was
+        // non-empty", and it cannot be zeroed by that field going missing.
+        if let Some(fact) = self.extract_salient_statement(content, &memory.experience.entities) {
+            if Self::is_fact_shaped(&fact) {
+                candidates.push((fact, importance * 0.6));
             }
         }
 
@@ -1103,12 +1316,33 @@ impl SemanticConsolidator {
         None
     }
 
-    /// Extract the most information-dense sentence that mentions at least one entity.
+    /// Extract the most information-dense declarative sentence from `content`.
     ///
-    /// Hardened: requires at least 1 entity match. A sentence with zero entity
-    /// mentions is not domain-relevant — it's generic prose that should not
-    /// become a stored fact. This prevents the salient fallback from capturing
-    /// boilerplate like "The system is working correctly".
+    /// Entity mentions RANK sentences here; they no longer gate them. The
+    /// previous contract returned `None` unless the winning sentence literally
+    /// contained one of `entities`, on the reasoning that a sentence with no
+    /// entity mention is generic prose. The reasoning is sound and the mechanism
+    /// is not: `entities` is populated by NER upstream, so the rule reads "reject
+    /// all knowledge whenever an optional enrichment step produced nothing". It
+    /// fails closed, silently, for the entire corpus at once — which is exactly
+    /// what happened, and it took the clustering, reinforcement and
+    /// contradiction/invalidation layers down with it, since none of them can act
+    /// on an input that is always empty.
+    ///
+    /// What replaces it is not a weaker bar but a differently placed one. The
+    /// structural filters are unchanged and self-contained — the 20..=200 char
+    /// window, the content-word floor below, `is_fact_shaped` and
+    /// `is_knowledge_worthy` at the call site — and above them sits
+    /// `CONSOLIDATION_MIN_SUPPORT`, which mints nothing until the same pattern
+    /// arrives from at least two DISTINCT memories. "Two independent memories say
+    /// this" is stronger evidence of domain relevance than "an NER pass found a
+    /// span", and unlike the entity gate it degrades gracefully: a corpus with no
+    /// entities yields fewer facts, not zero.
+    ///
+    /// When entities ARE present they still do real work — `entity_bonus` biases
+    /// selection toward the sentence that actually names the domain objects, so a
+    /// working NER pass improves WHICH sentence is chosen without ever deciding
+    /// WHETHER one is.
     fn extract_salient_statement(&self, content: &str, entities: &[String]) -> Option<String> {
         let sentences = Self::split_sentences(content);
         let entity_lower: Vec<String> = entities.iter().map(|e| e.to_lowercase()).collect();
@@ -1134,20 +1368,25 @@ impl SemanticConsolidator {
                 .filter(|w| !w.is_empty() && !self.keyword_extractor.is_stop_word(w))
                 .count();
 
-            // Require at least 3 content words for a meaningful statement
-            if content_words < 3 {
+            // Content-word floor. Raised 3 -> 4 as the deliberate offset for the
+            // removed entity gate: a proposition worth storing names at least a
+            // subject, a predicate and something predicated of it, and at three
+            // non-stop-words a 20-char fragment can still be a caption or a
+            // heading. Four is the smallest floor that requires an actual clause
+            // and it costs nothing on real prose (`CONSOLIDATION_MIN_SUPPORT`
+            // remains the filter that decides what is minted).
+            if content_words < CONSOLIDATION_SALIENT_MIN_CONTENT_WORDS {
                 continue;
             }
 
-            // Entity mentions — must have at least 1 to be domain-relevant
+            // Entity mentions are a RANKING signal, never a gate — see the fn doc.
+            // A sentence that names a known entity outranks one that does not, but
+            // an empty `entities` list (NER unavailable or silent) leaves ranking
+            // to content density instead of suppressing the sentence entirely.
             let entity_match_count = entity_lower
                 .iter()
                 .filter(|e| lower.contains(e.as_str()))
                 .count();
-
-            if entity_match_count == 0 {
-                continue;
-            }
 
             let entity_bonus = entity_match_count as f32 * 2.0;
             let score = content_words as f32 + entity_bonus;
@@ -1767,6 +2006,9 @@ mod tests {
             created_at: chrono::Utc::now(),
             last_reinforced: chrono::Utc::now() - chrono::Duration::days(10),
             fact_type: FactType::Pattern,
+            invalidated_at: None,
+            invalidated_by: None,
+            contradicts: Vec::new(),
         };
         let memory = create_test_memory("reinforcing memory", 0.7);
 
@@ -1792,6 +2034,9 @@ mod tests {
             created_at: chrono::Utc::now(),
             last_reinforced: chrono::Utc::now(),
             fact_type: FactType::Pattern,
+            invalidated_at: None,
+            invalidated_by: None,
+            contradicts: Vec::new(),
         };
         assert!(!consolidator.should_decay_fact(&recent_fact));
 
@@ -1805,6 +2050,9 @@ mod tests {
             created_at: chrono::Utc::now() - chrono::Duration::days(365),
             last_reinforced: chrono::Utc::now() - chrono::Duration::days(100),
             fact_type: FactType::Pattern,
+            invalidated_at: None,
+            invalidated_by: None,
+            contradicts: Vec::new(),
         };
         assert!(consolidator.should_decay_fact(&old_fact));
     }
@@ -2090,11 +2338,634 @@ mod tests {
         ));
     }
 
+    // ── Declarative candidate extraction ────────────────────────────────────
+    //
+    // The regression these pin: the candidate layer produced NOTHING for plain
+    // declarative sentences, so consolidation never had input to cluster, no
+    // facts were minted on ordinary corpora, and the contradiction/invalidation
+    // machinery downstream sat idle. Each test below isolates one of the gates
+    // that caused it.
+
+    /// The demo-corpus sentence, with NO NER entities at all.
+    ///
+    /// This is the exact shape that produced zero candidates: the general
+    /// extractor refused any sentence that did not literally contain one of
+    /// `experience.entities`, so an empty entity list suppressed the entire
+    /// semantic layer. Entities are now a ranking signal, so extraction is
+    /// independent of whether NER emitted anything.
+    #[test]
+    fn declarative_sentence_yields_a_candidate_with_no_ner_entities() {
+        let consolidator = SemanticConsolidator::new();
+        let memory = create_typed_memory(
+            "Initial reports said four crew members were injured in the bridge collapse.",
+            0.3,
+            ExperienceType::Observation,
+            vec![], // NER emitted nothing — the live production condition
+        );
+
+        let candidates = consolidator.extract_fact_candidates(&memory);
+
+        assert!(
+            !candidates.is_empty(),
+            "a plain declarative sentence must mint a candidate without NER entities"
+        );
+        assert!(
+            candidates
+                .iter()
+                .any(|(t, _)| t.contains("four crew members were injured")),
+            "the candidate must be the real sentence, got {candidates:?}"
+        );
+    }
+
+    /// The type gate was the second failure in series: `remember` defaults to
+    /// `Observation`, and the declarative extractor ran on `Observation` alone,
+    /// so `Conversation`, `Task` and `Intention` reached ZERO extractors for
+    /// ordinary prose — the other four extractors are keyword banks this
+    /// sentence matches none of.
+    #[test]
+    fn declarative_extractor_runs_on_every_non_operational_type() {
+        let consolidator = SemanticConsolidator::new();
+        let sentence =
+            "Initial reports said four crew members were injured in the bridge collapse.";
+
+        for exp_type in [
+            ExperienceType::Observation,
+            ExperienceType::Conversation,
+            ExperienceType::Task,
+            ExperienceType::Intention,
+            ExperienceType::Decision,
+            ExperienceType::Learning,
+            ExperienceType::Discovery,
+            ExperienceType::Pattern,
+            ExperienceType::Error,
+        ] {
+            let memory = create_typed_memory(sentence, 0.3, exp_type.clone(), vec![]);
+            let candidates = consolidator.extract_fact_candidates(&memory);
+            assert!(
+                !candidates.is_empty(),
+                "{exp_type:?} must produce a declarative candidate; it produced none"
+            );
+        }
+    }
+
+    /// The general extractor must NOT reopen the operational types. Execution
+    /// traces are logs, not knowledge, and they are rejected before any
+    /// extractor runs.
+    #[test]
+    fn operational_types_still_produce_no_candidates() {
+        let consolidator = SemanticConsolidator::new();
+        let sentence =
+            "Initial reports said four crew members were injured in the bridge collapse.";
+
+        for exp_type in [
+            ExperienceType::Context,
+            ExperienceType::Command,
+            ExperienceType::CodeEdit,
+            ExperienceType::FileAccess,
+            ExperienceType::Search,
+        ] {
+            let memory = create_typed_memory(sentence, 0.9, exp_type.clone(), vec![]);
+            assert!(
+                consolidator.extract_fact_candidates(&memory).is_empty(),
+                "{exp_type:?} is an execution trace and must stay silent"
+            );
+        }
+    }
+
+    /// The third failure in series: the extractor demanded `importance >= 0.5`,
+    /// but `calculate_importance` gives `Observation` — the DEFAULT experience
+    /// type — the 0.05 catch-all type weight, so a realistic observation lands
+    /// near 0.23 and could never clear the bar. Importance now scales the
+    /// candidate's confidence instead of deciding whether it exists.
+    #[test]
+    fn low_importance_no_longer_suppresses_declarative_extraction() {
+        let consolidator = SemanticConsolidator::new();
+        let memory = create_typed_memory(
+            "Initial reports said four crew members were injured in the bridge collapse.",
+            0.23, // what a real default-typed observation actually scores
+            ExperienceType::Observation,
+            vec![],
+        );
+
+        let candidates = consolidator.extract_fact_candidates(&memory);
+        assert!(
+            !candidates.is_empty(),
+            "a below-0.5 importance must lower confidence, not erase the candidate"
+        );
+
+        // ...and importance still does its real job: it weights confidence.
+        let low = candidates[0].1;
+        let high_memory = create_typed_memory(
+            "Initial reports said four crew members were injured in the bridge collapse.",
+            0.9,
+            ExperienceType::Observation,
+            vec![],
+        );
+        let high = consolidator.extract_fact_candidates(&high_memory)[0].1;
+        assert!(
+            high > low,
+            "importance must still rank candidates: {high} should exceed {low}"
+        );
+    }
+
+    /// Entities rank, they do not gate. With entities present the sentence that
+    /// mentions one is selected over a denser one that does not; with entities
+    /// absent, selection falls back to content density instead of returning
+    /// nothing.
+    #[test]
+    fn entity_mentions_rank_sentences_rather_than_gating_them() {
+        let consolidator = SemanticConsolidator::new();
+        // The two sentences share an identical tail, so sentence 2 carries
+        // exactly ONE more content word than sentence 1 whatever the stop-word
+        // list contains. Density alone therefore picks sentence 2; a single
+        // entity hit (+2.0) is enough to flip the choice to sentence 1.
+        let content = "The Dali blocked the shipping channel for weeks. \
+                       The salvage barge blocked the shipping channel for weeks.";
+
+        let with_entity = create_typed_memory(
+            content,
+            0.6,
+            ExperienceType::Observation,
+            vec!["Dali".to_string()],
+        );
+        let picked = consolidator.extract_fact_candidates(&with_entity);
+        assert!(
+            picked.iter().any(|(t, _)| t.contains("Dali")),
+            "an entity mention must outrank raw density, got {picked:?}"
+        );
+
+        let without_entity = create_typed_memory(content, 0.6, ExperienceType::Observation, vec![]);
+        let fallback = consolidator.extract_fact_candidates(&without_entity);
+        assert!(
+            !fallback.is_empty(),
+            "with no entities the densest sentence must still be extracted"
+        );
+        assert!(
+            fallback.iter().any(|(t, _)| t.contains("salvage barge")),
+            "without an entity signal, density decides; got {fallback:?}"
+        );
+    }
+
+    /// Pins `CONSOLIDATION_SALIENT_MIN_CONTENT_WORDS`, the structural half of
+    /// what replaced the entity gate. Three content words still admits a
+    /// caption; four requires a clause.
+    #[test]
+    fn content_word_floor_separates_a_caption_from_a_clause() {
+        assert_eq!(
+            CONSOLIDATION_SALIENT_MIN_CONTENT_WORDS, 4,
+            "this test pins the floor; update both together"
+        );
+
+        let consolidator = SemanticConsolidator::new();
+        // State the stop-word assumptions the fixtures rely on, so a change to
+        // the stop-word list fails HERE with a readable reason.
+        for w in ["the", "and", "in"] {
+            assert!(
+                consolidator.keyword_extractor.is_stop_word(w),
+                "fixture assumes '{w}' is a stop word"
+            );
+        }
+        for w in ["barge", "tugboat", "harbor", "sank"] {
+            assert!(
+                !consolidator.keyword_extractor.is_stop_word(w),
+                "fixture assumes '{w}' is a content word"
+            );
+        }
+
+        // 3 content words (barge, tugboat, harbor) — long enough for every other
+        // gate, so the floor is the only thing that can reject it.
+        let caption = "The barge and the tugboat in the harbor";
+        assert!(
+            caption.len() >= 25,
+            "must clear is_knowledge_worthy on length"
+        );
+        assert!(consolidator
+            .extract_salient_statement(caption, &[])
+            .is_none());
+
+        // 4 content words — the same fixture plus a predicate.
+        let clause = "The barge and the tugboat in the harbor sank";
+        assert_eq!(
+            consolidator.extract_salient_statement(clause, &[]),
+            Some(clause.to_string()),
+            "four content words is a clause and must be extracted"
+        );
+    }
+
+    /// The whole point of extracting candidates: repeated mentions must reach
+    /// the support threshold and mint a fact, while a single mention must not.
+    /// `CONSOLIDATION_MIN_SUPPORT` is the corroboration filter that replaced the
+    /// entity gate, so this is the test that shows it carrying the load.
+    #[test]
+    fn repeated_declarative_mentions_reach_the_support_threshold() {
+        let consolidator = SemanticConsolidator::with_thresholds(2, 0);
+
+        let m1 = create_typed_memory(
+            "Initial reports said four crew members were injured in the bridge collapse.",
+            0.3,
+            ExperienceType::Observation,
+            vec![],
+        );
+        let m2 = create_typed_memory(
+            "Early reports said four crew members were injured in the bridge collapse.",
+            0.3,
+            ExperienceType::Observation,
+            vec![],
+        );
+
+        // One mention is an anecdote — no fact.
+        let single = consolidator.consolidate(std::slice::from_ref(&m1));
+        assert_eq!(
+            single.facts_extracted, 0,
+            "a single mention must not mint a fact: {:?}",
+            single.new_facts
+        );
+
+        // Two independent mentions are corroboration — a fact.
+        let paired = consolidator.consolidate(&[m1, m2]);
+        assert!(
+            paired.facts_extracted >= 1,
+            "two corroborating memories must mint a fact, got {}",
+            paired.facts_extracted
+        );
+        assert!(
+            paired
+                .new_facts
+                .iter()
+                .any(|f| f.fact.contains("crew members were injured")),
+            "the minted fact must be the real sentence, got {:?}",
+            paired.new_facts
+        );
+    }
+
     #[test]
     fn test_quality_gate_accepts_file_paths_with_prose() {
         // File paths in context of explanation are fine
         assert!(SemanticConsolidator::is_knowledge_worthy(
             "The router configuration in src/handlers/router.rs defines all API endpoint routes for the server"
         ));
+    }
+
+    /// The 74-memory demonstration corpus from `seat/eval/seed-demo-corpus.mjs`,
+    /// verbatim (content, experience type). This is the "realistic corpus" that
+    /// held zero facts in production; the stage-count test below pins where in
+    /// the pipeline candidates exist and what the corroboration policy keeps.
+    const DEMO_CORPUS: &[(&str, ExperienceType)] = &[
+        ("Container ship Dali lost propulsion at 01:24 local time because an electrical breaker tripped during departure from the Port of Baltimore.", ExperienceType::Observation),
+        ("The loss of propulsion led to the Dali drifting off the channel heading despite the crew dropping anchor.", ExperienceType::Observation),
+        ("The drifting vessel struck a support pier of the Francis Scott Key Bridge, which triggered the collapse of the main truss spans into the Patapsco River.", ExperienceType::Observation),
+        ("Because the wreckage blocked the shipping channel, the Port of Baltimore suspended all vessel traffic.", ExperienceType::Decision),
+        ("The port suspension halted roll-on/roll-off automobile shipments, so Maersk rerouted its services to the Port of New York and New Jersey.", ExperienceType::Decision),
+        ("Overflow automobile volume was diverted south to the Port of Virginia at Norfolk as a result of the closure.", ExperienceType::Decision),
+        ("Coal exports from the CSX Curtis Bay terminal stopped for six weeks because bulk carriers could not transit the blocked channel.", ExperienceType::Observation),
+        ("NTSB chair Jennifer Homendy stated the investigation would examine the Dali's electrical system, after inspectors recovered the voyage data recorder.", ExperienceType::Observation),
+        ("Synergy Marine Group, the ship manager, confirmed the crew reported electrical failures during port inspections in the days before departure.", ExperienceType::Observation),
+        ("Captain Maynard of the pilots association credited the pilot's mayday call with stopping bridge traffic, which prevented further casualties.", ExperienceType::Learning),
+        ("The bridge lacked pier protection dolphins that current design standards require, a factor engineers said contributed to the total collapse.", ExperienceType::Learning),
+        ("Salvage crews used the floating crane Chesapeake 1000 to cut the collapsed truss sections for channel clearance.", ExperienceType::Task),
+        ("Initial reports said four crew members were injured in the collapse.", ExperienceType::Observation),
+        ("Corrected report: no crew members aboard the Dali were injured; the casualties were road workers on the bridge deck.", ExperienceType::Observation),
+        ("The Vamana index rebuild cut recall latency from 340ms to 92ms on the evaluation corpus.", ExperienceType::Learning),
+        ("Routine port-state inspection of the Dali at Seagirt noted an intermittent low-voltage alarm on the main switchboard; the crew reset it and the inspector logged it as resolved.", ExperienceType::Observation),
+        ("Electrician's shift note: reefer bank on the Dali's forward feeder showed voltage sag twice during cargo operations, within tolerance but recurring.", ExperienceType::Observation),
+        ("Synergy Marine deferred the Dali's switchboard breaker overhaul to the next scheduled dry dock to avoid a berth overstay.", ExperienceType::Decision),
+        ("Gate scale check: container MSKU-4471820 declared 4,200 kg on the manifest but weighed 28,650 kg at the Seagirt in-gate; flagged for VGM re-verification.", ExperienceType::Observation),
+        ("Drayage truck T-118 carrying an export reefer pinged 40 km off its assigned corridor near Annapolis during the evening run.", ExperienceType::Observation),
+        ("MSC Brianna completed cargo operations at Seagirt berth 3 and departed on the evening tide.", ExperienceType::Observation),
+        ("Crane STS-07 at Seagirt completed its 4,000-hour preventive maintenance; hoist brake pads replaced.", ExperienceType::Observation),
+        ("Morning shift moved 1,847 containers at Seagirt, slightly above the 30-day average.", ExperienceType::Observation),
+        ("Evergreen Ever Focus assigned to Seagirt berth 2 for Thursday arrival, draft 12.8 metres.", ExperienceType::Observation),
+        ("Fog delayed pilot boardings in the Craighill Channel for two hours before conditions lifted.", ExperienceType::Observation),
+        ("Customs placed a documentation hold on 12 containers from the CMA CGM Argentina pending broker corrections.", ExperienceType::Observation),
+        ("Dundalk Marine Terminal handled 3,200 imported vehicles this week, in line with forecast.", ExperienceType::Observation),
+        ("Longshore gang 14 set a terminal record with 42 crane moves per hour on the night shift.", ExperienceType::Observation),
+        ("The Wallenius Wilhelmsen Tosca discharged heavy machinery at Dundalk without incident.", ExperienceType::Observation),
+        ("Berth 1 at Seagirt scheduled for fender replacement next month; no vessel impact expected.", ExperienceType::Task),
+        ("Reefer monitoring rounds found all 240 plugged units within temperature spec.", ExperienceType::Observation),
+        ("The harbor tug Bridget McAllister returned to service after routine engine overhaul.", ExperienceType::Observation),
+        ("Chesapeake Bay pilots reported normal transit conditions; visibility eight nautical miles.", ExperienceType::Observation),
+        ("Weekly safety briefing covered updated lashing procedures for high-cube containers.", ExperienceType::Learning),
+        ("CSX intermodal ramp turned 96% of import boxes within 48 hours this week.", ExperienceType::Observation),
+        ("Empty container yard at Fairfield reached 78% utilization; repositioning plan drafted.", ExperienceType::Observation),
+        ("Maersk Kensington arrived at Seagirt berth 4 with 2,900 import containers.", ExperienceType::Observation),
+        ("Gate cameras at Dundalk upgraded to read damaged container door labels.", ExperienceType::Observation),
+        ("Thunderstorm forecast prompted crane wind-speed monitoring; operations continued below limits.", ExperienceType::Observation),
+        ("Hapag-Lloyd Atlanta Express completed bunkering at anchorage before berthing.", ExperienceType::Observation),
+        ("Terminal operating system patched overnight; gate transactions resumed at 05:00 without backlog.", ExperienceType::Observation),
+        ("Crane STS-04 flagged a slew-drive vibration reading at the high end of normal; monitoring continued.", ExperienceType::Observation),
+        ("Quarterly emissions report filed: terminal equipment idle time down 9% year over year.", ExperienceType::Observation),
+        ("Two export soybean trains unloaded at the CNX Marine Terminal on schedule.", ExperienceType::Observation),
+        ("Vessel traffic service logged 31 deep-draft transits through the main channel this week.", ExperienceType::Observation),
+        ("Warehouse C at Point Breeze passed its annual fire-suppression inspection.", ExperienceType::Observation),
+        ("ZIM Baltimore sailed for Norfolk after a routine eight-hour port call.", ExperienceType::Observation),
+        ("Chassis pool availability tightened to 91%; provider notified per service agreement.", ExperienceType::Observation),
+        ("Pilot association scheduled semi-annual bridge-team simulator training for member pilots.", ExperienceType::Learning),
+        ("Seagirt yard block E re-striped; reefer rows gained four additional plug positions.", ExperienceType::Observation),
+        ("The Atlantic Container Line Atlantic Sun loaded project cargo bound for Antwerp.", ExperienceType::Observation),
+        ("Random cargo exam rate held at 3.1% for the month, unchanged from prior period.", ExperienceType::Observation),
+        ("Tug assist requirements reviewed for vessels over 300 metres; no changes recommended.", ExperienceType::Learning),
+        ("Marine terminal lighting audit found six fixtures below lux spec in the Dundalk rail yard.", ExperienceType::Observation),
+        ("COSCO Development windowed for Saturday arrival; berth 3 turn time projected at 22 hours.", ExperienceType::Observation),
+        ("Monthly draft survey of the Curtis Bay coal pier showed silting within dredge tolerance.", ExperienceType::Observation),
+        ("Breakbulk crew discharged wind turbine blades at North Locust Point over two shifts.", ExperienceType::Observation),
+        ("Ship chandler deliveries consolidated to a single gate window to reduce congestion.", ExperienceType::Decision),
+        ("Crane operator recertification completed for 28 operators; two scheduled for retest.", ExperienceType::Observation),
+        ("The Grimaldi Grande Baltimora loaded 1,100 export vehicles at Dundalk.", ExperienceType::Observation),
+        ("Water taxi service resumed its harbor route after seasonal maintenance.", ExperienceType::Observation),
+        ("Line handlers reported a parted stern line on the bulk carrier Ocean Prosperity; replaced without delay to sailing.", ExperienceType::Observation),
+        ("Port administration approved the fiscal-year dredging budget for the access channels.", ExperienceType::Decision),
+        ("Refrigerated cargo volumes rose 14% month over month, led by poultry exports.", ExperienceType::Observation),
+        ("Security drill simulated an unauthorized gate entry; response time met the standard.", ExperienceType::Observation),
+        ("The container freight station cleared its LCL backlog ahead of the holiday weekend.", ExperienceType::Observation),
+        ("Rail dwell for export coal at Curtis Bay averaged 2.1 days, best quarter in two years.", ExperienceType::Observation),
+        ("Evergreen Ever Focus departed berth 2 after a 19-hour turn, one hour ahead of window.", ExperienceType::Observation),
+        ("Stevedore payroll system migration completed; no missed shifts reported.", ExperienceType::Observation),
+        ("Harbor survey vessel completed side-scan mapping of anchorage B.", ExperienceType::Observation),
+        ("Seagirt gate processed 4,102 truck transactions, a seasonal high, with average turn under 40 minutes.", ExperienceType::Observation),
+    ];
+
+    fn demo_corpus_memories(age_days: i64) -> Vec<Memory> {
+        DEMO_CORPUS
+            .iter()
+            .map(|(content, exp_type)| {
+                let experience = Experience {
+                    content: content.to_string(),
+                    experience_type: exp_type.clone(),
+                    entities: Vec::new(),
+                    ..Default::default()
+                };
+                Memory::new(
+                    MemoryId(Uuid::new_v4()),
+                    experience,
+                    0.3,
+                    None,
+                    None,
+                    None,
+                    Some(chrono::Utc::now() - chrono::Duration::days(age_days)),
+                )
+            })
+            .collect()
+    }
+
+    /// Stage-by-stage instrumentation of the consolidation pipeline on the
+    /// demo corpus. Prints the counts (run with --nocapture) and pins the
+    /// two facts about this corpus that the zero-facts investigation
+    /// established:
+    ///  1. The extractor DOES propose candidates from realistic prose
+    ///     (world 3, "extraction gap", is false).
+    ///  2. Corroboration (min_support >= 2) is what decides how many facts a
+    ///     unique-statement corpus mints — few, and that is the documented
+    ///     policy, not a defect.
+    #[test]
+    fn demo_corpus_stage_counts() {
+        let consolidator = SemanticConsolidator::new();
+        let memories = demo_corpus_memories(8); // older than CONSOLIDATION_MIN_AGE_DAYS
+
+        // Stage 1: candidate extraction per memory.
+        let mut all_candidates: Vec<(String, MemoryId, f32)> = Vec::new();
+        let mut memories_with_candidates = 0usize;
+        for m in &memories {
+            let extracted = consolidator.extract_fact_candidates(m);
+            if !extracted.is_empty() {
+                memories_with_candidates += 1;
+            }
+            for (pattern, confidence) in extracted {
+                all_candidates.push((pattern, m.id.clone(), confidence));
+            }
+        }
+
+        // Stage 2: clustering.
+        let clusters = consolidator
+            .group_candidates_by_similarity(&all_candidates, CONSOLIDATION_JACCARD_THRESHOLD);
+        let corroborated = clusters
+            .iter()
+            .filter(|c| c.members.len() >= CONSOLIDATION_MIN_SUPPORT_SMALL)
+            .count();
+
+        // Stage 3: full pipeline.
+        let result = consolidator.consolidate(&memories);
+
+        println!("── demo corpus stage counts ──");
+        println!("memories:                  {}", memories.len());
+        println!("memories with candidates:  {memories_with_candidates}");
+        println!("candidates proposed:       {}", all_candidates.len());
+        println!("clusters:                  {}", clusters.len());
+        println!("clusters >= min_support:   {corroborated}");
+        println!("facts minted:              {}", result.facts_extracted);
+        for f in &result.new_facts {
+            println!(
+                "  fact [{:?}] ({} sources): {}",
+                f.fact_type,
+                f.source_memories.len(),
+                f.fact
+            );
+        }
+
+        // The extractor proposes from the majority of the corpus: zero facts
+        // can never again be blamed on "nothing is proposed".
+        assert!(
+            memories_with_candidates >= DEMO_CORPUS.len() / 2,
+            "extractor should propose candidates from most of the demo corpus, \
+             got {memories_with_candidates}/{}",
+            DEMO_CORPUS.len()
+        );
+        assert!(
+            all_candidates.len() >= memories_with_candidates,
+            "at least one candidate per proposing memory"
+        );
+        // Facts minted equals corroborated clusters — corroboration is the
+        // deciding filter, nothing downstream of it silently drops facts.
+        assert_eq!(
+            result.facts_extracted, corroborated,
+            "every corroborated cluster must mint exactly one fact"
+        );
+    }
+
+    /// A claim and its negation share most of their content stems — negation
+    /// is often a one-word difference — so without a polarity gate they clear
+    /// the Jaccard threshold and merge into ONE cluster, minting a single
+    /// representative fact. The losing side never reaches the store, so the
+    /// contradiction/invalidation machinery has nothing to arbitrate: the
+    /// correction is silently swallowed at extraction time. Clustering must
+    /// keep opposite-polarity candidates apart so BOTH sides mint and
+    /// `ingest_candidate` can record the supersession.
+    #[test]
+    fn contradicting_statements_never_share_a_cluster() {
+        let consolidator = SemanticConsolidator::new();
+        let mems: Vec<Memory> = [
+            "Initial reports said four crew members were injured in the bridge collapse.",
+            "Early reports said four crew members were injured in the bridge collapse.",
+            "Corrected reports confirm no crew members were injured in the bridge collapse.",
+            "Later reports confirm no crew members were injured in the bridge collapse.",
+        ]
+        .iter()
+        .map(|content| {
+            let experience = Experience {
+                content: content.to_string(),
+                experience_type: ExperienceType::Observation,
+                entities: Vec::new(),
+                ..Default::default()
+            };
+            Memory::new(
+                MemoryId(Uuid::new_v4()),
+                experience,
+                0.8,
+                None,
+                None,
+                None,
+                Some(chrono::Utc::now() - chrono::Duration::days(8)),
+            )
+        })
+        .collect();
+
+        let result = consolidator.consolidate(&mems);
+        assert_eq!(
+            result.facts_extracted, 2,
+            "claim and correction must mint as SEPARATE facts, got {:?}",
+            result.new_facts
+        );
+        assert!(
+            result
+                .new_facts
+                .iter()
+                .any(|f| f.fact.contains("four crew members were injured")),
+            "the claim side must mint: {:?}",
+            result.new_facts
+        );
+        assert!(
+            result
+                .new_facts
+                .iter()
+                .any(|f| f.fact.contains("no crew members were injured")),
+            "the correction side must mint: {:?}",
+            result.new_facts
+        );
+    }
+
+    /// Minted facts are ordered by the recency of their newest supporting
+    /// memory, oldest claim first: callers ingest in this order, and
+    /// contradiction arbitration favours the incoming candidate on equal
+    /// support, so the LAST-ingested side — the one backed by the newest
+    /// evidence — wins. Without the sort, batch order was storage iteration
+    /// order (random UUIDs) and a bulk-seeded claim/correction pair settled
+    /// on a coin flip.
+    #[test]
+    fn minted_facts_are_ordered_by_evidence_recency() {
+        let consolidator = SemanticConsolidator::new();
+        let mem = |content: &str, days: i64| {
+            let experience = Experience {
+                content: content.to_string(),
+                experience_type: ExperienceType::Observation,
+                entities: Vec::new(),
+                ..Default::default()
+            };
+            Memory::new(
+                MemoryId(Uuid::new_v4()),
+                experience,
+                0.8,
+                None,
+                None,
+                None,
+                Some(chrono::Utc::now() - chrono::Duration::days(days)),
+            )
+        };
+        // Deliberately interleave: newest pair first in input order.
+        let mems = vec![
+            mem(
+                "Corrected reports confirm no crew members were injured in the bridge collapse.",
+                20,
+            ),
+            mem(
+                "Initial reports said four crew members were injured in the bridge collapse.",
+                40,
+            ),
+            mem(
+                "Later reports confirm no crew members were injured in the bridge collapse.",
+                20,
+            ),
+            mem(
+                "Early reports said four crew members were injured in the bridge collapse.",
+                40,
+            ),
+        ];
+
+        let result = consolidator.consolidate(&mems);
+        assert_eq!(result.facts_extracted, 2);
+        assert!(
+            result.new_facts[0]
+                .fact
+                .contains("four crew members were injured"),
+            "older claim must be first (ingested first, displaced last): {:?}",
+            result.new_facts
+        );
+        assert!(
+            result.new_facts[1]
+                .fact
+                .contains("no crew members were injured"),
+            "newest-evidence side must be last (wins the arbitration tie): {:?}",
+            result.new_facts
+        );
+        assert_eq!(
+            result.new_fact_ids,
+            result
+                .new_facts
+                .iter()
+                .map(|f| f.id.clone())
+                .collect::<Vec<_>>(),
+            "new_fact_ids must track the sorted order"
+        );
+    }
+
+    /// The demo corpus produces two DIFFERENT zeros, and `memories_eligible`
+    /// is what tells them apart:
+    ///
+    ///  * Fresh corpus, default thresholds: the age gate
+    ///    (CONSOLIDATION_MIN_AGE_DAYS) filters everything out —
+    ///    `memories_eligible == 0`. Zero facts because nothing was LOOKED AT.
+    ///    (The defect the investigation found was one layer up: the
+    ///    extraction watermark advanced past these age-ineligible memories,
+    ///    so they stayed unconsolidatable even after aging past the gate.
+    ///    See tests/fact_distillation_tests.rs.)
+    ///
+    ///  * Age gate lifted: every memory IS processed
+    ///    (`memories_eligible == corpus`), candidates are proposed from all
+    ///    of them, and the corpus STILL mints zero facts — measured above in
+    ///    `demo_corpus_stage_counts`, its 71 candidates form 71 singleton
+    ///    clusters. Every statement in this corpus is unique, so
+    ///    corroboration (min_support >= 2 DISTINCT memories) is never
+    ///    satisfied. That zero is the documented policy working as designed:
+    ///    minting singletons instead would turn all ~71 routine operational
+    ///    statements ("MSC Brianna completed cargo operations…") into
+    ///    permanent semantic "facts", which is noise, not knowledge.
+    #[test]
+    fn fresh_corpus_is_age_gated_not_broken() {
+        let consolidator = SemanticConsolidator::new();
+        let fresh = demo_corpus_memories(0);
+        let result = consolidator.consolidate(&fresh);
+        assert_eq!(
+            result.memories_eligible, 0,
+            "a fresh corpus must be entirely age-ineligible"
+        );
+        assert_eq!(
+            result.facts_extracted, 0,
+            "age gate must exclude a fresh corpus from consolidation"
+        );
+
+        // Age gate lifted: everything is processed; the zero that remains is
+        // the corroboration policy, not an extraction failure.
+        let eager = SemanticConsolidator::with_thresholds(CONSOLIDATION_MIN_SUPPORT, 0);
+        let eager_result = eager.consolidate(&fresh);
+        assert_eq!(
+            eager_result.memories_eligible,
+            fresh.len(),
+            "with the age gate lifted every memory must be processed"
+        );
+        assert_eq!(
+            eager_result.facts_extracted, 0,
+            "a corpus of unique statements has no corroborated claims: zero \
+             facts is the min_support policy, not a defect — if this ever \
+             mints, either the corpus gained restatements or the support \
+             policy changed, and both deserve a deliberate look"
+        );
     }
 }

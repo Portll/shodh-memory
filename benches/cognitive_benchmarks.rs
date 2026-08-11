@@ -209,27 +209,8 @@ fn bench_tier_operations(c: &mut Criterion) {
         );
     });
 
-    group.bench_function("demote", |b| {
-        b.iter_batched(
-            || {
-                let mut m = Memory::new(
-                    MemoryId(Uuid::new_v4()),
-                    Experience::default(),
-                    0.5,
-                    None,
-                    None,
-                    None,
-                    None, // created_at
-                );
-                m.tier = MemoryTier::Archive;
-                m
-            },
-            |mut memory| {
-                memory.demote();
-            },
-            BatchSize::SmallInput,
-        );
-    });
+    // The "demote" benchmark was removed with `Memory::demote()` — the tier
+    // ladder is monotonic (see MemoryTier).
 
     group.bench_function("full_promotion_cycle", |b| {
         b.iter_batched(

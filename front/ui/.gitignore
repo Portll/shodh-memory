@@ -1,0 +1,10 @@
+node_modules/
+# Build output is embedded into the Rust binary at compile time but is NOT
+# committed: it is a single ~1MB inlined HTML file that would change on every
+# build and make diffs unreviewable. Build it before `cargo build -p shodh-front`
+# (front/build.rs says so if you forget).
+dist/
+*.tsbuildinfo
+
+# Captured third-party source, kept for reference during the port, not built.
+.reference/

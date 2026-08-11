@@ -17,13 +17,13 @@ const GOLDEN: &str = include_str!("fixtures/en_core_web_sm_heads_golden.tsv");
 
 #[test]
 fn in_engine_heads_match_python_spacy_golden() {
-    if !dep_parser::is_available() {
-        eprintln!(
-            "SKIP in_engine_heads_match_python_spacy_golden: set SHODH_SPACY_MODEL_PATH \
-             to an en_core_web_sm bundle (model.json + model.safetensors) to run parity."
-        );
-        return;
-    }
+    // The bundle is compiled in, so parity is no longer opt-in: an unavailable
+    // parser means the embedded assets are broken, which this test must catch
+    // rather than skip past.
+    assert!(
+        dep_parser::is_available(),
+        "dependency parser must be available from the embedded bundle"
+    );
 
     let mut checked = 0usize;
     let mut mismatches: Vec<String> = Vec::new();
@@ -70,10 +70,10 @@ fn in_engine_heads_match_python_spacy_golden() {
 /// explicitly so they are legible in the test output.
 #[test]
 fn canonical_span_heads() {
-    if !dep_parser::is_available() {
-        eprintln!("SKIP canonical_span_heads: SHODH_SPACY_MODEL_PATH unset");
-        return;
-    }
+    assert!(
+        dep_parser::is_available(),
+        "dependency parser must be available from the embedded bundle"
+    );
     // "Port of Baltimore" → head "Port" (PROPN), not "Baltimore".
     let port = dep_parser::head_token("Port of Baltimore").unwrap();
     assert_eq!(port.text, "Port", "Port of Baltimore head");

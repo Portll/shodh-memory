@@ -632,6 +632,7 @@ mod tests {
             is_proper_noun: true,
             selectivity: None,
             fine_type: None,
+            kb_id: None,
         }
     }
 
@@ -736,6 +737,7 @@ mod tests {
             entity_confidence: Some(0.9),
             endpoint_selectivity: None,
             provenance: Vec::new(),
+            promoted_at: None,
             forman_curvature: None,
         }
     }

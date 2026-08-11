@@ -683,6 +683,23 @@ pub const CONSOLIDATION_JACCARD_THRESHOLD: f32 = 0.45;
 /// - Prevents one verbose memory from dominating the candidate pool
 pub const CONSOLIDATION_MAX_CANDIDATES_PER_MEMORY: usize = 5;
 
+/// Minimum non-stop-words a sentence must carry to be a declarative fact
+/// candidate (`SemanticConsolidator::extract_salient_statement`).
+///
+/// Justification:
+/// - Raised 3 -> 4 as the deliberate offset for removing the entity-match gate
+///   from the declarative extractor. That gate rejected every sentence unless
+///   NER had emitted a span it literally contained, so it took the entire
+///   semantic layer to zero whenever NER was silent; corroboration
+///   (`CONSOLIDATION_MIN_SUPPORT`, >= 2 distinct memories) is the filter that
+///   replaces it, and this floor is the cheap structural half.
+/// - Four non-stop-words is the smallest bar that requires a clause rather than
+///   a caption: at three, a 20-character heading ("Bridge collapse update")
+///   still qualifies.
+/// - Not higher: real declarative sentences in news/technical prose routinely
+///   sit at 5-8 content words, and a floor of 5 starts discarding them.
+pub const CONSOLIDATION_SALIENT_MIN_CONTENT_WORDS: usize = 4;
+
 /// Grace period before any fact decay begins (days)
 ///
 /// Facts are immune to decay for this period after last reinforcement.
@@ -741,6 +758,21 @@ pub const FACT_DEDUP_JACCARD_FLOOR: f32 = 0.30;
 /// - Raised from 0.70 to 0.75 to reduce asymmetry with the cosine path
 ///   (cosine 0.80 + Jaccard 0.30 is roughly equivalent to Jaccard 0.75 alone)
 pub const FACT_DEDUP_JACCARD_FALLBACK: f32 = 0.75;
+
+/// Confidence boost applied when a stored fact is re-attested by NEW source
+/// evidence, as a fraction of the remaining headroom (`c += k * (1 - c)`).
+///
+/// Justification:
+/// - Diminishing-returns shape: an already-confident fact gains little, a weak
+///   one gains a lot. Saturates at 1.0 without ever exceeding it.
+/// - Was an unnamed `0.1` literal inside the maintenance ingest loop, which is
+///   also why the on-demand distillation path silently applied no boost at all.
+///   Named here so both paths share one value.
+/// - Applied ONLY when the candidate contributes source memories the stored
+///   fact did not already have. Boosting on re-derivation from already-counted
+///   evidence turns the confidence field into a cycle counter — see
+///   `SemanticFactStore::ingest_candidate`.
+pub const FACT_REINFORCEMENT_BOOST: f32 = 0.1;
 
 /// Negation markers for polarity detection in fact deduplication
 ///
@@ -905,6 +937,49 @@ pub const TIER_PROMOTION_SESSION_IMPORTANCE: f32 = 0.5;
 ///
 /// Reference: Rasch & Born (2013) "About Sleep's Role in Memory"
 pub const TIER_PROMOTION_SESSION_AGE_SECS: i64 = 86400; // 24 hours
+
+/// Distinct attesting episodes required for an edge to leave L1 (working) for
+/// L2 (episodic).
+///
+/// The *evidence* half of the edge-tier promotion gate, and the reason batch
+/// ingest is no longer a dead end. Wall-clock separation
+/// ([`TIER_PROMOTION_WORKING_AGE_SECS`]) was the only proxy for "independent
+/// evidence", which silently made elapsed minutes a precondition for
+/// consolidation. Every corpus import, every eval run and every seeded
+/// deployment creates all of its edges within one pass, so no edge could ever
+/// satisfy it: the whole graph froze at L1 with a 0.20 retrieval trust
+/// multiplier and then aged out on the L1 prune schedule.
+///
+/// Distinct *episodes* measure what the clock was standing in for. Two
+/// different source memories independently attesting the same entity pair is
+/// evidence; the same conversation re-read forty times is not, and does not
+/// move this counter — `merge_provenance` deduplicates by `source_episode_id`,
+/// so repeated attestation from one episode only raises that record's
+/// `mention_count`, which promotion deliberately ignores.
+///
+/// 2 is the smallest count that can distinguish corroboration from a single
+/// observation, matching the tier's meaning: L2/episodic is "seen more than
+/// once", not "seen a lot".
+pub const TIER_PROMOTION_L2_MIN_EPISODES: usize = 2;
+
+/// Distinct attesting episodes required for an edge to leave L2 (episodic) for
+/// L3 (semantic). See [`TIER_PROMOTION_L2_MIN_EPISODES`].
+///
+/// Deliberately cumulative rather than "N more since the last promotion": because
+/// 4 > 2, an edge cannot reach L3 without acquiring two attestations beyond the
+/// ones that earned it L2, so "independent evidence since entering this tier"
+/// holds without persisting a per-tier episode counter — no schema change, and
+/// no new field that could drift out of agreement with the trail it summarises.
+///
+/// 4 distinct source episodes *plus* strength ≥ `L2_PROMOTION_THRESHOLD` is a
+/// far higher bar than the pre-clock behaviour this replaces, where THREE
+/// strengthen calls arising from a SINGLE observation inside one request reached
+/// L3.
+///
+/// Bounded above by `SHODH_PROVENANCE_MAX_SOURCES` (default 8), which caps the
+/// trail: setting that env var below this value disables the episode route to
+/// L3 entirely, leaving only the wall-clock route.
+pub const TIER_PROMOTION_L3_MIN_EPISODES: usize = 4;
 
 /// Potentiation boost applied during each maintenance cycle
 /// Applied to ALL memories based on access count (Hebbian strengthening)
@@ -1247,6 +1322,37 @@ pub const AROUSAL_BOOST_SCALE: f32 = 0.15;
 /// - Previously hardcoded as additive (credibility - 0.5) * 0.1
 pub const CREDIBILITY_BOOST_SCALE: f32 = 0.2;
 
+/// Graph-leg boost scales — the spreading-activation leg's historical ADDITIVE scales.
+///
+/// The two retrieval legs apply the same three signals in different functional forms:
+///
+/// - Semantic leg (`memory/mod.rs` `semantic_retrieve`, applied at the `(1.0 + Σ)`
+///   site): MULTIPLICATIVE — `score × (1.0 + recency + arousal + credibility + temporal)`
+///   using `RECENCY_BOOST_SCALE` / `AROUSAL_BOOST_SCALE` / `CREDIBILITY_BOOST_SCALE` above.
+/// - Graph leg (`memory/graph_retrieval.rs` `spreading_activation_retrieve_with_stats`):
+///   ADDITIVE — `(hybrid_score + recency + arousal + credibility) × type_dampening`
+///   using the three constants below.
+///
+/// The values below are exactly the pre-migration numbers the constants above were
+/// introduced to replace — see their doc comments: "previously hardcoded as additive
+/// 0.1 / 0.05 / (credibility - 0.5) * 0.1". The migration to the multiplicative form
+/// was completed for the semantic leg and never applied to the graph leg.
+///
+/// They are declared here rather than left inline so the divergence is greppable and
+/// both arms of the A/B are named. NOTE: the additive form on a normalized sub-1.0
+/// `hybrid_score` is not simply "5× smaller" than the multiplicative form — the two
+/// are not directly comparable by magnitude, which is why this needs measurement
+/// rather than a constant swap.
+///
+/// `SHODH_GRAPH_BOOST_MULTIPLICATIVE=1` switches the graph leg to the semantic leg's
+/// form and canonical constants. Default OFF pending the `+graph-boost-mult` ablation
+/// arm; do not flip the default without a measured win.
+pub const GRAPH_RECENCY_BOOST_SCALE: f32 = 0.1;
+/// See [`GRAPH_RECENCY_BOOST_SCALE`] — graph-leg additive arousal scale.
+pub const GRAPH_AROUSAL_BOOST_SCALE: f32 = 0.05;
+/// See [`GRAPH_RECENCY_BOOST_SCALE`] — graph-leg additive credibility scale.
+pub const GRAPH_CREDIBILITY_BOOST_SCALE: f32 = 0.1;
+
 /// Same-episode boost — additive score for memories sharing the current episode
 ///
 /// When the query specifies an episode_id and a candidate belongs to the same
@@ -1289,6 +1395,79 @@ pub const TEMPORAL_MATCH_BOOST_MONTH: f32 = 0.1;
 /// 0.15 is conservative: a moderate nudge that won't override strong semantic matches
 /// but gives temporal-range memories a meaningful advantage.
 pub const TEMPORAL_PREFILTER_BOOST: f32 = 0.15;
+
+/// Floor score for geo-prefetched candidates injected into the fused pool.
+/// Injection is additive-only: ids already in the pool keep their semantic score
+/// (entry().or_insert), so this can never displace or re-rank semantic candidates
+/// under the DEFAULT fusion mode (SHODH_FUSION_FLAT, calibrated-max magnitude
+/// scoring — real candidates enter at their full leg weight, e.g. up to
+/// graph_w/semantic_w, comfortably above 0.05).
+///
+/// CAVEAT (review finding): under the legacy `SHODH_FUSION_RRF` escape-hatch
+/// mode, scores are rank-reciprocal — `weight / (RRF_K_GRAPH_FUSION + rank)`
+/// with `RRF_K_GRAPH_FUSION = 30.0` — so even a rank-1 real candidate can score
+/// as low as `~0.6 / 31 ≈ 0.019`, which is BELOW 0.05. In that mode a
+/// floor-injected candidate can outrank a genuine top semantic result, i.e.
+/// "enters at the bottom of the ranking" is only true under the default
+/// (non-RRF) fusion mode, not universally. This is a pre-existing property of
+/// choosing a fixed floor against a mode-dependent score scale, not something
+/// this feature can fully close without reading the active fusion mode at
+/// injection time; documented here so it isn't rediscovered as a bug later.
+///
+/// The fusion pipeline truncates `res` to `query.max_results` BEFORE the hard
+/// geo predicate runs (predicate lives in the per-candidate hydration loop, via
+/// `matches_filters`/`Query::matches`); a floor-scored, bottom-ranked candidate
+/// would otherwise be cut on rank alone and never reach that predicate. The
+/// truncation length is extended to the deepest-ranked geo-injected id's
+/// actual position in the sorted list (see "GEO INJECTION SURVIVAL" at the
+/// `res.truncate` call site) — not merely by the count of injected ids past
+/// the window, since real candidates can occupy positions between the window
+/// edge and an injected id's true rank. This lets injected candidates always
+/// reach the predicate — which is what actually decides whether they survive
+/// — without displacing or re-ranking any real candidate ranked above them
+/// (again, under the default fusion mode; see the RRF-mode caveat above).
+pub const GEO_INJECT_FLOOR: f32 = 0.05;
+
+/// Multiplier applied to `query.max_results` to bound the number of geo
+/// prefetch candidates Layer 0.45 considers, mirroring Layer 3's
+/// `vector_top_k = query.max_results * 3` pattern.
+///
+/// FIX HISTORY (review findings on this task — record so the mechanism isn't
+/// re-broken by a future edit): the cap must be enforced INSIDE
+/// `search_by_location` (storage.rs), passed down via
+/// `SearchCriteria::ByLocation { limit: Some(query.max_results *
+/// MAX_GEO_PREFETCH_CANDIDATES), .. }`, and applied to `MemoryId`s BEFORE
+/// `LongTermMemory::search()`'s shared hydration loop (get + full
+/// deserialize per id) ever runs. Capping in Layer 0.45 itself (on the
+/// already-`Vec<Memory>` result of `advanced_search`) is too late — by then
+/// every in-radius id has already been hydrated, so cost still scales with
+/// corpus density inside the radius, not with `max_results`, regardless of
+/// what happens to the returned `Vec<Memory>` afterward. `search_by_location`
+/// selects the nearest `limit` candidates by geohash-decoded APPROXIMATE
+/// distance (cell-center at geohash precision 10 is within ~1m of the true
+/// position — accurate enough to select on without hydrating anything),
+/// tie-broken by MemoryId, never by raw geohash scan order (a RocksDB
+/// iteration artifact, not a meaningful ordering).
+///
+/// Round-3 correction: Layer 0.45 does NOT re-sort the capped result by exact
+/// coordinates. An earlier version of this comment (and of the code) claimed
+/// it did, "to correct cell-center imprecision" — that re-sort fed a
+/// `.take(cap)` call that got moved into `search_by_location` in round 2,
+/// leaving the re-sort as dead code (it sorted a `Vec<Memory>` that was
+/// immediately consumed by `.collect::<HashSet<MemoryId>>()`, which is
+/// unordered — the sort had zero observable effect). It was deleted rather
+/// than fixed, because in-cap ORDER is irrelevant: what matters is set
+/// MEMBERSHIP (which ids made the cap), not order, and that's decided
+/// entirely, and correctly, by `search_by_location`'s approximate-distance
+/// selection. `3` matches the vector leg's multiplier so a geo query gets
+/// the same proportional headroom as a semantic query.
+///
+/// `SearchCriteria::ByLocation.limit` is `None` everywhere except Layer
+/// 0.45's call — in particular `spatial_search` (retrieval.rs,
+/// `RetrievalMode::Spatial`) passes `None` deliberately, since it already
+/// hydrates the full in-radius set and does its own filter/sort/truncate
+/// (API-compat: that mode's existing behavior must not change).
+pub const MAX_GEO_PREFETCH_CANDIDATES: usize = 3;
 
 /// Minimum confidence for temporal prefix injection into query embeddings
 ///
@@ -3065,12 +3244,14 @@ pub const COMPANION_SCORE_FACTOR: f32 = 0.5;
 // | CONSOLIDATION_MIN_AGE_DAYS    | memory/compression.rs | consolidate_semantic_facts()      |
 // | CONSOLIDATION_JACCARD_THRESHOLD | memory/compression.rs | group_candidates_by_similarity()  |
 // | CONSOLIDATION_MAX_CANDIDATES_PER_MEMORY | memory/compression.rs | extract_fact_candidates() |
+// | CONSOLIDATION_SALIENT_MIN_CONTENT_WORDS | memory/compression.rs | extract_salient_statement() |
 // | FACT_DECAY_GRACE_DAYS              | memory/mod.rs, compression.rs | fact decay grace period     |
 // | FACT_DECAY_HALF_LIFE_BASE_DAYS     | memory/mod.rs, compression.rs | fact decay half-life base  |
 // | FACT_DECAY_HALF_LIFE_PER_SUPPORT_DAYS | memory/mod.rs, compression.rs | fact decay per support  |
 // | FACT_DEDUP_COSINE_THRESHOLD   | memory/facts.rs       | find_similar() hybrid dedup       |
 // | FACT_DEDUP_JACCARD_FLOOR      | memory/facts.rs       | find_similar() hybrid dedup       |
 // | FACT_DEDUP_JACCARD_FALLBACK   | memory/facts.rs       | find_similar() fallback mode      |
+// | FACT_REINFORCEMENT_BOOST      | memory/facts.rs       | ingest_candidate() reinforcement  |
 // | FACT_NEGATION_MARKERS         | memory/facts.rs       | detect_polarity()                 |
 //
 // ## Default Configuration Constants

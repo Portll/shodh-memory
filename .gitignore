@@ -17,6 +17,11 @@ eggs/
 .eggs/
 lib/
 lib64/
+# The blanket `lib/` rule above (standard Python venv boilerplate) also
+# matches front/ui/src/lib/ — the frontend's API client and cn() util —
+# silently keeping it out of every commit. Carve it back in explicitly.
+!front/ui/src/lib/
+!front/ui/src/lib/**
 parts/
 sdist/
 var/
@@ -81,6 +86,16 @@ bun.lock
 package-lock.json
 yarn.lock
 
+# ...except the dashboard's. front/ui is an APPLICATION whose build output is
+# compiled into the shodh-front binary, not a library, so its lockfile is the
+# only thing that makes that build reproducible — and reproducibility is part
+# of what this project claims. Without it CI cannot `npm ci`, and two builds of
+# the same commit can embed different dependency trees.
+!front/ui/package-lock.json
+# ...and the seat harness's, for the same reason: it is an application whose
+# dependency tree (pi versions above all) must be reproducible.
+!seat/package-lock.json
+
 # Coverage
 coverage/
 .coverage
@@ -137,3 +152,9 @@ tests/recall/longmemeval/
 
 # reconstructed front crate build dir
 front/target/
+
+# Private strategy vault — its own repo, never part of this public one.
+shodh-vault/
+
+# Demo capture artifacts (large binaries, regenerated on demand).
+demo-frames/

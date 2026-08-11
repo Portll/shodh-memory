@@ -504,7 +504,10 @@ impl ShodhBackupEngine {
             let vi_backup_dir = secondary_dir.join("vector_index");
             if vi_backup_dir.exists() {
                 fs::create_dir_all(vi_restore_dir)?;
-                // Copy all files from vector_index backup dir to restore target
+                // Copy all files from vector_index backup dir to restore target.
+                // The store is named once however many files it spans — pushing
+                // inside the loop reported "vector_index" once per file.
+                let mut copied_any = false;
                 if let Ok(entries) = fs::read_dir(&vi_backup_dir) {
                     for entry in entries.flatten() {
                         let src = entry.path();
@@ -512,7 +515,7 @@ impl ShodhBackupEngine {
                             let dest = vi_restore_dir.join(entry.file_name());
                             match fs::copy(&src, &dest) {
                                 Ok(_) => {
-                                    restored_stores.push("vector_index".to_string());
+                                    copied_any = true;
                                     tracing::info!(
                                         file = ?entry.file_name(),
                                         "Vector index restored from backup (instant startup)"
@@ -527,6 +530,9 @@ impl ShodhBackupEngine {
                             }
                         }
                     }
+                }
+                if copied_any {
+                    restored_stores.push("vector_index".to_string());
                 }
             }
         }
@@ -686,13 +692,37 @@ impl ShodhBackupEngine {
         Ok(())
     }
 
+    /// Count the memory records in the default column family.
+    ///
+    /// This counted **every** key instead, which is why a store holding 88
+    /// memories reported `Memories: 897` — the default CF also carries counters
+    /// and `stats:` rows, and the value is rendered to operators under the label
+    /// "Memories". The discriminator is the one `MemoryStorage::get_stats` uses:
+    /// a memory key is exactly the 16 raw bytes of its UUID, and soft-deleted
+    /// memories do not count, so this number agrees with `total_memories`.
     fn estimate_memory_count(&self, db: &DB) -> Result<usize> {
-        // Estimate by counting keys (this is a rough estimate)
+        const STATS_PREFIX: &[u8] = b"stats:";
         let mut count = 0;
-        let iter = db.iterator(rocksdb::IteratorMode::Start);
 
-        for _ in iter {
-            count += 1;
+        for item in db.iterator(rocksdb::IteratorMode::Start) {
+            let (key, value) = match item {
+                Ok(kv) => kv,
+                // A backup must not fail because one row is unreadable; the
+                // count is metadata, the bytes are copied by RocksDB itself.
+                Err(e) => {
+                    tracing::warn!(error = %e, "Skipping unreadable row while counting memories");
+                    continue;
+                }
+            };
+            if key.len() != 16 || key.starts_with(STATS_PREFIX) {
+                continue;
+            }
+            // The public entry to the same decode chain `get_stats` uses; its
+            // name is historical, the behaviour is the general one.
+            match crate::memory::storage::deserialize_memory_for_migration(&value) {
+                Ok(memory) if !memory.is_forgotten() => count += 1,
+                _ => continue,
+            }
         }
 
         Ok(count)

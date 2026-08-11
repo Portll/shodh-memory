@@ -31,17 +31,18 @@ use std::time::Instant;
 use uuid::Uuid;
 
 use crate::constants::{
-    BIDIRECTIONAL_DENSITY_DENSE, BIDIRECTIONAL_DENSITY_SPARSE, BIDIRECTIONAL_HOPS_DENSE,
-    BIDIRECTIONAL_HOPS_MEDIUM, BIDIRECTIONAL_HOPS_SPARSE, BIDIRECTIONAL_INTERSECTION_BOOST,
-    BIDIRECTIONAL_INTERSECTION_MIN, BIDIRECTIONAL_MIN_ENTITIES, DENSITY_GRAPH_WEIGHT_MAX,
-    DENSITY_GRAPH_WEIGHT_MIN, DENSITY_LINGUISTIC_WEIGHT, DENSITY_THRESHOLD_MAX,
-    DENSITY_THRESHOLD_MIN, EDGE_TIER_TRUST_L1, EDGE_TIER_TRUST_L2, EDGE_TIER_TRUST_L3,
-    EDGE_TIER_TRUST_LTP, HYBRID_GRAPH_WEIGHT, HYBRID_LINGUISTIC_WEIGHT, HYBRID_SEMANTIC_WEIGHT,
-    IMPORTANCE_DECAY_MAX, IMPORTANCE_DECAY_MIN, MEMORY_TIER_GRAPH_MULT_ARCHIVE,
-    MEMORY_TIER_GRAPH_MULT_LONGTERM, MEMORY_TIER_GRAPH_MULT_SESSION,
-    MEMORY_TIER_GRAPH_MULT_WORKING, ONTOLOGICAL_DENSITY_THRESHOLD, ONTOLOGICAL_ENTITY_PENALTY,
-    ONTOLOGICAL_MIN_CONFIDENCE, ONTOLOGICAL_RELATION_PENALTY, SALIENCE_BOOST_FACTOR,
-    SEED_COVERAGE_BONUS, SPREADING_ACTIVATION_THRESHOLD, SPREADING_DEGREE_NORMALIZATION,
+    AROUSAL_BOOST_SCALE, BIDIRECTIONAL_DENSITY_DENSE, BIDIRECTIONAL_DENSITY_SPARSE,
+    BIDIRECTIONAL_HOPS_DENSE, BIDIRECTIONAL_HOPS_MEDIUM, BIDIRECTIONAL_HOPS_SPARSE,
+    BIDIRECTIONAL_INTERSECTION_BOOST, BIDIRECTIONAL_INTERSECTION_MIN, BIDIRECTIONAL_MIN_ENTITIES,
+    CREDIBILITY_BOOST_SCALE, DENSITY_GRAPH_WEIGHT_MAX, DENSITY_GRAPH_WEIGHT_MIN,
+    DENSITY_LINGUISTIC_WEIGHT, DENSITY_THRESHOLD_MAX, DENSITY_THRESHOLD_MIN, EDGE_TIER_TRUST_L1,
+    EDGE_TIER_TRUST_L2, EDGE_TIER_TRUST_L3, EDGE_TIER_TRUST_LTP, GRAPH_AROUSAL_BOOST_SCALE,
+    GRAPH_CREDIBILITY_BOOST_SCALE, GRAPH_RECENCY_BOOST_SCALE, HYBRID_GRAPH_WEIGHT,
+    HYBRID_LINGUISTIC_WEIGHT, HYBRID_SEMANTIC_WEIGHT, IMPORTANCE_DECAY_MAX, IMPORTANCE_DECAY_MIN,
+    MEMORY_TIER_GRAPH_MULT_LONGTERM, MEMORY_TIER_GRAPH_MULT_WORKING, ONTOLOGICAL_DENSITY_THRESHOLD,
+    ONTOLOGICAL_ENTITY_PENALTY, ONTOLOGICAL_MIN_CONFIDENCE, ONTOLOGICAL_RELATION_PENALTY,
+    RECENCY_BOOST_SCALE, RECENCY_DECAY_RATE, SALIENCE_BOOST_FACTOR, SEED_COVERAGE_BONUS,
+    SPREADING_ACTIVATION_THRESHOLD, SPREADING_DEGREE_NORMALIZATION,
     SPREADING_EARLY_TERMINATION_CANDIDATES, SPREADING_EARLY_TERMINATION_RATIO, SPREADING_MAX_HOPS,
     SPREADING_MIN_CANDIDATES, SPREADING_MIN_HOPS, SPREADING_NORMALIZATION_FACTOR,
     SPREADING_RELAXED_THRESHOLD,
@@ -94,6 +95,91 @@ pub fn calculate_density_weights(graph_density: f32) -> (f32, f32, f32) {
     let semantic_weight = 1.0 - graph_weight - linguistic_weight;
 
     (semantic_weight, graph_weight, linguistic_weight)
+}
+
+/// How much of a memory's GRAPH evidence counts, given its memory tier (SHO-D2).
+///
+/// Working memories are dense and noisy, so their associations are discounted;
+/// `LongTerm` is the undiscounted reference. The value scales the graph
+/// activation only — see [`fuse_hybrid_score`] for why that distinction is
+/// load-bearing.
+///
+/// # `Session` is deliberately held at the `Working` value
+///
+/// [`MEMORY_TIER_GRAPH_MULT_SESSION`](crate::constants::MEMORY_TIER_GRAPH_MULT_SESSION)
+/// (0.6) is defined but **not applied here**.
+/// Until the memory-tier persistence fix in `promote_working_to_session`, the
+/// `Working → Session` transition was a pure in-memory map move with no storage
+/// write, while this function reads a tier materialized FROM storage — so no
+/// memory ever reached this code as `Session` and the 0.6 rung had never
+/// executed. Making the transition durable is correct, but it must not smuggle
+/// in a ranking change nobody measured: on the LoCoMo-100 gate, applying 0.6
+/// costs multi_hop ndcg 0.2652 → 0.2516 and open_domain recall@10 0.2750 →
+/// 0.2250, because `Session` is reached by importance and age alone — neither of
+/// which is evidence that a memory's graph associations are any less noisy than
+/// a `Working` memory's.
+///
+/// This mirrors the reasoning that retired
+/// [`MemoryTier::Archive`](crate::memory::types::MemoryTier::Archive): a lifecycle
+/// change must not activate an unmeasured ranking multiplier as a side effect.
+/// The constant is kept, not deleted — promoting the middle rung is a measured
+/// decision, and this is where it will be made.
+pub fn memory_tier_graph_trust(tier: MemoryTier) -> f32 {
+    match tier {
+        // Held at the Working value — see above. Archive is retired and inert.
+        MemoryTier::Working | MemoryTier::Session | MemoryTier::Archive => {
+            MEMORY_TIER_GRAPH_MULT_WORKING
+        }
+        MemoryTier::LongTerm => MEMORY_TIER_GRAPH_MULT_LONGTERM,
+    }
+}
+
+/// Blend the three retrieval legs into one comparable score.
+///
+/// `semantic_weight`/`graph_weight`/`linguistic_weight` come from
+/// [`calculate_density_weights`] and are a property of the QUERY, identical for
+/// every candidate. `tier_graph_trust` is a property of the CANDIDATE and
+/// discounts its graph evidence.
+///
+/// # Why the trust factor multiplies the signal, not the weight
+///
+/// This used to fold the tier factor into the weight vector and renormalize:
+///
+/// ```text
+///   S' = w_sem + t·w_graph + w_ling
+///   score = sem·(w_sem/S') + graph·(t·w_graph/S') + ling·(w_ling/S')
+/// ```
+///
+/// Because `S'` depends on `t`, every tier produced a DIFFERENT weight mix, and
+/// those scores were then ranked against each other. Discounting a memory's
+/// graph leg silently INFLATED its semantic and linguistic legs: at the shipped
+/// density weights a `Working` candidate's semantic term was scaled by ~1/0.79
+/// while a consolidated candidate's was scaled by ~1/0.88. Whenever semantic
+/// evidence dominated — which is the common case — the memory the system trusted
+/// LESS scored higher for that reason alone, inverting the very ordering the
+/// tier ladder exists to express.
+///
+/// Keeping the weight mix tier-independent removes that coupling: the trust
+/// factor now attenuates the graph term and nothing else, so two candidates
+/// differing only in tier differ only in how much their graph evidence counts.
+/// On the LoCoMo-100 gate this is a strict improvement — multi_hop ndcg
+/// 0.2516 → 0.2652, no category regresses.
+pub fn fuse_hybrid_score(
+    semantic_score: f32,
+    graph_activation: f32,
+    linguistic_score: f32,
+    semantic_weight: f32,
+    graph_weight: f32,
+    linguistic_weight: f32,
+    tier_graph_trust: f32,
+) -> f32 {
+    let weight_sum = semantic_weight + graph_weight + linguistic_weight;
+    if weight_sum <= 0.0 {
+        return 0.0;
+    }
+    semantic_score * (semantic_weight / weight_sum)
+        + graph_activation * tier_graph_trust * (graph_weight / weight_sum)
+        + linguistic_score * (linguistic_weight / weight_sum)
 }
 
 /// Calculate importance-weighted decay for spreading activation (SHO-26)
@@ -172,21 +258,24 @@ fn spread_single_direction(
     let mut activation_map: HashMap<Uuid, f32> = seeds.iter().cloned().collect();
     let mut traversed_edges: Vec<Uuid> = Vec::new();
 
-    // Audit fix #5 (flag-gated) — repair the 2-hop activation collapse. The
-    // default per-edge spread multiplies four sub-1.0 factors per hop and
-    // double-uses edge strength (it sets the decay rate AND is multiplied in),
-    // so a distal (2-hop) target collapses below `threshold` and is pruned before
-    // it can be scored. E3 proved this is the real multi-hop bottleneck (a fusion
-    // patch could not fix it without wrecking single-hop). When enabled: gentle
-    // FIXED per-hop decay (not the compounding importance-weighted rate), and edge
-    // strength / tier-trust as ADDITIVE PRIORS with a floor so a weak edge
-    // attenuates but never zeroes the path. Default off → unchanged.
-    let spread_fix = std::env::var("SHODH_SPREAD_FIX")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
+    // NOTE on the removed SHODH_SPREAD_FIX (deleted 2026-08-06):
+    // A flag-gated variant here used fixed per-hop decay plus additive priors with a
+    // 0.5 floor, to stop a weak edge zeroing a path. Its comment claimed "E3 proved
+    // this is the real multi-hop bottleneck". The measurements say otherwise: four E3
+    // CI runs with the flag ON gave 2-hop recall@10 of 0.0000/0.0167/0.0000/0.0167
+    // against 0.3167 for the vector leg alone, and the D1 A/B on real LoCoMo moved
+    // multi_hop by exactly +0.0000 (0.3329 -> 0.3329). E3 motivated the hypothesis; it
+    // never confirmed it. PPR then became the default spreading mechanism (SHODH_PPR,
+    // default on), and its branch precedes this one, so the flag could not execute at
+    // all. Removed as falsified and unreachable.
+    //
+    // The one idea worth keeping is NOT dead: PPR has no analogue of that 0.5 prior
+    // floor. `ppr_edge_weight` ends in `w.max(0.0)` — a clamp to zero, the opposite of
+    // a floor — and PPR's column-stochastic normalization makes edge weakness purely
+    // RELATIVE to sibling edges, so a weak edge competing with strong ones can be
+    // starved harder than a floor would ever allow. A floored `ppr_edge_weight` has
+    // never been tested. See the follow-up issue before re-deriving this from scratch.
     let dir_fix = edge_dir_fix_enabled();
-    const SPREAD_FIX_HOP_DECAY: f32 = 0.6;
-    const SPREAD_FIX_PRIOR_FLOOR: f32 = 0.5;
 
     // Lever-1 prototype: weight each hop by the edge's relation type so activation
     // flows along meaningful predicates (causal/structural) rather than mere
@@ -237,24 +326,16 @@ fn spread_single_direction(
                     }
                 };
 
+                // Importance-weighted decay. NOTE: `effective` is used twice here — it
+                // sets the decay rate AND is multiplied in. That double-use is a known
+                // characteristic of this legacy BFS path, not an oversight; the
+                // flag-gated alternative that removed it was measured and falsified
+                // (see the note at the top of this function). This path only runs when
+                // an operator sets SHODH_PPR=0; PPR is the default spreading mechanism.
                 let effective = edge.effective_strength();
-                let base_spread = if spread_fix {
-                    // Additive priors + fixed hop decay: distal targets retain
-                    // meaningful activation instead of collapsing below threshold.
-                    // effective is used ONCE (strength prior), not twice.
-                    let hop_decay = SPREAD_FIX_HOP_DECAY.powi(hop as i32);
-                    let trust_prior =
-                        SPREAD_FIX_PRIOR_FLOOR + (1.0 - SPREAD_FIX_PRIOR_FLOOR) * tier_trust;
-                    let strength_prior =
-                        SPREAD_FIX_PRIOR_FLOOR + (1.0 - SPREAD_FIX_PRIOR_FLOOR) * effective;
-                    source_activation * hop_decay * trust_prior * strength_prior * degree_norm
-                } else {
-                    // Default: importance-weighted decay (effective sets the decay
-                    // rate AND is multiplied in — the double-use the fix removes).
-                    let decay_rate = calculate_importance_weighted_decay(effective);
-                    let decay = (-decay_rate * hop as f32).exp();
-                    source_activation * decay * effective * tier_trust * degree_norm
-                };
+                let decay_rate = calculate_importance_weighted_decay(effective);
+                let decay = (-decay_rate * hop as f32).exp();
+                let base_spread = source_activation * decay * effective * tier_trust * degree_norm;
 
                 // Lever-1: scale by the relation type's intrinsic spreading weight
                 // so a real predicate (e.g. Causes 1.3) carries more activation than
@@ -637,10 +718,32 @@ fn personalized_pagerank(
     // different index assignment reorders the power-iteration matrix-vector
     // sums, and f32 addition is non-associative, so the stationary masses wobble
     // by a few ULPs between recall repeats — enough to flip near-tie episode
-    // ranks across the final-sort quantization boundary. Sorting makes the node
-    // ordering, and therefore the PPR result, bit-reproducible.
-    let mut frontier: Vec<Uuid> = seeds.keys().copied().collect();
-    frontier.sort_unstable();
+    // ranks across the final-sort quantization boundary.
+    //
+    // Sort by entity NAME, not by Uuid: a Uuid sort is deterministic within one
+    // process but entity UUIDs are re-rolled by every ingest, so across two
+    // ingests of the same corpus it is a random permutation — the RH-12
+    // cross-repeat determinism guard sees the resulting ULP wobble. Names are a
+    // pure function of graph content; uuid stays as the total-order fallback
+    // for the pathological duplicate-name case.
+    let mut frontier: Vec<Uuid> = {
+        let mut named: Vec<(String, Uuid)> = seeds
+            .keys()
+            .map(|u| {
+                (
+                    graph
+                        .get_entity(u)
+                        .ok()
+                        .flatten()
+                        .map(|e| e.name)
+                        .unwrap_or_default(),
+                    *u,
+                )
+            })
+            .collect();
+        named.sort_unstable();
+        named.into_iter().map(|(_, u)| u).collect()
+    };
     let mut visited: HashSet<Uuid> = frontier.iter().copied().collect();
     for &s in &frontier {
         ppr_intern(s, &mut nodes, &mut node_idx, &mut adj);
@@ -770,10 +873,15 @@ fn personalized_pagerank(
         w / mention_count as f32
     };
     let mut p = vec![0.0_f32; n];
-    let weighted: Vec<(usize, f32)> = seeds
+    let mut weighted: Vec<(usize, f32)> = seeds
         .iter()
         .filter_map(|(u, w)| node_idx.get(u).map(|&i| (i, spec_weight(u, *w))))
         .collect();
+    // `seeds` is a HashMap, so `weighted` arrives in per-process-random order
+    // and `zsum` (a non-associative f32 sum) would differ in its last bits
+    // between two ingests of the same corpus. Pin the summation order to the
+    // interned node index, which is repeat-stable (name-sorted frontier).
+    weighted.sort_unstable_by_key(|(i, _)| *i);
     let zsum: f32 = weighted.iter().map(|(_, w)| *w).sum::<f32>().max(1e-9);
     for (i, w) in weighted {
         p[i] += w / zsum;
@@ -1059,6 +1167,22 @@ pub fn spreading_activation_retrieve_with_stats(
 ) -> Result<(Vec<ActivatedMemory>, RetrievalStats)> {
     let start_time = Instant::now();
     let mut stats = RetrievalStats::default();
+
+    // A/B: unify this leg's recency/arousal/credibility boosts with the semantic leg.
+    //
+    // The semantic leg applies them MULTIPLICATIVELY — `score × (1.0 + Σ factors)` with
+    // RECENCY/AROUSAL/CREDIBILITY_BOOST_SCALE. This leg applies them ADDITIVELY with the
+    // pre-migration GRAPH_* scales (see constants.rs). The multiplicative migration was
+    // completed for the semantic leg and never applied here, so the two legs emit scores
+    // on different footings before GRAPH_CANDIDATE_CAP truncation and RRF fusion.
+    //
+    // The forms are NOT comparable by magnitude (additive 0.1 on a normalized sub-1.0
+    // hybrid_score is not simply "5× smaller" than a multiplicative 0.5), so this is a
+    // measured arm rather than a swap. Default off → byte-identical to previous behavior.
+    // Arm: `+graph-boost-mult` in recall_harness::runner::analyze_ablation.
+    let boost_multiplicative = std::env::var("SHODH_GRAPH_BOOST_MULTIPLICATIVE")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
 
     // Determine weights based on density
     let (semantic_weight, graph_weight, linguistic_weight) = if let Some(density) = graph_density {
@@ -1626,11 +1750,17 @@ pub fn spreading_activation_retrieve_with_stats(
     // activated entities sums their activations via `current.0 +=` below.
     // f32 addition is non-associative, so iterating `activation_map` in
     // per-process-random HashMap order yields slightly different episode
-    // scores and flips near-tie graph-leg ranks between repeats. Sort the
-    // source entities by Uuid to pin the summation order. This is the
+    // scores and flips near-tie graph-leg ranks between repeats. This is the
     // dominant query-time residual: episode score IS the graph-leg ranking.
+    //
+    // Sort by activation VALUE, not by Uuid: entity UUIDs are re-rolled by
+    // every ingest, so a uuid order is deterministic in-process but a random
+    // permutation across two ingests of the same corpus (the RH-12 guard's
+    // comparison). A value order is a pure function of repeat-stable data,
+    // and the uuid fallback among EQUAL values is harmless for determinism:
+    // swapping equal addends leaves every f32 partial sum bit-identical.
     let mut activation_entries: Vec<(&Uuid, &f32)> = activation_map.iter().collect();
-    activation_entries.sort_unstable_by(|a, b| a.0.cmp(b.0));
+    activation_entries.sort_unstable_by(|a, b| b.1.total_cmp(a.1).then_with(|| a.0.cmp(b.0)));
 
     for (entity_uuid, entity_activation) in activation_entries {
         let episodes = graph.get_episodes_by_entity(entity_uuid)?;
@@ -1712,58 +1842,60 @@ pub fn spreading_activation_retrieve_with_stats(
             let linguistic_raw = calculate_linguistic_match(&memory, &analysis);
             let linguistic_score = linguistic_raw; // Already normalized in calculate_linguistic_match
 
-            // Memory-tier graph weight multiplier (SHO-D2)
-            // Working memories are dense/noisy → lower graph trust
-            // LongTerm memories are sparse/proven → full graph trust
-            let tier_graph_mult = match memory.tier {
-                MemoryTier::Working => MEMORY_TIER_GRAPH_MULT_WORKING, // 0.3
-                MemoryTier::Session => MEMORY_TIER_GRAPH_MULT_SESSION, // 0.6
-                MemoryTier::LongTerm => MEMORY_TIER_GRAPH_MULT_LONGTERM, // 1.0
-                MemoryTier::Archive => MEMORY_TIER_GRAPH_MULT_ARCHIVE, // 1.2
-            };
+            // Unified scoring using density-dependent weights (calculated at
+            // function start), with the memory-tier trust discount applied to the
+            // graph EVIDENCE. See `memory_tier_graph_trust` / `fuse_hybrid_score`.
+            let hybrid_score = fuse_hybrid_score(
+                semantic_score,
+                graph_activation,
+                linguistic_score,
+                semantic_weight,
+                graph_weight,
+                linguistic_weight,
+                memory_tier_graph_trust(memory.tier),
+            );
 
-            // Unified scoring using density-dependent weights (calculated at function start)
-            // Graph weight is further adjusted by memory tier
-            // Weights are: semantic_weight, graph_weight * tier_mult, linguistic_weight
-            let tier_adjusted_graph_weight = graph_weight * tier_graph_mult;
-            // Renormalize weights to sum to 1.0
-            let weight_sum = semantic_weight + tier_adjusted_graph_weight + linguistic_weight;
-            let norm_semantic = semantic_weight / weight_sum;
-            let norm_graph = tier_adjusted_graph_weight / weight_sum;
-            let norm_linguistic = linguistic_weight / weight_sum;
-
-            let hybrid_score = semantic_score * norm_semantic
-                + graph_activation * norm_graph
-                + linguistic_score * norm_linguistic;
-
-            // Recency decay (10% contribution) - recent memories get boost
-            // λ = 0.01 means ~50% at 70 hours, ~25% at 140 hours
-            const RECENCY_DECAY_RATE: f32 = 0.01;
+            // Raw boost signals, unscaled. RECENCY_DECAY_RATE is the canonical constant
+            // (0.01, ~50% at 70h / ~25% at 140h) — previously a local const shadowing it
+            // with the same value. Scale and functional form are applied below.
             let hours_old = (now - memory.created_at).num_hours().max(0) as f32;
-            let recency_boost = (-RECENCY_DECAY_RATE * hours_old).exp() * 0.1;
-
-            // Emotional arousal boost: high arousal = more salient (5% contribution)
-            let arousal_boost = memory
+            let recency_raw = (-RECENCY_DECAY_RATE * hours_old).exp();
+            let arousal_raw = memory
                 .experience
                 .context
                 .as_ref()
-                .map(|c| c.emotional.arousal * 0.05)
+                .map(|c| c.emotional.arousal)
                 .unwrap_or(0.0);
-
-            // Source credibility boost (5% contribution)
-            let credibility_boost = memory
+            let credibility_raw = memory
                 .experience
                 .context
                 .as_ref()
-                .map(|c| (c.source.credibility - 0.5).max(0.0) * 0.1)
+                .map(|c| (c.source.credibility - 0.5).max(0.0))
                 .unwrap_or(0.0);
 
             // Type-aware activation dampening: noise types (CodeEdit, Command, etc.)
             // get reduced activation scores so intentional memories rank higher.
             // This is the read-time complement to write-time edge dampening.
             let type_dampening = memory.experience.experience_type.activation_multiplier();
-            let final_score =
-                (hybrid_score + recency_boost + arousal_boost + credibility_boost) * type_dampening;
+
+            let final_score = if boost_multiplicative {
+                // Semantic-leg form: modulate the base score rather than adding to it,
+                // using the canonical scales. Matches memory/mod.rs `(1.0 + Σ factors)`.
+                hybrid_score
+                    * (1.0
+                        + recency_raw * RECENCY_BOOST_SCALE
+                        + arousal_raw * AROUSAL_BOOST_SCALE
+                        + credibility_raw * CREDIBILITY_BOOST_SCALE)
+                    * type_dampening
+            } else {
+                // Historical graph-leg form: additive boosts with the GRAPH_* scales.
+                // Byte-identical to the pre-flag behavior (0.1 / 0.05 / 0.1).
+                (hybrid_score
+                    + recency_raw * GRAPH_RECENCY_BOOST_SCALE
+                    + arousal_raw * GRAPH_AROUSAL_BOOST_SCALE
+                    + credibility_raw * GRAPH_CREDIBILITY_BOOST_SCALE)
+                    * type_dampening
+            };
 
             scored_memories.push(ActivatedMemory {
                 memory,
@@ -1775,8 +1907,23 @@ pub fn spreading_activation_retrieve_with_stats(
         }
     }
 
-    // Step 6: Sort by final score (descending)
-    scored_memories.sort_by(|a, b| b.final_score.total_cmp(&a.final_score));
+    // Step 6: Sort by final score (descending).
+    //
+    // Content tie-break: without one, equal-score candidates keep the
+    // `activated_memories` HashMap iteration order — random per process AND
+    // per ingest — and the truncations below (cap 200, then graph_leg_k) cut
+    // through equal-score plateaus, so leg MEMBERSHIP would differ between
+    // two ingests of the same corpus (RH-12 guard). Content is repeat-stable
+    // and unique per store (#109 content-hash dedup at remember()), so this
+    // is a total order.
+    scored_memories.sort_by(|a, b| {
+        b.final_score.total_cmp(&a.final_score).then_with(|| {
+            a.memory
+                .experience
+                .content
+                .cmp(&b.memory.experience.content)
+        })
+    });
 
     // Bound the candidate set before the O(n²) lateral-inhibition pass below. The caller
     // keeps only the top ~200 graph candidates anyway, so this loses nothing — but without
@@ -1793,8 +1940,15 @@ pub fn spreading_activation_retrieve_with_stats(
         for (i, penalty) in penalties.iter().enumerate() {
             scored_memories[i].final_score -= penalty;
         }
-        // Re-sort after inhibition reweighting
-        scored_memories.sort_by(|a, b| b.final_score.total_cmp(&a.final_score));
+        // Re-sort after inhibition reweighting (same total order as Step 6).
+        scored_memories.sort_by(|a, b| {
+            b.final_score.total_cmp(&a.final_score).then_with(|| {
+                a.memory
+                    .experience
+                    .content
+                    .cmp(&b.memory.experience.content)
+            })
+        });
     }
 
     // Step 7: Apply limit. Default = query.max_results, which makes the graph leg a
@@ -1936,6 +2090,139 @@ fn calculate_lateral_inhibition(scored: &[ActivatedMemory]) -> Vec<f32> {
 mod tests {
     use super::*;
 
+    // =========================================================================
+    // Memory-tier graph trust: the multiplier must attenuate GRAPH EVIDENCE and
+    // nothing else.
+    //
+    // It used to be folded into the weight vector, which was then renormalized
+    // per candidate — so a candidate's tier changed the weight on its SEMANTIC
+    // and LINGUISTIC legs too, and those scores were ranked against each other.
+    // These pin the invariant that makes cross-candidate comparison valid.
+    // =========================================================================
+
+    /// The shipped density weights at the sparse end, used by every test below:
+    /// semantic 0.5, graph 0.3, linguistic 0.2 (they sum to 1.0).
+    const W_SEM: f32 = 0.5;
+    const W_GRAPH: f32 = 0.3;
+    const W_LING: f32 = 0.2;
+
+    #[test]
+    fn tier_trust_leaves_the_semantic_and_linguistic_legs_untouched() {
+        // Two candidates with IDENTICAL evidence and different trust factors.
+        // Their scores may differ only by the graph term. With zero graph
+        // activation there is no graph term, so they must be exactly equal —
+        // under the old renormalizing form they were not (0.5·0.5/0.79 = 0.3165
+        // vs 0.5·0.5/1.0 = 0.25, a 27% spread driven purely by tier).
+        let low = fuse_hybrid_score(0.5, 0.0, 0.4, W_SEM, W_GRAPH, W_LING, 0.3);
+        let high = fuse_hybrid_score(0.5, 0.0, 0.4, W_SEM, W_GRAPH, W_LING, 1.0);
+        assert_eq!(
+            low, high,
+            "with no graph evidence, tier trust must not move the score at all"
+        );
+
+        // And the value is the plain weighted blend of the other two legs.
+        assert!((low - (0.5 * 0.5 + 0.4 * 0.2)).abs() < 1e-6, "got {low}");
+    }
+
+    #[test]
+    fn tier_trust_scales_the_graph_term_linearly() {
+        // graph term = graph_activation · trust · (w_graph / Σw). Σw = 1.0 here,
+        // so doubling the trust must double the graph term's contribution.
+        let base = fuse_hybrid_score(0.2, 0.0, 0.1, W_SEM, W_GRAPH, W_LING, 0.3);
+        let at_03 = fuse_hybrid_score(0.2, 0.8, 0.1, W_SEM, W_GRAPH, W_LING, 0.3);
+        let at_06 = fuse_hybrid_score(0.2, 0.8, 0.1, W_SEM, W_GRAPH, W_LING, 0.6);
+        let at_10 = fuse_hybrid_score(0.2, 0.8, 0.1, W_SEM, W_GRAPH, W_LING, 1.0);
+
+        assert!((at_03 - base - 0.8 * 0.3 * 0.3).abs() < 1e-6);
+        assert!(
+            ((at_06 - base) - 2.0 * (at_03 - base)).abs() < 1e-6,
+            "graph contribution must be linear in trust"
+        );
+        assert!(((at_10 - base) - 0.8 * 1.0 * 0.3).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_more_trusted_memory_is_never_outranked_on_identical_evidence() {
+        // The failure shape this fix exists to prevent. Two candidates with the
+        // SAME semantic, graph and linguistic evidence; one is LongTerm, one is
+        // Working. The renormalizing form ranked the Working candidate ABOVE the
+        // LongTerm one whenever semantic evidence dominated, because discounting
+        // its graph leg inflated its semantic leg.
+        let sem = 0.72_f32;
+        let graph = 0.05_f32; // semantic-dominant: the common case
+        let ling = 0.30_f32;
+
+        let working = fuse_hybrid_score(
+            sem,
+            graph,
+            ling,
+            W_SEM,
+            W_GRAPH,
+            W_LING,
+            memory_tier_graph_trust(MemoryTier::Working),
+        );
+        let longterm = fuse_hybrid_score(
+            sem,
+            graph,
+            ling,
+            W_SEM,
+            W_GRAPH,
+            W_LING,
+            memory_tier_graph_trust(MemoryTier::LongTerm),
+        );
+        assert!(
+            longterm >= working,
+            "equal evidence: the consolidated memory must not rank below the \
+             working one (longterm={longterm} working={working})"
+        );
+
+        // Demonstrate the old form actually inverted it, so this test is pinning
+        // a real regression and not a tautology.
+        let legacy = |trust: f32| {
+            let sum = W_SEM + W_GRAPH * trust + W_LING;
+            sem * (W_SEM / sum) + graph * (W_GRAPH * trust / sum) + ling * (W_LING / sum)
+        };
+        assert!(
+            legacy(0.3) > legacy(1.0),
+            "the renormalizing form is expected to invert the ordering here"
+        );
+    }
+
+    #[test]
+    fn session_graph_trust_is_held_at_the_working_value() {
+        // `promote_working_to_session` now persists the tier, so `Session` can
+        // reach the scoring path for the first time. It must not silently
+        // activate MEMORY_TIER_GRAPH_MULT_SESSION (0.6) — an unmeasured ranking
+        // claim that costs recall on the LoCoMo-100 gate. Promoting the middle
+        // rung is a measured decision; this test is the tripwire that forces it
+        // to be made deliberately.
+        assert_eq!(
+            memory_tier_graph_trust(MemoryTier::Session),
+            memory_tier_graph_trust(MemoryTier::Working),
+            "Session must score identically to Working until the rung is measured"
+        );
+        assert_eq!(
+            memory_tier_graph_trust(MemoryTier::LongTerm),
+            MEMORY_TIER_GRAPH_MULT_LONGTERM,
+            "LongTerm remains the undiscounted reference"
+        );
+        // Archive is retired (see MemoryTier::Archive) — it must never rank
+        // ABOVE LongTerm, which its 1.2 constant would have done.
+        assert!(
+            memory_tier_graph_trust(MemoryTier::Archive)
+                <= memory_tier_graph_trust(MemoryTier::LongTerm),
+            "the retired Archive tier must not out-trust LongTerm"
+        );
+    }
+
+    #[test]
+    fn degenerate_weights_do_not_produce_nan() {
+        // Defensive: `calculate_density_weights` cannot return an all-zero
+        // vector today, but a score of NaN would poison the sort comparator
+        // rather than merely rank badly.
+        assert_eq!(fuse_hybrid_score(0.9, 0.9, 0.9, 0.0, 0.0, 0.0, 1.0), 0.0);
+    }
+
     #[test]
     fn test_cosine_similarity() {
         let a = vec![1.0, 0.0, 0.0];
@@ -1981,6 +2268,7 @@ mod tests {
             is_proper_noun: false,
             selectivity: None,
             fine_type: None,
+            kb_id: None,
         };
 
         // add_entity forces mention_count=1 for a new entity and +1 on each re-add of
@@ -2016,6 +2304,7 @@ mod tests {
             forman_curvature: None,
             endpoint_selectivity: None,
             provenance: Vec::new(),
+            promoted_at: None,
         };
         graph.add_relationship(mk_edge(hub, target_h)).unwrap();
         graph.add_relationship(mk_edge(rare, target_r)).unwrap();
@@ -2078,6 +2367,7 @@ mod tests {
             is_proper_noun: false,
             selectivity: None,
             fine_type: None,
+            kb_id: None,
         };
         let a = graph.add_entity(mk_entity("Alphaword")).unwrap();
         let b = graph.add_entity(mk_entity("Betaword")).unwrap();
@@ -2102,6 +2392,7 @@ mod tests {
                 forman_curvature: None,
                 endpoint_selectivity: None,
                 provenance: Vec::new(),
+                promoted_at: None,
             })
             .unwrap();
 
@@ -2601,6 +2892,7 @@ mod tests {
             is_proper_noun: false,
             selectivity: None,
             fine_type: None,
+            kb_id: None,
         };
         let widget = graph.add_entity(mk_entity("widget")).unwrap();
         let gadget = graph.add_entity(mk_entity("gadget")).unwrap();
@@ -2630,6 +2922,7 @@ mod tests {
                 forman_curvature: None,
                 endpoint_selectivity: None,
                 provenance: Vec::new(),
+                promoted_at: None,
             })
             .unwrap();
 

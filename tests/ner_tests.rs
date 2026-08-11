@@ -6,7 +6,13 @@
 //! - Person name extraction
 //! - Mixed entity extraction
 //! - Edge cases and stress tests
+//!
+//! Every test below `production_typer` exercises the REAL GLiNER path through
+//! `NeuralNer` — the path production actually runs. Everything else in this file
+//! runs the rule-based fallback (`NeuralNer::new_fallback`), which for a long
+//! time was the only `NeuralNer` behaviour under test at all.
 
+use shodh_memory::embeddings::gliner::GlinerConfig;
 use shodh_memory::embeddings::ner::{NerConfig, NerEntityType, NeuralNer};
 use std::path::PathBuf;
 
@@ -19,6 +25,158 @@ fn create_test_ner() -> NeuralNer {
         confidence_threshold: 0.5,
     };
     NeuralNer::new_fallback(config)
+}
+
+// ==================== Production GLiNER Path ====================
+
+/// The production typer, not the fallback. These tests pin the behaviour the
+/// remember path depends on: `NeuralNer::extract` must EMIT entities when the
+/// GLiNER assets are present.
+///
+/// Asset handling is a hard gate, not a skip. Every other model-dependent test
+/// in this repo returns early when assets are absent, and a test that skips
+/// cannot fail — so it can neither catch a regression nor rule one out. CI
+/// provisions `SHODH_GLINER_MODEL_PATH` and already refuses to run without it
+/// ("refusing to run on fallback NER"), so asserting presence here costs nothing
+/// in CI and is loud everywhere else.
+mod production_typer {
+    use super::*;
+
+    /// Construct the production NER exactly the way `MultiUserMemoryManager::new`
+    /// does, and refuse to proceed on the fallback path.
+    fn production_ner() -> NeuralNer {
+        let config = GlinerConfig::from_env();
+        assert!(
+            config.assets_present(),
+            "GLiNER assets missing at {:?} — these tests pin the PRODUCTION typer and must not \
+             silently degrade to the rule-based fallback. Set SHODH_GLINER_MODEL_PATH to a \
+             directory containing model.onnx, tokenizer.json and label_embeddings.bin.",
+            config.model_path
+        );
+
+        let ner = NeuralNer::new(NerConfig::default()).expect("NeuralNer::new never fails");
+        assert!(
+            !ner.is_fallback_mode(),
+            "NeuralNer fell back to the rule-based extractor despite assets being present at {:?}",
+            config.model_path
+        );
+        ner
+    }
+
+    /// Emission itself — the property whose absence was reported as
+    /// `ner_entities: []` on the remember path.
+    ///
+    /// An empty result is also the CORRECT answer for text that names nothing,
+    /// so "the typer stopped working" and "this corpus has no entities" produce
+    /// byte-identical output. Nothing in the pipeline could tell them apart, and
+    /// nothing tested this layer: every other `NeuralNer` test in this file and
+    /// in `src/embeddings/ner.rs` runs `new_fallback`. This test is that missing
+    /// discriminator — if emission ever does break, it fails here first.
+    #[test]
+    fn production_extract_emits_entities() {
+        let ner = production_ner();
+        let text = "The annual conference was held in Baltimore before moving to Norfolk.";
+        let entities = ner.extract(text).expect("extract must not error");
+
+        assert!(
+            !entities.is_empty(),
+            "GLiNER emitted ZERO entities for {text:?} — the remember path would store \
+             ner_entities: [], and no LOC record would ever reach the gazetteer."
+        );
+
+        let locations: Vec<&str> = entities
+            .iter()
+            .filter(|e| e.entity_type == NerEntityType::Location)
+            .map(|e| e.text.as_str())
+            .collect();
+        assert!(
+            locations
+                .iter()
+                .any(|t| t.eq_ignore_ascii_case("Baltimore")),
+            "expected 'Baltimore' typed as Location; got locations {locations:?} from all \
+             entities {:?}",
+            debug_entities(&entities)
+        );
+        assert!(
+            locations.iter().any(|t| t.eq_ignore_ascii_case("Norfolk")),
+            "expected 'Norfolk' typed as Location; got locations {locations:?} from all \
+             entities {:?}",
+            debug_entities(&entities)
+        );
+    }
+
+    /// The production path must carry the fine label — that is the whole point
+    /// of the GLiNER rollup, and its absence is how you tell the fallback path
+    /// apart from the real one when both happen to emit something.
+    #[test]
+    fn production_extract_carries_fine_labels() {
+        let ner = production_ner();
+        let entities = ner
+            .extract("Microsoft opened an engineering office in Seattle.")
+            .expect("extract must not error");
+        assert!(
+            !entities.is_empty(),
+            "GLiNER emitted ZERO entities for an unambiguous ORG + LOC sentence"
+        );
+        assert!(
+            entities.iter().all(|e| e.fine_label.is_some()),
+            "every GLiNER entity must carry a fine label; got {:?}",
+            debug_entities(&entities)
+        );
+    }
+
+    /// The reported emptiness was corpus-wide, not sentence-specific. Pin
+    /// emission across several unrelated sentences so a single lucky sentence
+    /// cannot carry the gate.
+    #[test]
+    fn production_extract_emits_across_a_corpus() {
+        let ner = production_ner();
+        let corpus = [
+            "The annual conference was held in Baltimore before moving to Norfolk.",
+            "Microsoft opened an engineering office in Seattle.",
+            "Priya Sharma joined the robotics team in Bangalore last March.",
+            "The cargo ship rammed the Francis Scott Key Bridge.",
+            "Infosys and Wipro both reported earnings from Hyderabad.",
+        ];
+
+        let mut empty: Vec<&str> = Vec::new();
+        let mut total = 0usize;
+        for text in corpus {
+            let entities = ner.extract(text).expect("extract must not error");
+            if entities.is_empty() {
+                empty.push(text);
+            }
+            total += entities.len();
+        }
+
+        assert!(
+            empty.is_empty(),
+            "GLiNER emitted zero entities for {} of {} corpus sentences: {empty:?}",
+            empty.len(),
+            corpus.len()
+        );
+        assert!(
+            total >= corpus.len(),
+            "expected at least one entity per corpus sentence, got {total} across {} sentences",
+            corpus.len()
+        );
+    }
+
+    fn debug_entities(
+        entities: &[shodh_memory::embeddings::ner::NerEntity],
+    ) -> Vec<(String, &'static str, Option<String>, f32)> {
+        entities
+            .iter()
+            .map(|e| {
+                (
+                    e.text.clone(),
+                    e.entity_type.as_str(),
+                    e.fine_label.clone(),
+                    e.confidence,
+                )
+            })
+            .collect()
+    }
 }
 
 // ==================== Indian Entity Tests ====================

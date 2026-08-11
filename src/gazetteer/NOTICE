@@ -1,0 +1,25 @@
+GeoNames geographical database
+==============================
+
+`cities15000.tsv` in this directory is derived from the GeoNames
+`cities15000` export (all cities with a population greater than 15,000).
+
+    Source:  https://www.geonames.org
+    Export:  https://download.geonames.org/export/dump/cities15000.zip
+    Licence: Creative Commons Attribution 4.0 International (CC BY 4.0)
+             https://creativecommons.org/licenses/by/4.0/
+
+This work is licensed under CC BY 4.0. The GeoNames data is used here
+unmodified in substance; the derivation is a mechanical subset, performed by
+`scripts/build_gazetteer.py`:
+
+  - only the name, ASCII name, latitude, longitude, ISO country code and
+    population columns are retained;
+  - the `alternatenames` column is dropped;
+  - rows with a population of zero are dropped;
+  - rows are re-sorted by descending population for a stable, diffable asset.
+
+No other transformation is applied. Coordinates and populations are the
+GeoNames values.
+
+GeoNames is not affiliated with this project and does not endorse it.

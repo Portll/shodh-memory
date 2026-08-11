@@ -16,7 +16,61 @@
 // ---------------------------------------------------------------------------
 
 const SHODH_API_URL = process.env.SHODH_API_URL || "http://127.0.0.1:3030";
-const SHODH_API_KEY = process.env.SHODH_API_KEY || "sk-shodh-dev-local-testing-key";
+
+/**
+ * API key resolution — MUST match the MCP shim's persistence scheme
+ * (mcp-server/api-key-store.ts; this file ships standalone and cannot import
+ * it). The auto-spawned server only accepts the key the shim generated, which
+ * the shim persists to `<data-root>/.api-key`. Resolution order:
+ *   1. SHODH_API_KEY env (explicit)
+ *   2. `<data-root>/.api-key` — the shared key persisted by the MCP shim
+ *      (data root = SHODH_MEMORY_PATH, else the platform data dir, mirroring
+ *      the Rust server's default_storage_path in src/config.rs)
+ *   3. Legacy dev key — only correct when the user started the server
+ *      manually with that key; SessionStart verifies auth and fails LOUDLY
+ *      instead of letting capture die silently on a 401.
+ */
+interface ResolvedApiKey {
+  key: string;
+  source: "env" | "shared-key-file" | "legacy-dev-fallback";
+  file?: string;
+}
+
+function resolveApiKey(): ResolvedApiKey {
+  if (process.env.SHODH_API_KEY) {
+    return { key: process.env.SHODH_API_KEY, source: "env" };
+  }
+  const fs = require("fs");
+  const path = require("path");
+  const os = require("os");
+
+  const roots: string[] = [];
+  if (process.env.SHODH_MEMORY_PATH) {
+    roots.push(process.env.SHODH_MEMORY_PATH);
+  }
+  const home = os.homedir();
+  if (process.platform === "win32") {
+    roots.push(path.join(process.env.APPDATA || path.join(home, "AppData", "Roaming"), "shodh-memory"));
+  } else if (process.platform === "darwin") {
+    roots.push(path.join(home, "Library", "Application Support", "shodh-memory"));
+  } else {
+    roots.push(path.join(process.env.XDG_DATA_HOME || path.join(home, ".local", "share"), "shodh-memory"));
+  }
+
+  for (const root of roots) {
+    const file = path.join(root, ".api-key");
+    try {
+      const raw = fs.readFileSync(file, "utf-8").trim();
+      if (raw) return { key: raw, source: "shared-key-file", file };
+    } catch {
+      // File absent or unreadable — try the next candidate.
+    }
+  }
+  return { key: "sk-shodh-dev-local-testing-key", source: "legacy-dev-fallback" };
+}
+
+const RESOLVED_API_KEY = resolveApiKey();
+const SHODH_API_KEY = RESOLVED_API_KEY.key;
 const SHODH_USER_ID = process.env.SHODH_USER_ID || "claude-code";
 const HOOK_TIMEOUT_MS = 5000;
 const CIRCUIT_BREAKER_THRESHOLD = 3;
@@ -281,6 +335,77 @@ async function callBrainGet(endpoint: string): Promise<unknown> {
     }
     return null;
   }
+}
+
+/**
+ * Auth/reachability probe used at SessionStart. /health is public on the
+ * server, so a reachable server can still reject every capture call — probe
+ * an authenticated endpoint (/api/users, same one the MCP shim validates
+ * against) to distinguish "server down" from "key rejected".
+ */
+type AuthProbeResult =
+  | { status: "ok" }
+  | { status: "unauthorized"; httpStatus: number }
+  | { status: "unreachable"; detail: string };
+
+async function verifyServerAuth(): Promise<AuthProbeResult> {
+  try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), HOOK_TIMEOUT_MS);
+    const response = await fetch(`${SHODH_API_URL}/api/users`, {
+      headers: { "X-API-Key": SHODH_API_KEY },
+      signal: controller.signal,
+    });
+    clearTimeout(timeoutId);
+    if (response.status === 401 || response.status === 403) {
+      return { status: "unauthorized", httpStatus: response.status };
+    }
+    // Any other response (including 5xx) means the server is up and the key
+    // was not rejected — later calls will surface their own errors.
+    return { status: "ok" };
+  } catch (e) {
+    return { status: "unreachable", detail: e instanceof Error ? e.message : "unknown" };
+  }
+}
+
+/** Loud, actionable SessionStart failure: stderr block + user-visible systemMessage. */
+function reportAuthFailure(httpStatus: number): void {
+  const keyOrigin =
+    RESOLVED_API_KEY.source === "env"
+      ? "the SHODH_API_KEY environment variable"
+      : RESOLVED_API_KEY.source === "shared-key-file"
+        ? `the shared key file ${RESOLVED_API_KEY.file}`
+        : "the legacy dev key (no SHODH_API_KEY set and no shared key file found)";
+
+  const fixLines =
+    RESOLVED_API_KEY.source === "legacy-dev-fallback"
+      ? [
+          "Fix: connect the shodh-memory MCP server once (it persists a shared",
+          "key to <data-dir>/.api-key that hooks pick up automatically), or set",
+          "SHODH_API_KEY to the key your server was started with.",
+        ]
+      : [
+          "Fix: set SHODH_API_KEY to the key the server was started with, or",
+          "stop the server, delete the stale shared key file, and let the MCP",
+          "server re-create it on next connect.",
+        ];
+
+  console.error("[shodh] ============================================================");
+  console.error(`[shodh] MEMORY CAPTURE DISABLED — server rejected API key (${httpStatus})`);
+  console.error(`[shodh] Key came from ${keyOrigin}.`);
+  for (const line of fixLines) console.error(`[shodh] ${line}`);
+  console.error("[shodh] ============================================================");
+
+  console.log(
+    JSON.stringify({
+      systemMessage: `shodh-memory: capture DISABLED — the memory server rejected the hook's API key (${httpStatus}). Key source: ${keyOrigin}. ${fixLines.join(" ")}`,
+      hookSpecificOutput: {
+        hookEventName: "SessionStart",
+        additionalContext:
+          "\n<shodh-memory>\nMemory capture is DISABLED this session: the memory server rejected the hook's API key. Do not rely on persistent memory until the user fixes the key configuration.\n</shodh-memory>",
+      },
+    })
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -910,6 +1035,19 @@ async function handleTaskUpdate(input: HookInput): Promise<void> {
 // ---------------------------------------------------------------------------
 
 async function handleSessionStart(input: HookInput): Promise<void> {
+  // Verify auth up front. A rejected key means EVERY capture call this session
+  // would silently 401 — the user must hear about it now, not never.
+  const probe = await verifyServerAuth();
+  if (probe.status === "unauthorized") {
+    reportAuthFailure(probe.httpStatus);
+    return;
+  }
+  if (probe.status === "unreachable") {
+    console.error(`[shodh] Memory server unreachable at ${SHODH_API_URL} (${probe.detail}) — no briefing this session.`);
+    console.error("[shodh] Later hook events will retry automatically once the server is up.");
+    return;
+  }
+
   const projectDir = process.env.CLAUDE_PROJECT_DIR || input.cwd || process.cwd();
   const projectName = projectDir.split(/[/\\]/).pop() || "unknown";
   const claudeDir = `${projectDir}/.claude`;

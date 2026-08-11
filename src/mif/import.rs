@@ -160,6 +160,7 @@ pub fn prepare_todos(doc: &MifDocument, user_id: &str) -> Vec<Todo> {
                 embedding: None,
                 related_memory_ids,
                 external_id: t.external_id.clone(),
+                blocked_by: t.blocked_by.iter().map(|id| TodoId(*id)).collect(),
             }
         })
         .collect()
@@ -263,6 +264,7 @@ pub fn import_graph_entities(kg: &MifKnowledgeGraph, graph: &GraphMemory) -> (us
             is_proper_noun: true,
             selectivity: None,
             fine_type: entity.fine_type.clone(),
+            kb_id: None,
         };
 
         match graph.add_entity(node) {
@@ -340,6 +342,7 @@ pub fn import_graph_relationships(
             forman_curvature: None,
             endpoint_selectivity: None,
             provenance: Vec::new(),
+            promoted_at: None,
         };
 
         match graph.add_relationship(edge) {
@@ -518,6 +521,7 @@ pub(crate) fn parse_relation_type(s: &str) -> RelationType {
         "alternative_to" | "alternativeto" => RelationType::AlternativeTo,
         "assigned_to" | "assignedto" => RelationType::AssignedTo,
         "approves" => RelationType::Approves,
+        "precedes" => RelationType::Precedes,
         other => RelationType::Custom(other.to_string()),
     }
 }

@@ -73,7 +73,13 @@ pub fn build_public_routes(state: AppState) -> Router {
         .route("/webhook/linear", post(integrations::linear_webhook))
         .route("/webhook/github", post(integrations::github_webhook))
         // =================================================================
-        // GRAPH VISUALIZATION (PUBLIC - HTML VIEWER ONLY)
+        // RETIRED HTML VIEWERS (PUBLIC - STATIC TOMBSTONE)
+        //
+        // Both pages were hand-maintained forks of the single-page dashboard
+        // the `shodh-front` crate (`front/`) now owns. They are kept mounted so
+        // existing bookmarks get an explanation and the canonical URL instead
+        // of a bare 404; both serve the same static page and read nothing from
+        // the request.
         // =================================================================
         .route("/graph/view", get(visualization::graph_view))
         .route("/dashboard", get(visualization::dashboard));
@@ -228,6 +234,10 @@ pub fn build_protected_routes(state: AppState) -> Router {
         // KNOWLEDGE GRAPH (ADVANCED)
         // =================================================================
         .route("/api/graph/{user_id}/stats", get(graph::get_graph_stats))
+        .route(
+            "/api/graph/{user_id}/tier-census",
+            get(graph::get_edge_tier_census),
+        )
         .route(
             "/api/graph/{user_id}/curvature",
             post(graph::compute_curvature),
@@ -463,9 +473,21 @@ pub fn build_protected_routes(state: AppState) -> Router {
     }
 
     // =================================================================
-    // STATE
+    // TRACE CAPTURE + STATE
     // =================================================================
-    router.with_state(state)
+    // Witnessed-op capture is mounted HERE — inside build_protected_routes —
+    // not at the server.rs call sites, so both transports (HTTP with auth,
+    // local IPC without an auth layer) are covered structurally (audit
+    // amendment 9). Layer order note: axum applies `.layer()` inner-first;
+    // this layer wraps only the routes above, and the caller's auth layer
+    // (HTTP path) wraps outside it — so on HTTP, capture runs strictly
+    // inside authentication.
+    router
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            super::trace::capture_middleware,
+        ))
+        .with_state(state)
 }
 
 /// Build the complete router with probe, public, and protected routes.

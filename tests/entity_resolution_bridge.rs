@@ -70,12 +70,10 @@ fn canonicals_for(
 
 #[test]
 fn bridge_mentions_resolve_to_canonical_entities() {
-    if !dep_parser::is_available() {
-        eprintln!(
-            "SKIP bridge_mentions_resolve_to_canonical_entities: SHODH_SPACY_MODEL_PATH unset"
-        );
-        return;
-    }
+    assert!(
+        dep_parser::is_available(),
+        "dependency parser must be available from the embedded bundle"
+    );
     let (mentions, causal) = load();
     let res = resolve(&mentions, &causal).expect("parser available");
 

@@ -390,6 +390,7 @@ pub async fn add_entity(
         is_proper_noun: true,
         selectivity: None,
         fine_type: None,
+        kb_id: None,
     };
 
     graph_guard.add_entity(entity).map_err(AppError::Internal)?;
@@ -493,6 +494,7 @@ pub async fn add_relationship(
         forman_curvature: None,
         endpoint_selectivity: None,
         provenance: Vec::new(),
+        promoted_at: None,
     };
 
     graph_guard

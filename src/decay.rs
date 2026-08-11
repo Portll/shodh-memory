@@ -48,12 +48,64 @@
 //! - Anderson & Schooler (1991) "Reflections of the Environment in Memory"
 
 use crate::constants::{
-    DECAY_CROSSOVER_DAYS, DECAY_LAMBDA_CONSOLIDATION, POWERLAW_BETA, POWERLAW_BETA_POTENTIATED,
+    DECAY_CROSSOVER_DAYS, DECAY_LAMBDA_CONSOLIDATION, L2_DECAY_PER_DAY, L3_DECAY_PER_MONTH,
+    POWERLAW_BETA, POWERLAW_BETA_POTENTIATED,
 };
+
+/// How fast an L3 (semantic) edge experiences time, relative to an L2 (episodic)
+/// edge, on the shared Wixted hybrid curve.
+///
+/// # Why this exists
+///
+/// `RelationshipEdge::decay_at` used to dispatch L2Episodic and L3Semantic to
+/// [`hybrid_decay_factor`] with **no tier argument**: the two tiers decayed
+/// identically, differing only in their prune gates. That made the tier ladder's
+/// central claim — L3 is "near-permanent" where L2 is merely episodic — false in
+/// the executed path, while [`L2_DECAY_PER_DAY`] and [`L3_DECAY_PER_MONTH`] sat
+/// in `constants.rs` documenting rates nothing read.
+///
+/// # Why a time scale, and why this value
+///
+/// The two constants jointly assert a *ratio*: L2 sheds 3.1%/day, L3 sheds
+/// 2%/month. Converted to the same units that is
+///
+/// ```text
+///   L3_DECAY_PER_MONTH / 30 days     0.02 / 30      0.000666…
+///   ────────────────────────────  =  ─────────  =  ───────────  =  0.021505…
+///        L2_DECAY_PER_DAY              0.031          0.031
+/// ```
+///
+/// so an L3 edge should age at ≈2.15% of an L2 edge's rate — 46.5× slower. That
+/// ratio is *uniquely determined* by the two documented constants; it introduces
+/// no new tunable. Applying it as a scale on the time axis
+/// (`f_L3(t) = f_hybrid(t · κ)`) rather than on λ alone keeps the whole shipped
+/// curve — its exponential leg, its crossover continuity, its monotonicity —
+/// intact, and makes L2 the κ=1 reference so **L2 behaviour is bit-identical to
+/// what shipped**. Both constants are now load-bearing: change either and L3's
+/// curve moves.
+///
+/// # Consequence worth knowing
+///
+/// Scaling time also moves the crossover: L3 does not enter the power-law leg
+/// until `DECAY_CROSSOVER_DAYS / κ ≈ 140` real days. Inside `decay_at` that is
+/// invisible (each call resets `last_activated`, so no tier ever sees more than
+/// one cycle's elapsed time — see `recall_harness::decay_sim`), and it has the
+/// side benefit that L3's first ~140 days are purely exponential and therefore
+/// **cadence-invariant**: exponential decay is memoryless, so stepping at the 6h
+/// production cadence and jumping once to the same age agree exactly. In
+/// `effective_strength`, which sees true age, the 140-day exponential nose is the
+/// intended shape of "near-permanent".
+///
+/// Reference: Wixted (2004) "The psychology and neuroscience of forgetting" —
+/// consolidation reduces the *rate* of forgetting, it does not change its form.
+pub const L3_TIME_SCALE_VS_L2: f64 = (L3_DECAY_PER_MONTH as f64 / 30.0) / (L2_DECAY_PER_DAY as f64);
 
 /// Calculates the hybrid decay factor for a given elapsed time.
 ///
 /// Returns a value between 0.0 and 1.0 representing the retention ratio.
+///
+/// This is the L2/reference curve — equivalent to
+/// [`hybrid_decay_factor_scaled`] with `time_scale = 1.0`.
 ///
 /// # Arguments
 ///
@@ -72,9 +124,26 @@ use crate::constants::{
 /// ```
 #[inline]
 pub fn hybrid_decay_factor(days_elapsed: f64, potentiated: bool) -> f32 {
-    if days_elapsed <= 0.0 {
+    hybrid_decay_factor_scaled(days_elapsed, potentiated, 1.0)
+}
+
+/// The hybrid curve evaluated on a tier-scaled time axis.
+///
+/// `time_scale` compresses (`> 1.0`) or dilates (`< 1.0`) how fast the edge
+/// experiences time. `1.0` is the L2/episodic reference;
+/// [`L3_TIME_SCALE_VS_L2`] is the semantic tier. See that constant for the
+/// derivation and for why the scale lives on the time axis rather than on λ.
+///
+/// A non-positive `time_scale` is treated as "no decay" (factor 1.0) rather than
+/// producing a nonsensical growth factor — the caller passes a compile-time
+/// constant, so this is a defensive floor, not a supported mode.
+#[inline]
+pub fn hybrid_decay_factor_scaled(days_elapsed: f64, potentiated: bool, time_scale: f64) -> f32 {
+    if days_elapsed <= 0.0 || time_scale <= 0.0 {
         return 1.0;
     }
+
+    let days_elapsed = days_elapsed * time_scale;
 
     let beta = if potentiated {
         POWERLAW_BETA_POTENTIATED
@@ -667,6 +736,116 @@ mod tests {
         assert!(year_retention > 0.01);
         // Potentiated: should be > 5%
         assert!(year_retention_potentiated > 0.05);
+    }
+
+    // =========================================================================
+    // Tier-distinct decay (invariant (d), L2 vs L3 half).
+    //
+    // Before this change L2Episodic and L3Semantic dispatched to the SAME
+    // `hybrid_decay_factor` call with no tier argument — identical decay — while
+    // `L2_DECAY_PER_DAY` (0.031/day) and `L3_DECAY_PER_MONTH` (0.02/month) had no
+    // production reference. `L3_TIME_SCALE_VS_L2` is the ratio those two
+    // constants jointly assert; the tests below pin (i) the ratio itself,
+    // (ii) that the curves are now measurably different in the same units, and
+    // (iii) that L2 is untouched.
+    // =========================================================================
+
+    #[test]
+    fn l3_time_scale_is_the_documented_constant_ratio() {
+        // κ = (L3_DECAY_PER_MONTH / 30 days) / L2_DECAY_PER_DAY
+        //   = (0.02 / 30) / 0.031
+        //   = 0.00066666… / 0.031
+        //   = 0.02150537…
+        // Written as a literal, not recomputed from the constants, so that a
+        // silent edit to either constant fails HERE with a readable number
+        // rather than quietly re-tuning every L3 edge in the system.
+        assert!(
+            (L3_TIME_SCALE_VS_L2 - 0.021_505_376_3).abs() < 1e-9,
+            "L3 must age at ~2.15% of L2's rate, got {L3_TIME_SCALE_VS_L2}"
+        );
+        // Stated the other way round: 46.5× slower.
+        assert!(
+            (1.0 / L3_TIME_SCALE_VS_L2 - 46.5).abs() < 0.05,
+            "L3 should be ~46.5x slower than L2"
+        );
+    }
+
+    #[test]
+    fn l2_reference_curve_is_unchanged_by_the_scaling_refactor() {
+        // `hybrid_decay_factor` must remain bit-identical to the shipped curve —
+        // 14 integration tests are pinned to its literals. κ=1 is the identity.
+        for &days in &[0.5_f64, 1.0, 2.999, 3.0, 7.0, 30.0, 365.0] {
+            for &pot in &[false, true] {
+                assert_eq!(
+                    hybrid_decay_factor(days, pot),
+                    hybrid_decay_factor_scaled(days, pot, 1.0),
+                    "time_scale 1.0 must be the identity (days={days}, potentiated={pot})"
+                );
+            }
+        }
+        // Anchor literal from the shipped model, carried to f32 precision:
+        //   A_cross = exp(-0.693 × 3) = exp(-2.079) = 0.12505520771
+        //   f(30)   = A_cross × (30/3)^-0.5
+        //           = 0.12505520771 × 0.31622776602
+        //           = 0.03954592900
+        // (An older comment elsewhere in the tree rounds A_cross to 0.12505519
+        // and quotes 0.03954777; that is wrong in the 6th decimal. The value
+        // below is what the model actually produces.)
+        assert!((hybrid_decay_factor(30.0, false) - 0.039_545_93).abs() < 1e-6);
+    }
+
+    #[test]
+    fn l3_decays_measurably_slower_than_l2_in_the_same_units() {
+        // Same elapsed time, same potentiation, same function — only the tier
+        // scale differs. At 30 days, non-potentiated:
+        //   L2: power-law leg  → 0.03954593        (see derivation above)
+        //   L3: sees 30 × 0.021505376 = 0.64516129 days, still in the
+        //       exponential leg (< 3) →
+        //       exp(-0.693 × 0.64516129) = exp(-0.44709677) = 0.63948202
+        let l2 = hybrid_decay_factor(30.0, false);
+        let l3 = hybrid_decay_factor_scaled(30.0, false, L3_TIME_SCALE_VS_L2);
+        assert!((l2 - 0.039_545_93).abs() < 1e-6, "L2 at 30d, got {l2}");
+        assert!((l3 - 0.639_482_02).abs() < 1e-6, "L3 at 30d, got {l3}");
+        // The point of the fix: not merely different, different by an order of
+        // magnitude — L3 retains ~16x more strength than L2 at one month idle.
+        assert!(
+            l3 > l2 * 15.0,
+            "L3 must retain far more than L2 at 30 days: l3={l3} l2={l2}"
+        );
+
+        // The ordering holds across the whole range, not just at one point.
+        for &days in &[1.0_f64, 3.0, 7.0, 30.0, 90.0, 365.0] {
+            let l2 = hybrid_decay_factor(days, false);
+            let l3 = hybrid_decay_factor_scaled(days, false, L3_TIME_SCALE_VS_L2);
+            assert!(l3 > l2, "L3 must outlast L2 at every horizon (days={days})");
+        }
+    }
+
+    #[test]
+    fn l3_first_140_days_are_exponential_and_therefore_cadence_invariant() {
+        // Crossover moves to DECAY_CROSSOVER_DAYS / κ = 3 / 0.0215054 = 139.5 days.
+        let crossover_real_days = DECAY_CROSSOVER_DAYS / L3_TIME_SCALE_VS_L2;
+        assert!(
+            (crossover_real_days - 139.5).abs() < 0.1,
+            "L3 crossover at ~139.5 real days, got {crossover_real_days}"
+        );
+
+        // Exponential decay is memoryless, so within that nose, N cadenced steps
+        // of h days compose exactly into one jump of N×h days. This is what makes
+        // L3 immune to the periodic-decay artefact documented in
+        // `recall_harness::decay_sim` (each `decay_at` resets `last_activated`,
+        // so production never feeds a long elapsed into the power-law leg).
+        let step_days = 0.25; // the ~6h production heavy-cycle cadence
+        let steps = 100; // 25 days total, well inside the nose
+        let composed: f64 = (0..steps).fold(1.0, |acc, _| {
+            acc * hybrid_decay_factor_scaled(step_days, false, L3_TIME_SCALE_VS_L2) as f64
+        });
+        let single =
+            hybrid_decay_factor_scaled(step_days * steps as f64, false, L3_TIME_SCALE_VS_L2) as f64;
+        assert!(
+            (composed - single).abs() < 1e-4,
+            "cadenced ({composed}) and single-jump ({single}) L3 decay must agree inside the exponential nose"
+        );
     }
 
     #[test]

@@ -31,6 +31,7 @@ pub mod entity_resolution;
 pub mod entity_type;
 pub mod errors;
 pub mod fs_matcher;
+pub mod gazetteer;
 pub mod graph_memory;
 pub mod handlers;
 pub mod integrations;

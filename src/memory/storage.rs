@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use super::oplog::{self, OpRecord, OpRecordDraft};
 use super::types::*;
 
 /// Helper trait to safely iterate over RocksDB results with error logging.
@@ -540,6 +541,11 @@ impl LegacyExperienceV1 {
             ner_entities: Vec::new(),
             cooccurrence_pairs: Vec::new(),
             importance_override: None,
+            // Pre-dates toponym resolution by several schema versions. Left
+            // empty rather than resolved on read: resolution belongs at
+            // remember time, and silently minting coordinates during a legacy
+            // decode would make old records look like they always had them.
+            toponyms: Vec::new(),
         }
     }
 }
@@ -695,6 +701,23 @@ impl LegacyMemoryV2 {
 ///
 /// Returns (Memory, needs_migration) where needs_migration=true means the data
 /// was in a legacy format and should be re-written for future performance.
+/// Postcard defaults for every trailing `MemoryFlat` field added after the
+/// postcard cutover (#192), in field order: `toponyms: Vec<Toponym>` (empty =
+/// varint `0x00`).
+///
+/// `parent_id` is NOT listed: it was added in January, before the April
+/// postcard cutover, so every postcard-era record already carries it.
+///
+/// `decode_raw_compat` appends these one at a time, so a record missing any
+/// suffix of these fields decodes (postcard has no `#[serde(default)]` EOF
+/// tolerance). Keep in sync with any new trailing field — and note that this
+/// mechanism ONLY works for fields appended at the end of `MemoryFlat`. A field
+/// added to `Experience` instead lands mid-payload, where an old record decodes
+/// to silently wrong values rather than failing; that is why
+/// `Experience::toponyms` is `#[serde(skip)]` and carried at the `MemoryFlat`
+/// tail.
+const MEMORY_DEFAULT_SUFFIX: &[u8] = &[0x00];
+
 fn deserialize_memory(data: &[u8]) -> Result<(Memory, bool)> {
     use crate::serialization::{SHO_VERSION_BINCODE2, SHO_VERSION_POSTCARD};
 
@@ -702,10 +725,14 @@ fn deserialize_memory(data: &[u8]) -> Result<(Memory, bool)> {
     if let Some((version, payload)) = crate::serialization::unwrap_sho(data) {
         match version {
             SHO_VERSION_POSTCARD => {
-                // Current format: postcard — single decode, no fallback
-                let memory: Memory = crate::serialization::decode_raw(payload)
-                    .map_err(|e| anyhow!("SHO v2 postcard decode failed: {e}"))?;
-                Ok((memory, false))
+                // Current format: postcard, tolerating records written before
+                // the trailing fields listed in MEMORY_DEFAULT_SUFFIX existed.
+                let (memory, defaulted): (Memory, bool) =
+                    crate::serialization::decode_raw_compat(payload, MEMORY_DEFAULT_SUFFIX)
+                        .map_err(|e| anyhow!("SHO v2 postcard decode failed: {e}"))?;
+                // `defaulted` marks the record for rewrite in the current schema,
+                // the same signal the legacy-format branches return.
+                Ok((memory, defaulted))
             }
             SHO_VERSION_BINCODE2 => {
                 // Legacy SHO v1: bincode 2.x — decode and mark for migration
@@ -1079,6 +1106,51 @@ pub(crate) fn crc32_simple(data: &[u8]) -> u32 {
 /// Column family name for secondary indices (tags, types, timestamps, etc.)
 const CF_INDEX: &str = "memory_index";
 
+/// Column family for the append-only agent-traceability operation log
+/// (`memory::oplog::OpRecord`, spec `docs/superpowers/specs/2026-07-30-agent-traceability-design.md`).
+///
+/// `pub` (unlike [`CF_INDEX`]) so other openers of the live storage path —
+/// notably `migration.rs`'s hardcoded-CF-list opener — can reference the
+/// constant instead of duplicating the string literal (audit
+/// `2026-07-30-traceability-slice1-audit.md` Finding A / amendment 3).
+///
+/// Keyspace within this CF:
+/// - `op:{session_id}:{seq:016x}` — one entry per [`super::oplog::OpRecord`],
+///   `seq` zero-padded to 16 **hex** digits (`u64`) so lexicographic order
+///   equals numeric order across the *entire* `u64` range. Decimal padding
+///   would break above 10^16 (`u64::MAX` is 20 decimal digits but only 16
+///   hex digits), so hex is exact at identical cost.
+/// - `head:{session_id}` — cached `(last_seq, last_hash, last_ts)` for O(1)
+///   append without scanning the session's full history.
+/// - `incomplete:{session_id}` — integrity flag set by
+///   [`MemoryStorage::oplog_mark_incomplete`]; never touches `op:`/`head:` keys.
+///
+/// `session_id` is validated (`crate::validation::validate_session_id`) to
+/// reject `:` before it ever reaches a key, so these three prefixes cannot
+/// collide with each other or with a foreign session's `op:` keys.
+pub const CF_OPLOG: &str = "oplog";
+
+/// Key prefix for oplog records: full key is `op:{session_id}:{seq:016x}`
+/// (hex, not decimal — see [`CF_OPLOG`]'s doc comment for why).
+const OPLOG_RECORD_PREFIX: &str = "op:";
+
+/// Key prefix for the cached per-session head pointer: `head:{session_id}`.
+const OPLOG_HEAD_PREFIX: &str = "head:";
+
+/// Key prefix for the per-session integrity flag: `incomplete:{session_id}`.
+const OPLOG_INCOMPLETE_PREFIX: &str = "incomplete:";
+
+/// Cached per-session head pointer, stored under `head:{session_id}` in
+/// [`CF_OPLOG`]. `last_ts` mirrors the head record's `ts` so
+/// [`MemoryStorage::oplog_sessions`] can order sessions "newest-first by
+/// head write time" without decoding each session's full record history.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct OplogHead {
+    last_seq: u64,
+    last_hash: String,
+    last_ts: DateTime<Utc>,
+}
+
 /// Maximum number of failed writes to buffer for retry.
 /// Small enough to bound memory usage (~100 memories × ~2KB ≈ 200KB)
 /// but large enough to absorb transient RocksDB contention bursts.
@@ -1101,6 +1173,16 @@ pub struct MemoryStorage {
     write_retry_buffer: parking_lot::Mutex<std::collections::VecDeque<Memory>>,
     /// Counter of total write failures (for /api/health metrics)
     write_failure_count: std::sync::atomic::AtomicU64,
+    /// Serializes oplog head-read -> `WriteBatch`-write so concurrent appends
+    /// to the same session cannot race and produce duplicate `seq` values or
+    /// forked chains. Storage methods are NOT otherwise externally serialized
+    /// — handlers take `.read()` guards on `MemorySystem` (audit
+    /// `2026-07-30-traceability-slice1-audit.md` Finding G) — so this lock is
+    /// the only thing making "seq = head.last_seq + 1" atomic. Held only
+    /// across the append path (read head, build record, write batch); never
+    /// taken by reads. Capture is low-frequency relative to reads, so a
+    /// single per-storage (i.e. per-user) mutex is acceptable for v1.
+    oplog_append_lock: parking_lot::Mutex<()>,
 }
 
 impl MemoryStorage {
@@ -1109,6 +1191,11 @@ impl MemoryStorage {
         self.db
             .cf_handle(CF_INDEX)
             .expect("memory_index CF must exist")
+    }
+
+    /// CF accessor for the agent-traceability oplog column family.
+    fn oplog_cf(&self) -> &ColumnFamily {
+        self.db.cf_handle(CF_OPLOG).expect("oplog CF must exist")
     }
 
     /// Create a new memory storage.
@@ -1182,6 +1269,14 @@ impl MemoryStorage {
                     idx_opts.set_write_buffer_size(ROCKSDB_MEMORY_WRITE_BUFFER_BYTES);
                     idx_opts
                 }),
+                ColumnFamilyDescriptor::new(CF_OPLOG, {
+                    let mut oplog_opts = Options::default();
+                    oplog_opts.create_if_missing(true);
+                    oplog_opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
+                    oplog_opts.set_max_write_buffer_number(2);
+                    oplog_opts.set_write_buffer_size(ROCKSDB_MEMORY_WRITE_BUFFER_BYTES);
+                    oplog_opts
+                }),
             ]
         })?);
 
@@ -1205,6 +1300,7 @@ impl MemoryStorage {
             write_mode,
             write_retry_buffer: parking_lot::Mutex::new(std::collections::VecDeque::new()),
             write_failure_count: std::sync::atomic::AtomicU64::new(0),
+            oplog_append_lock: parking_lot::Mutex::new(()),
         })
     }
 
@@ -1998,8 +2094,9 @@ impl MemoryStorage {
                 lat,
                 lon,
                 radius_meters,
+                limit,
             } => {
-                memory_ids = self.search_by_location(lat, lon, radius_meters)?;
+                memory_ids = self.search_by_location(lat, lon, radius_meters, limit)?;
             }
             SearchCriteria::ByActionType(action_type) => {
                 memory_ids = self.search_by_action_type(&action_type)?;
@@ -2329,16 +2426,28 @@ impl MemoryStorage {
     ///
     /// Performance: O(k) where k = memories in ~9 geohash cells covering the radius
     /// Previous approach was O(n) where n = all geo-indexed memories
+    ///
+    /// `limit`, if `Some`, bounds the number of ids returned to the nearest
+    /// `limit` by geohash-decoded APPROXIMATE distance (cell-center at
+    /// geohash precision 10 is within ~1m of the true position — plenty
+    /// accurate for this sort/cap; nothing here is hydrated). Capping must
+    /// happen here, before the caller's `search()` hydrates (get + full
+    /// deserialize) every returned id — capping after hydration doesn't
+    /// bound the hydration cost, which is the expensive part. `None`
+    /// preserves the historical uncapped, geohash-scan-order behavior.
     fn search_by_location(
         &self,
         center_lat: f64,
         center_lon: f64,
         radius_meters: f64,
+        limit: Option<usize>,
     ) -> Result<Vec<MemoryId>> {
         use super::types::{geohash_decode, geohash_search_prefixes, GeoFilter};
 
         let geo_filter = GeoFilter::new(center_lat, center_lon, radius_meters);
-        let mut ids = Vec::new();
+        // (id, approx_distance_meters) — distance kept so we can sort
+        // nearest-first before capping, without hydrating anything.
+        let mut candidates: Vec<(MemoryId, f64)> = Vec::new();
 
         // Get geohash prefixes for center + neighbors at appropriate precision
         let prefixes = geohash_search_prefixes(center_lat, center_lon, radius_meters);
@@ -2368,18 +2477,26 @@ impl MemoryStorage {
                     let (min_lat, min_lon, max_lat, max_lon) = geohash_decode(geohash);
                     let approx_lat = (min_lat + max_lat) / 2.0;
                     let approx_lon = (min_lon + max_lon) / 2.0;
+                    let approx_distance = geo_filter.haversine_distance(approx_lat, approx_lon);
 
                     // Final haversine check for edge cases at cell boundaries
-                    if geo_filter.contains(approx_lat, approx_lon) {
+                    if approx_distance <= radius_meters {
                         if let Ok(uuid) = uuid::Uuid::parse_str(parts[2]) {
-                            ids.push(MemoryId(uuid));
+                            candidates.push((MemoryId(uuid), approx_distance));
                         }
                     }
                 }
             }
         }
 
-        Ok(ids)
+        // Nearest-first, MemoryId tie-break (never raw geohash scan order,
+        // which is a RocksDB iteration artifact, not a meaningful ordering).
+        candidates.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+        if let Some(n) = limit {
+            candidates.truncate(n);
+        }
+
+        Ok(candidates.into_iter().map(|(id, _)| id).collect())
     }
 
     /// Search memories by action type
@@ -2649,10 +2766,40 @@ impl MemoryStorage {
     /// Mark memories as forgotten (soft delete) with atomic batch write.
     /// Returns the IDs of memories that were flagged, so callers can clean up
     /// secondary indices (vector, BM25, graph).
+    ///
+    /// Also deletes each flagged memory's `geo:` index entry, if it has one,
+    /// in the SAME batch as the flag update (review finding, geotemporal Task
+    /// 2 round 4): the scan already has the full `Memory` in hand, so this
+    /// costs no extra RocksDB read/deserialize, and riding in the existing
+    /// per-sweep `WriteBatch` costs no extra fsync — a sweep flagging N
+    /// memories still does exactly one `write_opt`, not N. (Round 3 instead
+    /// added a `remove_geo_index(&self, id)` function, called per id in the
+    /// caller's loop over `flagged_ids` — that re-fetched and
+    /// re-deserialized each memory via `self.get(id)`, even though the
+    /// scan right here already had it, and issued its own
+    /// WriteBatch+write_opt per id, so under `WriteMode::Sync` a single
+    /// `OlderThan`/`LowImportance` sweep could cost up to N fsync'd writes.
+    /// `remove_geo_index` has been removed — this function's own batch is
+    /// the only place the geo key needs deleting, since nothing else in
+    /// this codebase soft-forgets memories one at a time; hard-delete
+    /// (`ForgetCriteria::ById`, `delete()`/`remove_from_indices`) already
+    /// handles geo cleanup for the single-id case.)
+    ///
+    /// NOTE on restoration (still true, carried over from the round-3 doc
+    /// comment this replaces): there is no un-forget/restore path anywhere
+    /// in this codebase for ANY secondary index — grepped for
+    /// restore/recover/unforget across src/; nothing reverses
+    /// `mark_forgotten_by_*`, and the `"forgotten"` metadata flag is only
+    /// ever set to `"true"`, never cleared. Vector, BM25, and graph cleanup
+    /// on soft-forget are therefore already one-way, unrestorable
+    /// operations; deleting the geo index entry here matches that existing
+    /// precedent rather than inventing a new (and currently unsupported)
+    /// restoration contract for geo alone.
     pub fn mark_forgotten_by_age(&self, cutoff: DateTime<Utc>) -> Result<Vec<MemoryId>> {
         let mut batch = rocksdb::WriteBatch::default();
         let mut flagged_ids = Vec::new();
         let now = Utc::now().to_rfc3339();
+        let idx = self.index_cf();
 
         let iter = self.db.iterator(IteratorMode::Start);
         for (key, value) in iter.flatten() {
@@ -2665,6 +2812,11 @@ impl MemoryStorage {
                 }
                 if memory.created_at < cutoff {
                     flagged_ids.push(memory.id.clone());
+                    if let Some(geo) = memory.experience.geo_location {
+                        let geohash = super::types::geohash_encode(geo[0], geo[1], 10);
+                        let geo_key = format!("geo:{}:{}", geohash, memory.id.0);
+                        batch.delete_cf(idx, geo_key.as_bytes());
+                    }
                     memory
                         .experience
                         .metadata
@@ -2692,10 +2844,16 @@ impl MemoryStorage {
     /// Mark memories with low importance as forgotten with atomic batch write.
     /// Returns the IDs of memories that were flagged, so callers can clean up
     /// secondary indices (vector, BM25, graph).
+    ///
+    /// Also deletes each flagged memory's `geo:` index entry, if it has one,
+    /// in the same batch as the flag update — see `mark_forgotten_by_age`'s
+    /// doc comment for the full rationale (one sweep, one write, no
+    /// redundant re-fetch; this mirrors it exactly).
     pub fn mark_forgotten_by_importance(&self, threshold: f32) -> Result<Vec<MemoryId>> {
         let mut batch = rocksdb::WriteBatch::default();
         let mut flagged_ids = Vec::new();
         let now = Utc::now().to_rfc3339();
+        let idx = self.index_cf();
 
         let iter = self.db.iterator(IteratorMode::Start);
         for (key, value) in iter.flatten() {
@@ -2708,6 +2866,11 @@ impl MemoryStorage {
                 }
                 if memory.importance() < threshold {
                     flagged_ids.push(memory.id.clone());
+                    if let Some(geo) = memory.experience.geo_location {
+                        let geohash = super::types::geohash_encode(geo[0], geo[1], 10);
+                        let geo_key = format!("geo:{}:{}", geohash, memory.id.0);
+                        batch.delete_cf(idx, geo_key.as_bytes());
+                    }
                     memory
                         .experience
                         .metadata
@@ -3059,7 +3222,7 @@ impl MemoryStorage {
     pub fn rocksdb_memory_breakdown(&self) -> (u64, u64) {
         let mut memtables = 0u64;
         let mut readers = 0u64;
-        for cf_name in ["default", CF_INDEX] {
+        for cf_name in ["default", CF_INDEX, CF_OPLOG] {
             if let Some(cf) = self.db.cf_handle(cf_name) {
                 if let Ok(Some(v)) = self
                     .db
@@ -3094,6 +3257,11 @@ impl MemoryStorage {
             .flush_cf_opt(self.index_cf(), &flush_opts)
             .map_err(|e| anyhow::anyhow!("Failed to flush index CF: {e}"))?;
 
+        // Explicitly flush the oplog CF for the same reason (audit Finding H).
+        self.db
+            .flush_cf_opt(self.oplog_cf(), &flush_opts)
+            .map_err(|e| anyhow::anyhow!("Failed to flush oplog CF: {e}"))?;
+
         Ok(())
     }
 
@@ -3103,6 +3271,230 @@ impl MemoryStorage {
     /// Facts use a different key prefix ("facts:") to avoid collisions.
     pub fn db(&self) -> Arc<DB> {
         self.db.clone()
+    }
+
+    // ========================================================================
+    // Agent-traceability oplog (spec
+    // docs/superpowers/specs/2026-07-30-agent-traceability-design.md §3.1-3.2)
+    // ========================================================================
+
+    /// Appends `draft` to its session's hash chain and persists it in
+    /// [`CF_OPLOG`], returning the sealed record (`seq`/`prev_hash`/`hash`
+    /// filled in). See [`CF_OPLOG`]'s doc comment for the key scheme.
+    ///
+    /// Atomic per session: reads the cached head, builds `seq =
+    /// head.last_seq + 1` (or `0` against [`super::oplog::genesis_hash`] if
+    /// this is the session's first record), then writes the record and the
+    /// updated head in one `WriteBatch`.
+    ///
+    /// Concurrency: guarded by `oplog_append_lock` for the whole
+    /// head-read → batch-write span. Storage methods are NOT externally
+    /// serialized — handlers take `.read()` guards on `MemorySystem`
+    /// (audit `2026-07-30-traceability-slice1-audit.md` Finding G) — so
+    /// without this lock, two concurrent appends to the same session could
+    /// both read the same head and produce duplicate `seq` values / forked
+    /// chains.
+    ///
+    /// Durability: inherits `self.write_mode` exactly like every other
+    /// storage write (audit amendment 6, resolving a constraint conflict
+    /// with Task 5's <100 µs median append gate) — appends are NOT forced
+    /// to `set_sync(true)`. See `oplog.rs`'s module docs for the resulting
+    /// crash window.
+    pub fn oplog_append(&self, draft: OpRecordDraft) -> Result<OpRecord> {
+        crate::validation::validate_session_id(&draft.session_id)
+            .context("oplog_append: invalid session_id")?;
+        // oplog.rs's DOMAIN_SEP invariant ("0x00 cannot occur in a validated
+        // session_id/user_id") covers user_id too, and user_id is
+        // self-asserted (see OpRecord::user_id's doc comment) — an
+        // unvalidated value with an embedded NUL/control char or unbounded
+        // length would land verbatim in the permanent tamper-evident record
+        // and break that guarantee.
+        crate::validation::validate_user_id(&draft.user_id)
+            .context("oplog_append: invalid user_id")?;
+
+        let OpRecordDraft {
+            ts,
+            session_id,
+            user_id,
+            op,
+            attestation,
+            payload_summary,
+            evidence_refs,
+            outcome,
+            reported_ts,
+            source,
+        } = draft;
+
+        // Guard the whole head-read -> batch-write span (see method docs).
+        let _guard = self.oplog_append_lock.lock();
+        let cf = self.oplog_cf();
+        let head_key = format!("{OPLOG_HEAD_PREFIX}{session_id}");
+
+        let (seq, prev_hash) = match self
+            .db
+            .get_cf(cf, head_key.as_bytes())
+            .context("oplog_append: reading session head")?
+        {
+            Some(bytes) => {
+                let head: OplogHead = serde_json::from_slice(&bytes)
+                    .context("oplog_append: decoding session head")?;
+                (head.last_seq + 1, head.last_hash)
+            }
+            None => (0u64, oplog::genesis_hash(&session_id, &user_id)),
+        };
+
+        let mut record = OpRecord {
+            seq,
+            ts,
+            session_id: session_id.clone(),
+            user_id,
+            op,
+            attestation,
+            payload_summary,
+            evidence_refs,
+            outcome,
+            reported_ts,
+            source,
+            prev_hash: prev_hash.clone(),
+            hash: String::new(),
+        };
+        record.hash = oplog::chain_hash(&prev_hash, &oplog::canonical_bytes(&record));
+
+        let record_key = format!("{OPLOG_RECORD_PREFIX}{session_id}:{seq:016x}");
+        // serde_json, matching oplog.rs's canonical-bytes format: the
+        // persistence round-trip invariant (oplog.rs module docs) requires
+        // any storage format to restore every field bit-exactly, and
+        // serde_json over `OpRecord` is the one already proven to do so
+        // (`serde_round_trip_preserves_verification`).
+        let record_bytes =
+            serde_json::to_vec(&record).context("oplog_append: serializing record")?;
+
+        let new_head = OplogHead {
+            last_seq: seq,
+            last_hash: record.hash.clone(),
+            last_ts: record.ts,
+        };
+        let head_bytes =
+            serde_json::to_vec(&new_head).context("oplog_append: serializing session head")?;
+
+        let mut batch = WriteBatch::default();
+        batch.put_cf(cf, record_key.as_bytes(), &record_bytes);
+        batch.put_cf(cf, head_key.as_bytes(), &head_bytes);
+
+        let mut write_opts = WriteOptions::default();
+        write_opts.set_sync(self.write_mode == WriteMode::Sync);
+        self.db
+            .write_opt(batch, &write_opts)
+            .context("oplog_append: writing record + head batch")?;
+
+        Ok(record)
+    }
+
+    /// Reads `session_id`'s records starting at `from_seq` (inclusive), in
+    /// ascending `seq` order, capped at `limit`.
+    pub fn oplog_read(
+        &self,
+        session_id: &str,
+        from_seq: u64,
+        limit: usize,
+    ) -> Result<Vec<OpRecord>> {
+        crate::validation::validate_session_id(session_id)
+            .context("oplog_read: invalid session_id")?;
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let cf = self.oplog_cf();
+        let prefix = format!("{OPLOG_RECORD_PREFIX}{session_id}:");
+        let start_key = format!("{OPLOG_RECORD_PREFIX}{session_id}:{from_seq:016x}");
+
+        let iter = self.db.iterator_cf(
+            cf,
+            IteratorMode::From(start_key.as_bytes(), rocksdb::Direction::Forward),
+        );
+
+        let mut records = Vec::new();
+        for item in iter {
+            let (key, value) = item.context("oplog_read: iterator error")?;
+            if !key.starts_with(prefix.as_bytes()) {
+                break;
+            }
+            let record: OpRecord =
+                serde_json::from_slice(&value).context("oplog_read: decoding record")?;
+            records.push(record);
+            if records.len() >= limit {
+                break;
+            }
+        }
+        Ok(records)
+    }
+
+    /// Sets the `incomplete:{session_id}` integrity flag. NEVER touches
+    /// `op:`/`head:` keys — the flag is a separate key prefix precisely so
+    /// this can never rewrite or delete a sealed record (audit amendment 15:
+    /// this is the one intentional, out-of-band oplog write site, used by
+    /// backup restore to mark sessions whose tail was rolled back).
+    pub fn oplog_mark_incomplete(&self, session_id: &str) -> Result<()> {
+        crate::validation::validate_session_id(session_id)
+            .context("oplog_mark_incomplete: invalid session_id")?;
+        let key = format!("{OPLOG_INCOMPLETE_PREFIX}{session_id}");
+
+        let mut write_opts = WriteOptions::default();
+        write_opts.set_sync(self.write_mode == WriteMode::Sync);
+        self.db
+            .put_cf_opt(self.oplog_cf(), key.as_bytes(), b"1", &write_opts)
+            .context("oplog_mark_incomplete: writing flag")?;
+        Ok(())
+    }
+
+    /// Whether `session_id`'s integrity flag is set (see
+    /// [`Self::oplog_mark_incomplete`]).
+    pub fn oplog_is_incomplete(&self, session_id: &str) -> Result<bool> {
+        crate::validation::validate_session_id(session_id)
+            .context("oplog_is_incomplete: invalid session_id")?;
+        let key = format!("{OPLOG_INCOMPLETE_PREFIX}{session_id}");
+        Ok(self
+            .db
+            .get_cf(self.oplog_cf(), key.as_bytes())
+            .context("oplog_is_incomplete: reading flag")?
+            .is_some())
+    }
+
+    /// Lists distinct session ids with at least one oplog record,
+    /// newest-first by head write time (the `ts` of each session's most
+    /// recent append; `session_id` breaks ties for determinism).
+    ///
+    /// No `user_id` filter (audit amendment 7): `MemoryStorage` is already
+    /// per-user (`{base}/{user_id}/storage`), so a `user_id` parameter here
+    /// would be vestigial and would invite a false cross-user-listing
+    /// expectation.
+    pub fn oplog_sessions(&self, limit: usize, offset: usize) -> Result<Vec<String>> {
+        let cf = self.oplog_cf();
+        let iter = self.db.iterator_cf(
+            cf,
+            IteratorMode::From(OPLOG_HEAD_PREFIX.as_bytes(), rocksdb::Direction::Forward),
+        );
+
+        let mut sessions: Vec<(String, DateTime<Utc>)> = Vec::new();
+        for item in iter {
+            let (key, value) = item.context("oplog_sessions: iterator error")?;
+            if !key.starts_with(OPLOG_HEAD_PREFIX.as_bytes()) {
+                break;
+            }
+            let session_id = String::from_utf8_lossy(&key[OPLOG_HEAD_PREFIX.len()..]).to_string();
+            let head: OplogHead =
+                serde_json::from_slice(&value).context("oplog_sessions: decoding session head")?;
+            sessions.push((session_id, head.last_ts));
+        }
+
+        sessions.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
+        Ok(sessions
+            .into_iter()
+            .skip(offset)
+            .take(limit)
+            .map(|(id, _)| id)
+            .collect())
     }
 }
 
@@ -3145,6 +3537,15 @@ pub enum SearchCriteria {
         lat: f64,
         lon: f64,
         radius_meters: f64,
+        /// Optional cap on the number of matching ids returned, nearest-first
+        /// by geohash-decoded approximate distance (tie-break MemoryId).
+        /// Bounding happens INSIDE `search_by_location`, before any
+        /// hydration — capping post-hydration is too late, since hydration
+        /// (get + deserialize) is the expensive part. `None` preserves the
+        /// historical uncapped behavior (used by robotics `spatial_search`,
+        /// which already re-sorts/re-filters/truncates the fully hydrated
+        /// result itself).
+        limit: Option<usize>,
     },
     /// Filter by action type
     ByActionType(String),
@@ -3739,34 +4140,12 @@ impl MemoryStorage {
         Ok(())
     }
 
-    /// Load the fact extraction watermark for a user.
-    ///
-    /// Key: `_watermark:fact_extraction:{user_id}` → 8-byte little-endian i64 (unix millis)
-    /// Returns None if no watermark has been persisted yet.
-    pub fn get_fact_watermark(&self, user_id: &str) -> Option<i64> {
-        let key = format!("_watermark:fact_extraction:{user_id}");
-        match self.db.get(key.as_bytes()) {
-            Ok(Some(bytes)) if bytes.len() == 8 => {
-                Some(i64::from_le_bytes(bytes[..8].try_into().unwrap()))
-            }
-            _ => None,
-        }
-    }
-
-    /// Persist the fact extraction watermark for a user.
-    ///
-    /// Key: `_watermark:fact_extraction:{user_id}` → 8-byte little-endian i64 (unix millis)
-    pub fn set_fact_watermark(&self, user_id: &str, timestamp_millis: i64) {
-        let key = format!("_watermark:fact_extraction:{user_id}");
-        let mut write_opts = WriteOptions::default();
-        write_opts.set_sync(self.write_mode == WriteMode::Sync);
-        if let Err(e) = self
-            .db
-            .put_opt(key.as_bytes(), timestamp_millis.to_le_bytes(), &write_opts)
-        {
-            tracing::warn!("Failed to persist fact extraction watermark: {e}");
-        }
-    }
+    // NOTE on `_watermark:fact_extraction:{user_id}` keys: the incremental
+    // fact-extraction watermark was removed (it silently excluded every
+    // age-ineligible memory from consolidation forever — the zero-facts
+    // defect). Persisted keys may still exist in older stores; they are
+    // simply never read again. The `_watermark:` prefix stays reserved in
+    // the system-key lists (see `migration.rs`) so residue is skipped.
 
     /// Delete ALL interference records (GDPR forget_all)
     ///

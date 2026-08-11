@@ -261,6 +261,9 @@ pub struct MifTodo {
     pub related_memory_ids: Vec<Uuid>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub external_id: Option<String>,
+    /// Structured dependencies: todo UUIDs that must complete before this one
+    #[serde(default)]
+    pub blocked_by: Vec<Uuid>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

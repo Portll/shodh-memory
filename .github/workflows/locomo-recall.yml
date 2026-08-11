@@ -62,7 +62,7 @@ jobs:
       # SHA — short or full — fails the fetch. Checking out manually after a
       # full-depth fetch makes the documented "dispatch twice with the commit
       # before and after" A/B flow actually work for SHAs.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -103,7 +103,7 @@ jobs:
         run: cargo build --release --bin recall-eval
 
       - name: Cache embedder model (download from HF once, reuse across runs)
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.cache/shodh-memory/models
           key: shodh-models-minilm-c9745ed1
@@ -229,7 +229,6 @@ jobs:
           SHODH_GRAPH_RESERVE_K: ${{ github.event.inputs.graph_reserve_k }}
           SHODH_GRAPH_ACT_ADD: ${{ github.event.inputs.graph_act_add }}
           SHODH_GRAPH_W_FLOOR: ${{ github.event.inputs.graph_w_floor }}
-          SHODH_SPREAD_FIX: ${{ github.event.inputs.spread_fix }}
           SHODH_ACTR_NORM: ${{ github.event.inputs.actr_norm }}
           SHODH_GRAPH_RESERVE_FINAL: ${{ github.event.inputs.graph_reserve_final }}
           SHODH_GRAPH_EXPAND_K: ${{ github.event.inputs.graph_expand_k }}
@@ -312,7 +311,6 @@ jobs:
           SHODH_GRAPH_RESERVE_K: ${{ github.event.inputs.graph_reserve_k }}
           SHODH_GRAPH_ACT_ADD: ${{ github.event.inputs.graph_act_add }}
           SHODH_GRAPH_W_FLOOR: ${{ github.event.inputs.graph_w_floor }}
-          SHODH_SPREAD_FIX: ${{ github.event.inputs.spread_fix }}
           SHODH_ACTR_NORM: ${{ github.event.inputs.actr_norm }}
           SHODH_GRAPH_RESERVE_FINAL: ${{ github.event.inputs.graph_reserve_final }}
           SHODH_GRAPH_EXPAND_K: ${{ github.event.inputs.graph_expand_k }}
@@ -377,7 +375,7 @@ jobs:
 
       - name: Upload results
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: locomo-recall-report
           path: |

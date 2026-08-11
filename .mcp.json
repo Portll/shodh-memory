@@ -10,6 +10,10 @@
     "linear": {
       "command": "npx",
       "args": ["-y", "mcp-remote", "https://mcp.linear.app/mcp"]
+    },
+    "code-review-graph": {
+      "command": "python",
+      "args": ["-m", "code_review_graph", "mcp"]
     }
   }
 }

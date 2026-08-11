@@ -70,13 +70,17 @@ pub struct PerCaseRecord {
     pub relevant_total: usize,
     pub relevant_found: usize,
     pub missed: Vec<String>,
-    /// Recall computed over a wider cutoff of the SAME retrieved list, to split
-    /// ranking failures (gold present but ranked >10) from retrieval-reach
-    /// failures (gold absent from the candidate funnel). Only informative when
-    /// the harness queries with `max_results >= 50/100` (via `RECALL_DIAG_K`);
-    /// otherwise the list is shorter than the cutoff and these equal
-    /// `recall_at_k`. The gap `recall_at_100 - recall_at_k` is the upper bound
-    /// on what a perfect reranker over the top-100 pool could recover.
+    /// Recall computed over a SEPARATE `RECALL_DIAG_K`-deep retrieval, to split
+    /// ranking failures (gold present but ranked >10 at depth) from
+    /// retrieval-reach failures (gold absent from the candidate funnel
+    /// entirely). Only informative when `RECALL_DIAG_K >= 50/100` is set;
+    /// otherwise the deep list degrades to the production list (shorter than
+    /// the cutoff) and these equal `recall_at_k`. The deep list is a SECOND
+    /// query at `max_results = diag_k` — a deeper operating point (wider
+    /// vector pool, wider rerank budget) — so the headline fields above are
+    /// never perturbed by the diagnostic; see `run_one_pass`. The gap
+    /// `recall_at_100 - recall_at_k` approximates what a perfect reranker
+    /// over a 100-deep pool could recover.
     #[serde(default)]
     pub recall_at_50: f64,
     #[serde(default)]

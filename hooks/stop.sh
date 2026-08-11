@@ -3,8 +3,23 @@
 # Stores the interaction when Claude finishes responding
 
 SHODH_API_URL="${SHODH_API_URL:-http://127.0.0.1:3030}"
-SHODH_API_KEY="${SHODH_API_KEY:-sk-shodh-dev-local-testing-key}"
 SHODH_USER_ID="${SHODH_USER_ID:-claude-code}"
+
+# Resolve API key: env > shared key file persisted by the MCP server > legacy dev key.
+# (Shared file: <data-root>/.api-key, see mcp-server/api-key-store.ts.)
+if [ -z "$SHODH_API_KEY" ]; then
+    for KEY_FILE in \
+        ${SHODH_MEMORY_PATH:+"$SHODH_MEMORY_PATH/.api-key"} \
+        "${XDG_DATA_HOME:-$HOME/.local/share}/shodh-memory/.api-key" \
+        "$HOME/Library/Application Support/shodh-memory/.api-key" \
+        ${APPDATA:+"$APPDATA/shodh-memory/.api-key"}; do
+        if [ -f "$KEY_FILE" ]; then
+            SHODH_API_KEY=$(tr -d '[:space:]' < "$KEY_FILE")
+            if [ -n "$SHODH_API_KEY" ]; then break; fi
+        fi
+    done
+fi
+SHODH_API_KEY="${SHODH_API_KEY:-sk-shodh-dev-local-testing-key}"
 
 # Read hook input from stdin (JSON with stop_hook_active, etc.)
 INPUT=$(cat)

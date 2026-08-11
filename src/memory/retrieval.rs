@@ -1280,6 +1280,11 @@ impl RetrievalEngine {
             lat: geo_filter.lat,
             lon: geo_filter.lon,
             radius_meters: geo_filter.radius_meters,
+            // Uncapped: this function already fetches every in-radius memory,
+            // then does its own filter/sort/truncate below (API-compat
+            // requirement — RetrievalMode::Spatial's existing behavior must
+            // not change). Only Layer 0.45's prefetch (mod.rs) passes a limit.
+            limit: None,
         };
 
         let mut memories: Vec<SharedMemory> = self
@@ -1721,18 +1726,12 @@ impl TrackedRetrieval {
     }
 }
 
-/// Feedback record for a retrieval
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RetrievalFeedback {
-    /// Which retrieval this feedback is for
-    pub retrieval_id: String,
-    /// The outcome
-    pub outcome: RetrievalOutcome,
-    /// Optional task context (what was the user trying to do)
-    pub task_context: Option<String>,
-    /// When feedback was provided
-    pub feedback_at: chrono::DateTime<chrono::Utc>,
-}
+// `RetrievalFeedback` was removed. It was a serializable record of a retrieval
+// outcome that nothing constructed, nothing stored and nothing read — the
+// feedback loop it appeared to serve is `MemorySystem::reinforce_recall_tracked`
+// working from a `TrackedRetrieval` and a `RetrievalOutcome` directly. A public
+// type that looks like a persistence format but has no writer is a standing
+// invitation to build against a path that does not exist.
 
 impl RetrievalEngine {
     // ========================================================================
@@ -1742,122 +1741,28 @@ impl RetrievalEngine {
     /// Search with tracking for later feedback
     ///
     /// Use this when you want to provide feedback on retrieval quality.
-    /// Returns a TrackedRetrieval that can be used with `reinforce_recall`.
+    /// Returns a `TrackedRetrieval` to hand to
+    /// `MemorySystem::reinforce_recall_tracked`.
     pub fn search_tracked(&self, query: &Query, limit: usize) -> Result<TrackedRetrieval> {
         let memories = self.search(query, limit)?;
         Ok(TrackedRetrieval::new(memories, query))
     }
 
-    /// Reinforce memories based on task outcome (core feedback loop)
-    ///
-    /// This is THE key method that closes the Hebbian loop:
-    /// - If outcome is Helpful: strengthen associations, boost importance
-    /// - If outcome is Misleading: weaken associations, reduce importance
-    /// - If outcome is Neutral: just record access (mild reinforcement)
-    ///
-    /// Call this after a task completes to indicate which memories helped.
-    pub fn reinforce_recall(
-        &self,
-        memory_ids: &[MemoryId],
-        outcome: RetrievalOutcome,
-    ) -> Result<ReinforcementStats> {
-        if memory_ids.is_empty() {
-            return Ok(ReinforcementStats::default());
-        }
-
-        let mut stats = ReinforcementStats {
-            memories_processed: memory_ids.len(),
-            ..Default::default()
-        };
-
-        // Hebbian coactivation: count pair associations for non-misleading outcomes
-        if !matches!(outcome, RetrievalOutcome::Misleading) && memory_ids.len() >= 2 {
-            let n = memory_ids.len();
-            stats.associations_strengthened = n * (n - 1) / 2;
-        }
-
-        match outcome {
-            RetrievalOutcome::Helpful => {
-                // Boost importance of helpful memories and PERSIST to storage
-                for id in memory_ids {
-                    if let Ok(memory) = self.storage.get(id) {
-                        // Increment access and apply importance boost
-                        memory.record_access();
-                        memory.boost_importance(0.05); // +5% importance
-
-                        // PERSIST: Write updated memory back to durable storage
-                        if self.storage.update(&memory).is_ok() {
-                            stats.importance_boosts += 1;
-                        }
-                    }
-                }
-            }
-            RetrievalOutcome::Misleading => {
-                // Reduce importance of misleading memories and PERSIST to storage
-                for id in memory_ids {
-                    if let Ok(memory) = self.storage.get(id) {
-                        memory.record_access();
-                        memory.decay_importance(0.10); // -10% importance
-
-                        // PERSIST: Write updated memory back to durable storage
-                        if self.storage.update(&memory).is_ok() {
-                            stats.importance_decays += 1;
-                        }
-                    }
-                }
-                // Don't strengthen associations for misleading memories
-            }
-            RetrievalOutcome::Neutral => {
-                // Just record access, mild reinforcement - PERSIST to storage
-                for id in memory_ids {
-                    if let Ok(memory) = self.storage.get(id) {
-                        memory.record_access();
-
-                        // PERSIST: Write access update to storage
-                        if let Err(e) = self.storage.update(&memory) {
-                            tracing::warn!(
-                                "Failed to persist access update for memory {}: {}",
-                                id.0,
-                                e
-                            );
-                        }
-                    }
-                }
-                // Association strengthening for neutral outcomes is counted above (pair counting)
-            }
-        }
-
-        stats.outcome = outcome;
-        Ok(stats)
-    }
-
-    /// Reinforce using a tracked retrieval (convenience wrapper)
-    pub fn reinforce_tracked(
-        &self,
-        tracked: &TrackedRetrieval,
-        outcome: RetrievalOutcome,
-    ) -> Result<ReinforcementStats> {
-        let ids = tracked.memory_ids();
-        self.reinforce_recall(&ids, outcome)
-    }
-
-    /// Batch reinforce multiple retrievals (for async feedback processing)
-    pub fn reinforce_batch(
-        &self,
-        feedbacks: &[RetrievalFeedback],
-        retrieval_memories: &HashMap<String, Vec<MemoryId>>,
-    ) -> Result<Vec<ReinforcementStats>> {
-        let mut results = Vec::with_capacity(feedbacks.len());
-
-        for feedback in feedbacks {
-            if let Some(memory_ids) = retrieval_memories.get(&feedback.retrieval_id) {
-                let stats = self.reinforce_recall(memory_ids, feedback.outcome)?;
-                results.push(stats);
-            }
-        }
-
-        Ok(results)
-    }
+    // Reinforcement lives on `MemorySystem`, not here.
+    //
+    // `RetrievalEngine::reinforce_recall` / `reinforce_tracked` /
+    // `reinforce_batch` were a second implementation of the feedback loop that
+    // applied no feedback momentum, no graph coactivation, no entity-edge
+    // Hebbian updates and no prediction-error weighting, used flat 0.05/0.10
+    // importance deltas instead of the calibrated constants, and wrote through
+    // `self.storage` directly — bypassing the working/session caches, so a
+    // reinforcement could be silently overwritten by a later writeback of a
+    // stale cached `Arc`.
+    //
+    // They were deleted rather than left in place: nothing in-tree called them
+    // once `MemorySystem::reinforce_recall_tracked` was unified, and a `pub`
+    // method that silently does two thirds of the job is a footgun regardless.
+    // Use `MemorySystem::reinforce_recall` or `reinforce_recall_tracked`.
 }
 
 /// Statistics from a reinforcement operation

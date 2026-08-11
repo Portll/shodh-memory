@@ -6,7 +6,7 @@
 
 use anyhow::{Context, Result};
 use dashmap::DashMap;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, OnceLock};
 use tracing::info;
 
@@ -406,6 +406,29 @@ fn allcaps_regex() -> &'static regex::Regex {
 fn issue_regex() -> &'static regex::Regex {
     static RE: OnceLock<regex::Regex> = OnceLock::new();
     RE.get_or_init(|| regex::Regex::new(r"\b([A-Z]{2,10}-\d+)\b").unwrap())
+}
+
+/// The set of entity surfaces the NER phase has already typed, folded for
+/// case-insensitive comparison.
+///
+/// The tag phase consults this to avoid building a second, keyword-typed node
+/// for a surface GLiNER already classified. See the call site in
+/// `process_experience_into_graph` for why the twin was destructive.
+fn ner_claimed_surfaces(ner_entities: &[(String, EntityNode)]) -> HashSet<String> {
+    ner_entities
+        .iter()
+        .map(|(name, _)| name.trim().to_lowercase())
+        .collect()
+}
+
+/// Whether the tag phase should skip this surface because NER already typed it.
+///
+/// Comparison is trimmed and case-insensitive: the tag twin is written from the
+/// same merged vector as the entity, but callers and extractors normalise
+/// casing inconsistently, and a twin that slips through on a casing difference
+/// reintroduces the exact defect this guard exists to prevent.
+fn tag_surface_claimed_by_ner(tag: &str, ner_claimed: &HashSet<String>) -> bool {
+    ner_claimed.contains(&tag.trim().to_lowercase())
 }
 
 /// Classify a tag into a specific EntityLabel based on naming patterns.
@@ -929,9 +952,6 @@ impl MultiUserMemoryManager {
         info!("Prospective memory store initialized");
 
         let todo_store = Arc::new(TodoStore::new(shared_db.clone(), &base_path)?);
-        if let Err(e) = todo_store.load_vector_indices() {
-            tracing::warn!("Failed to load todo vector indices: {}, semantic todo search will rebuild on first use", e);
-        }
         info!("Todo store initialized");
 
         let file_store = Arc::new(FileMemoryStore::new(shared_db.clone(), &base_path)?);
@@ -1617,6 +1637,19 @@ impl MultiUserMemoryManager {
             .iter()
             .map(|(id, _)| id.to_string())
             .collect()
+    }
+
+    /// Cache-only single-user lookup: `Some` iff the user's MemorySystem is
+    /// currently loaded; NEVER creates or reopens a store on miss (unlike
+    /// `get_user_memory`, which materializes a user dir plus a full
+    /// MemorySystem with retry sleeps). The trace-capture middleware depends
+    /// on this being side-effect-free (audit amendment 11): capture must
+    /// observe, never construct.
+    pub fn cached_user_memory(
+        &self,
+        user_id: &str,
+    ) -> Option<Arc<parking_lot::RwLock<MemorySystem>>> {
+        self.user_memories.get(user_id)
     }
 
     /// Snapshot cached user memories without creating/opening cold users.
@@ -2575,6 +2608,68 @@ impl MultiUserMemoryManager {
         backed_up
     }
 
+    /// Rebuild a memory's graph episode from scratch, for the case where the
+    /// memory's ENTITY SET changed but its episode already exists.
+    ///
+    /// [`Self::process_experience_into_graph`] is idempotent by design: if an
+    /// episode already exists for this memory id it returns early, which stops
+    /// an MCP retry from inflating `mention_count` and birthing duplicate
+    /// edges. That guard is correct for a replay and wrong for a genuine
+    /// change, so a changed memory has to demolish its episode first. Two
+    /// callers need exactly that:
+    ///
+    /// - `upsert`, when it rewrites an existing memory's content, and
+    /// - `remember`, when a content-identical duplicate merged in entities the
+    ///   stored copy did not have.
+    ///
+    /// They used to be one inline block and one missing block respectively —
+    /// the merge case simply never reached the graph, so an enriched entity set
+    /// sat in RocksDB and BM25 while traversal still saw the old one.
+    ///
+    /// The alternative — teaching the idempotency guard to admit only the
+    /// entity delta — was rejected. The edge-construction pass downstream of it
+    /// is several hundred lines of policy (PMI gating, hub caps, fragment
+    /// masks, predicate typing, reward modulation, surprise accounting) and a
+    /// second entry point into it would be a second copy of that policy waiting
+    /// to diverge. Demolish-and-rebuild reuses it verbatim.
+    ///
+    /// `delete_episode` is not as destructive as it looks: it scrubs this
+    /// episode from every edge's attestation trail and deletes only edges left
+    /// with NO remaining attestation, so edges corroborated by other episodes
+    /// keep their accumulated Hebbian weight. What is lost is the strengthening
+    /// this one episode accrued on edges only it attested — which, for an
+    /// episode being rebuilt because its entity set was wrong, is not a loss
+    /// worth protecting.
+    ///
+    /// It does cost a full scan of the relationships column family, so it is
+    /// gated on there being an actual delta at both call sites. A duplicate
+    /// that adds nothing never gets here.
+    pub fn rebuild_experience_graph(
+        &self,
+        user_id: &str,
+        experience: &Experience,
+        memory_id: &MemoryId,
+        entity_name_embeddings: Option<&HashMap<String, Vec<f32>>>,
+    ) -> Result<Option<crate::memory::types::SurpriseComponents>> {
+        if let Ok(graph) = self.get_user_graph(user_id) {
+            let graph_guard = graph.read();
+            match graph_guard.delete_episode(&memory_id.0) {
+                Ok(true) => tracing::debug!(
+                    "Cleaned up old episode {} before graph rebuild",
+                    &memory_id.0.to_string()[..8]
+                ),
+                Ok(false) => {} // No prior episode existed
+                Err(e) => tracing::debug!(
+                    "Old episode cleanup failed for {} (non-fatal): {}",
+                    &memory_id.0.to_string()[..8],
+                    e
+                ),
+            }
+        }
+
+        self.process_experience_into_graph(user_id, experience, memory_id, entity_name_embeddings)
+    }
+
     /// Process an experience and extract entities/relationships into the graph
     ///
     /// SHO-102: Improved graph building with:
@@ -2975,10 +3070,34 @@ impl MultiUserMemoryManager {
                     is_proper_noun: !matches!(ner_entity.entity_type, NerEntityType::Misc),
                     selectivity: None,
                     fine_type,
+                    kb_id: None,
                 };
                 (ner_entity.text, node)
             })
             .collect();
+
+        // Surfaces the NER phase already typed. The tag phase must not build a
+        // second node for any of them.
+        //
+        // `remember` writes the merged entity list into BOTH `experience.entities`
+        // and `experience.tags` (handlers/remember.rs), so every NER entity has a
+        // same-named tag twin. The twin is typed by `classify_tag_label`, a
+        // keyword matcher that recognises infrastructure names and otherwise
+        // falls through to a default — and because `add_entity` dedups by name
+        // and puts the LAST-written label first in the merged `labels` vec, the
+        // twin's default label is the one `GET /api/graph/data/{user_id}` renders
+        // (`visualization.rs` reads `labels.first()`).
+        //
+        // The net effect was that GLiNER's 141-way fine typing was discarded at
+        // display time by a keyword matcher, so a correctly-typed graph rendered
+        // as one flat class. This is precisely what graph_memory.rs's own comment
+        // ("GLiNER typing must never degrade a schema-recognized coarse class")
+        // exists to prevent; the tag twin routed around it entirely.
+        //
+        // Skipping claimed surfaces also removes the twin's second effect: the
+        // tag path applies none of the NER phase's entity filters, so fragment
+        // surfaces rejected as entities re-entered the graph as tags.
+        let ner_claimed = ner_claimed_surfaces(&ner_entities);
 
         // Build tag entity nodes
         let tag_entities: Vec<(String, EntityNode)> = experience
@@ -2986,7 +3105,8 @@ impl MultiUserMemoryManager {
             .iter()
             .filter_map(|tag| {
                 let tag_name = tag.trim();
-                if tag_name.len() >= 2
+                if !tag_surface_claimed_by_ner(tag_name, &ner_claimed)
+                    && tag_name.len() >= 2
                     && !blocklist.contains(tag_name.to_lowercase().as_str())
                     && !tag_name.starts_with("tool:")
                     && !tag_name.starts_with("source:")
@@ -3015,6 +3135,7 @@ impl MultiUserMemoryManager {
                             is_proper_noun: false,
                             selectivity: None,
                             fine_type: None,
+                            kb_id: None,
                         },
                     ))
                 } else {
@@ -3087,6 +3208,7 @@ impl MultiUserMemoryManager {
                         is_proper_noun: true,
                         selectivity: None,
                         fine_type: None,
+                        kb_id: None,
                     },
                 ))
             })
@@ -3122,6 +3244,7 @@ impl MultiUserMemoryManager {
                         is_proper_noun: true,
                         selectivity: None,
                         fine_type: None,
+                        kb_id: None,
                     },
                 ))
             })
@@ -3168,6 +3291,7 @@ impl MultiUserMemoryManager {
                             is_proper_noun: false,
                             selectivity: None,
                             fine_type: None,
+                            kb_id: None,
                         },
                     ))
                 })
@@ -3782,6 +3906,7 @@ impl MultiUserMemoryManager {
                         evidence_span,
                         typed_by,
                     }],
+                    promoted_at: None,
                 };
 
                 if let Err(e) = graph_guard.add_relationship(edge) {
@@ -4165,10 +4290,86 @@ mod tests {
         assert_eq!(classify_tag_label("utils-lib"), EntityLabel::Module);
     }
 
+    /// Build a minimal NER-phase entity for the twin-suppression tests.
+    fn ner_phase_entity(name: &str, label: EntityLabel) -> (String, EntityNode) {
+        let now = chrono::Utc::now();
+        (
+            name.to_string(),
+            EntityNode {
+                uuid: uuid::Uuid::new_v4(),
+                name: name.to_string(),
+                labels: vec![label],
+                created_at: now,
+                last_seen_at: now,
+                mention_count: 1,
+                summary: String::new(),
+                attributes: HashMap::new(),
+                name_embedding: None,
+                salience: 0.5,
+                is_proper_noun: true,
+                selectivity: None,
+                fine_type: None,
+                kb_id: None,
+            },
+        )
+    }
+
+    #[test]
+    fn ner_typed_surfaces_are_never_retyped_by_the_tag_phase() {
+        // THE INVARIANT. `remember` writes the merged entity list into both
+        // `experience.entities` and `experience.tags`, so every NER entity
+        // arrives at the tag phase as a same-named twin. Typing that twin with
+        // the keyword matcher discarded GLiNER's classification at display
+        // time, because `add_entity` puts the last-written label first and the
+        // graph payload renders `labels.first()`.
+        let ner = vec![
+            ner_phase_entity("Baltimore", EntityLabel::Location),
+            ner_phase_entity("Varun Sharma", EntityLabel::Person),
+        ];
+        let claimed = ner_claimed_surfaces(&ner);
+
+        for surface in ["Baltimore", "baltimore", "  BALTIMORE  ", "Varun Sharma"] {
+            assert!(
+                tag_surface_claimed_by_ner(surface, &claimed),
+                "{surface:?} was typed by NER and must not get a tag twin"
+            );
+        }
+    }
+
+    #[test]
+    fn tags_that_ner_did_not_claim_still_become_entities() {
+        // The guard must suppress twins only. A genuine tag — a user label or a
+        // YAKE keyphrase that is not an NER entity — is still the tag phase's
+        // job, and silently dropping those would trade one defect for another.
+        let ner = vec![ner_phase_entity("Baltimore", EntityLabel::Location)];
+        let claimed = ner_claimed_surfaces(&ner);
+
+        for surface in ["kubernetes", "q3-roadmap", "Baltimore Harbor"] {
+            assert!(
+                !tag_surface_claimed_by_ner(surface, &claimed),
+                "{surface:?} is not an NER entity and must still be admitted"
+            );
+        }
+    }
+
     #[test]
     fn test_classify_tag_label_fallback() {
-        assert_eq!(classify_tag_label("react"), EntityLabel::Technology);
-        assert_eq!(classify_tag_label("rust"), EntityLabel::Technology);
+        // CHANGED: these now resolve to `Concept`, not `Technology`.
+        //
+        // Both ARE technologies — but `classify_tag_label` does not know that.
+        // Neither appears in any of its rules (the "rust"/"react" strings in
+        // graph_memory.rs live in the EntityExtractor's separate lexicon, not
+        // in this matcher), so they reach the fallthrough exactly like an
+        // unrecognised word does. The old default asserted `Technology` for
+        // everything that fell through, which is why an entire graph rendered
+        // as one class regardless of what it contained.
+        //
+        // Naming them `Concept` is the honest answer for a matcher that did not
+        // recognise them. Restoring `Technology` for genuine technology tags is
+        // a lexicon problem — it needs a real technology vocabulary wired into
+        // this function, not a default that guesses.
+        assert_eq!(classify_tag_label("react"), EntityLabel::Concept);
+        assert_eq!(classify_tag_label("rust"), EntityLabel::Concept);
     }
 
     #[test]

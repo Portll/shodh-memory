@@ -622,17 +622,15 @@ fn test_activation_across_tier_cycle() {
 
     memory.set_activation(0.7);
 
-    // Full promotion cycle: Working -> Session -> LongTerm -> Archive
+    // Full promotion ladder: Working -> Session -> LongTerm (terminal).
+    // Extra promotions are no-ops; `demote()` no longer exists (tier is
+    // monotonic — see MemoryTier).
     memory.promote();
     memory.promote();
     memory.promote();
+    assert_eq!(memory.tier, MemoryTier::LongTerm);
 
-    // Full demotion cycle: Archive -> LongTerm -> Session -> Working
-    memory.demote();
-    memory.demote();
-    memory.demote();
-
-    // Activation should be preserved through the entire cycle
+    // Activation is metadata and must survive every tier transition untouched.
     assert!((memory.activation() - 0.7).abs() < f32::EPSILON);
 }
 

@@ -62,6 +62,9 @@ pub enum AppError {
     UserNotFound(String),
     TodoNotFound(String),
     ProjectNotFound(String),
+    /// A backup id that is not among the user's backups. Distinct from a
+    /// storage fault: the caller recovers by listing backups and picking one.
+    BackupNotFound(u32),
 
     // Conflict Errors (409)
     MemoryAlreadyExists(String),
@@ -121,6 +124,7 @@ impl AppError {
             Self::UserNotFound(_) => "USER_NOT_FOUND",
             Self::TodoNotFound(_) => "TODO_NOT_FOUND",
             Self::ProjectNotFound(_) => "PROJECT_NOT_FOUND",
+            Self::BackupNotFound(_) => "BACKUP_NOT_FOUND",
             Self::MemoryAlreadyExists(_) => "MEMORY_ALREADY_EXISTS",
             Self::StorageError(_) => "STORAGE_ERROR",
             Self::DatabaseError(_) => "DATABASE_ERROR",
@@ -149,7 +153,8 @@ impl AppError {
             | Self::EntityNotFound(_)
             | Self::UserNotFound(_)
             | Self::TodoNotFound(_)
-            | Self::ProjectNotFound(_) => StatusCode::NOT_FOUND,
+            | Self::ProjectNotFound(_)
+            | Self::BackupNotFound(_) => StatusCode::NOT_FOUND,
 
             Self::MemoryAlreadyExists(_) => StatusCode::CONFLICT,
 
@@ -192,6 +197,7 @@ impl AppError {
             Self::UserNotFound(id) => format!("User not found: {id}"),
             Self::TodoNotFound(id) => format!("Todo not found: {id}"),
             Self::ProjectNotFound(id) => format!("Project not found: {id}"),
+            Self::BackupNotFound(id) => format!("Backup not found: {id}"),
             Self::MemoryAlreadyExists(id) => format!("Memory already exists: {id}"),
             Self::StorageError(msg) => format!("Storage error: {msg}"),
             Self::DatabaseError(msg) => format!("Database error: {msg}"),

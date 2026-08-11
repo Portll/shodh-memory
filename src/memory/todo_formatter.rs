@@ -163,9 +163,26 @@ pub fn format_todo_list_with_total(
 
     let mut output = header;
 
-    // Separate parent todos and subtasks
-    let parent_todos: Vec<_> = todos.iter().filter(|t| t.parent_id.is_none()).collect();
-    let subtasks: Vec<_> = todos.iter().filter(|t| t.parent_id.is_some()).collect();
+    // Top-level rows: todos without a parent, PLUS subtasks whose parent is
+    // not part of this list (e.g. the subtasks view, or a filtered list that
+    // matched only the child). A subtask must never be dropped just because
+    // its parent didn't make the list.
+    let ids_in_list: std::collections::HashSet<_> = todos.iter().map(|t| &t.id).collect();
+    let parent_todos: Vec<_> = todos
+        .iter()
+        .filter(|t| match &t.parent_id {
+            None => true,
+            Some(pid) => !ids_in_list.contains(pid),
+        })
+        .collect();
+    let subtasks: Vec<_> = todos
+        .iter()
+        .filter(|t| {
+            t.parent_id
+                .as_ref()
+                .is_some_and(|pid| ids_in_list.contains(pid))
+        })
+        .collect();
 
     // Group by status in workflow order
     let status_order = [
@@ -350,6 +367,57 @@ pub fn format_todo_updated(todo: &Todo, project_name: Option<&str>) -> String {
 /// Format todo deleted confirmation
 pub fn format_todo_deleted(todo_id: &str) -> String {
     format!("✓ Deleted {}", todo_id)
+}
+
+/// Icon for a comment type
+fn comment_type_icon(comment_type: &super::types::TodoCommentType) -> &'static str {
+    use super::types::TodoCommentType;
+    match comment_type {
+        TodoCommentType::Comment => "💬",
+        TodoCommentType::Progress => "📊",
+        TodoCommentType::Resolution => "✅",
+        TodoCommentType::Activity => "🔄",
+    }
+}
+
+/// Format the comment list for a todo. Every comment line carries its id —
+/// update/delete operations require the comment id, and this rendering is the
+/// only place a client that reads formatted output can discover it.
+pub fn format_comment_list(todo_short_id: &str, comments: &[super::types::TodoComment]) -> String {
+    if comments.is_empty() {
+        return format!("No comments on {}", todo_short_id);
+    }
+
+    let mut output = format!(
+        "📝 Comments on {} ({} total)\n\n",
+        todo_short_id,
+        comments.len()
+    );
+    for (i, comment) in comments.iter().enumerate() {
+        output.push_str(&format!(
+            "{}. {} {} ({}) [id: {}]\n   {}\n\n",
+            i + 1,
+            comment_type_icon(&comment.comment_type),
+            comment.author,
+            comment.created_at.format("%Y-%m-%d %H:%M"),
+            comment.id.0,
+            comment.content
+        ));
+    }
+    output
+}
+
+/// Format the confirmation for a newly added comment, including its id so the
+/// caller can immediately update or delete it.
+pub fn format_comment_added(todo_short_id: &str, comment: &super::types::TodoComment) -> String {
+    format!(
+        "✓ Added comment to {} [id: {}]\n\n  {} ({}):\n  {}",
+        todo_short_id,
+        comment.id.0,
+        comment.author,
+        comment.created_at.format("%Y-%m-%d %H:%M"),
+        comment.content
+    )
 }
 
 /// Format project list with sub-project hierarchy
@@ -640,5 +708,65 @@ mod tests {
         let future = now + Duration::days(3);
         let text = format_due_date(&future);
         assert!(text.contains("Due"));
+    }
+
+    /// Regression: a list consisting only of subtasks (the subtasks view, or a
+    /// filtered list that matched a child but not its parent) must render the
+    /// rows, not just the header. Subtasks were previously dropped whenever
+    /// their parent was absent from the list.
+    #[test]
+    fn test_orphan_subtasks_render_as_rows() {
+        let parent_elsewhere = super::super::types::TodoId::new();
+        let mut child = Todo::new("u".to_string(), "The child task".to_string());
+        child.parent_id = Some(parent_elsewhere);
+
+        let out = format_todo_list(&[child], &[]);
+        assert!(
+            out.contains("The child task"),
+            "subtask with absent parent must still render: {out}"
+        );
+    }
+
+    #[test]
+    fn test_subtasks_nest_under_present_parent() {
+        let mut parent = Todo::new("u".to_string(), "Parent task".to_string());
+        parent.status = TodoStatus::Todo;
+        let mut child = Todo::new("u".to_string(), "Child task".to_string());
+        child.parent_id = Some(parent.id.clone());
+        child.status = TodoStatus::Todo;
+
+        let out = format_todo_list(&[parent, child], &[]);
+        assert!(out.contains("Parent task"));
+        assert!(out.contains("Child task"));
+        // Child appears after parent (nested rendering)
+        let p_pos = out.find("Parent task").unwrap();
+        let c_pos = out.find("Child task").unwrap();
+        assert!(c_pos > p_pos, "child renders under its parent");
+    }
+
+    /// Comment ids must be discoverable from the rendered list — update and
+    /// delete both require the id, and this rendering is the only place a
+    /// formatted-output client can obtain it.
+    #[test]
+    fn test_comment_list_and_confirmation_include_ids() {
+        use super::super::types::{TodoComment, TodoId};
+
+        let todo_id = TodoId::new();
+        let comment = TodoComment::new(todo_id, "varun".to_string(), "First note".to_string());
+
+        let listed = format_comment_list("SHO-8", std::slice::from_ref(&comment));
+        assert!(
+            listed.contains(&comment.id.0.to_string()),
+            "comment id must appear in the list rendering: {listed}"
+        );
+        assert!(listed.contains("First note"));
+
+        let added = format_comment_added("SHO-8", &comment);
+        assert!(
+            added.contains(&comment.id.0.to_string()),
+            "comment id must appear in the add confirmation: {added}"
+        );
+
+        assert_eq!(format_comment_list("SHO-8", &[]), "No comments on SHO-8");
     }
 }

@@ -255,10 +255,13 @@ RUST_LOG=info
 SHODH_GLINER_MODEL_PATH=./models/gliner-bi-edge  # asset dir; default: conventional dirs, else first-run download cache
 SHODH_GLINER_THRESHOLD=0.3                        # span keep threshold (default 0.3)
 
-# Domain knowledge-base entity linking (gated, default OFF)
-SHODH_KB_LINKING=1            # enable KB alias linking (default off)
-SHODH_KB_PATH=./kb.jsonl      # domain KB JSONL asset (unset = no KB loaded)
-SHODH_KB_LINK_MIN=0.75        # minimum link score (default 0.75)
+# Offline KB entity linking.
+# Stamping EntityNode.kb_id with a Wikidata QID is ALWAYS ON and needs no
+# configuration: the slice is vendored (src/kb/wikidata-slice.tsv) and no
+# network call is ever made. Only the graph-MERGING half is gated.
+SHODH_KB_LINKING=1            # also seed surface->canonical aliases (default off)
+SHODH_KB_PATH=./my-kb.tsv     # replace the vendored slice with your own TSV
+                              # (same 5 columns) for a sovereign/curated KB
 
 # Learnable / graph tuning
 SHODH_CONTRASTIVE_ADAPTER=1   # contrastive entity-embedding adapter (gated, default off)

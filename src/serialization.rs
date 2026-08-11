@@ -158,42 +158,62 @@ pub fn try_decode_compat<T: DeserializeOwned>(
     default_suffix: &[u8],
 ) -> Result<(T, bool)> {
     if has_format_tag(data) {
-        let payload = &data[FORMAT_TAG_LEN..];
-        match postcard::from_bytes::<T>(payload) {
-            Ok(val) => return Ok((val, false)),
-            Err(postcard::Error::DeserializeUnexpectedEnd) if !default_suffix.is_empty() => {
-                // Older record missing one or more trailing fields. A record can be
-                // short by SEVERAL fields (each schema revision adds one), so supply
-                // the field defaults ONE AT A TIME and retry until it decodes or the
-                // defaults run out — appending all of them at once would trip
-                // postcard's trailing-bytes check for a record missing only some.
-                // needs_migration = true so the caller rewrites it in current schema.
-                let mut extended = Vec::with_capacity(payload.len() + default_suffix.len());
-                extended.extend_from_slice(payload);
-                for &b in default_suffix {
-                    extended.push(b);
-                    match postcard::from_bytes::<T>(&extended) {
-                        Ok(val) => return Ok((val, true)),
-                        Err(postcard::Error::DeserializeUnexpectedEnd) => continue,
-                        Err(e) => {
-                            return Err(anyhow::anyhow!("postcard decode (compat retry): {e}"))
-                        }
-                    }
-                }
-                return Err(anyhow::anyhow!(
-                    "postcard decode (compat): record still truncated after appending \
-                     {} default field(s)",
-                    default_suffix.len()
-                ));
-            }
-            Err(e) => return Err(anyhow::anyhow!("postcard decode (tagged): {e}")),
-        }
+        return decode_raw_compat(&data[FORMAT_TAG_LEN..], default_suffix);
     }
 
     // Legacy: bincode 2.x with safe allocation limit.
     let (val, _): (T, _) = bincode::serde::decode_from_slice(data, crate::bincode_safe_config())
         .map_err(|e| anyhow::anyhow!("bincode decode (legacy): {e}"))?;
     Ok((val, true))
+}
+
+/// Decode a RAW postcard payload (no format tag), tolerating older records that
+/// were serialized with FEWER trailing fields than `T` currently has.
+///
+/// The tolerance mechanism [`try_decode_compat`] documents, factored out for
+/// callers whose payload has already been unwrapped from an envelope that
+/// provided format discrimination — SHO v2 records, where `unwrap_sho` has
+/// verified the magic, version byte and CRC32 before handing over the payload.
+///
+/// `default_suffix` is the postcard encoding of the default values for the
+/// field(s) added since the older records were written, in declaration order.
+/// Returns `(value, defaults_applied)`; `defaults_applied = true` means the
+/// record predates a field and would benefit from being rewritten.
+///
+/// IMPORTANT: this only works for fields appended at the END of the encoded
+/// value. Postcard is positional, so a field added anywhere else shifts every
+/// subsequent field and can decode to plausible-looking garbage rather than
+/// failing — no suffix can repair that.
+pub fn decode_raw_compat<T: DeserializeOwned>(
+    payload: &[u8],
+    default_suffix: &[u8],
+) -> Result<(T, bool)> {
+    match postcard::from_bytes::<T>(payload) {
+        Ok(val) => Ok((val, false)),
+        Err(postcard::Error::DeserializeUnexpectedEnd) if !default_suffix.is_empty() => {
+            // Older record missing one or more trailing fields. A record can be
+            // short by SEVERAL fields (each schema revision adds one), so supply
+            // the field defaults ONE AT A TIME and retry until it decodes or the
+            // defaults run out — appending all of them at once would trip
+            // postcard's trailing-bytes check for a record missing only some.
+            let mut extended = Vec::with_capacity(payload.len() + default_suffix.len());
+            extended.extend_from_slice(payload);
+            for &b in default_suffix {
+                extended.push(b);
+                match postcard::from_bytes::<T>(&extended) {
+                    Ok(val) => return Ok((val, true)),
+                    Err(postcard::Error::DeserializeUnexpectedEnd) => continue,
+                    Err(e) => return Err(anyhow::anyhow!("postcard decode (compat retry): {e}")),
+                }
+            }
+            Err(anyhow::anyhow!(
+                "postcard decode (compat): record still truncated after appending \
+                 {} default field(s)",
+                default_suffix.len()
+            ))
+        }
+        Err(e) => Err(anyhow::anyhow!("postcard decode (tagged): {e}")),
+    }
 }
 
 /// Check if data starts with the postcard format tag.

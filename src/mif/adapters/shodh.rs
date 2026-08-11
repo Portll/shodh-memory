@@ -242,6 +242,7 @@ fn convert_v1_todo(t: &serde_json::Value) -> Option<MifTodo> {
         comments: Vec::new(),
         related_memory_ids: Vec::new(),
         external_id: None,
+        blocked_by: Vec::new(),
     })
 }
 

@@ -9,7 +9,12 @@
 //!
 //! Degradation: when the GLiNER model assets are absent, extraction falls back
 //! to the rule-based [`EntityExtractor`] keyword matcher (logged once at init).
-//! The fallback yields coarse 4-class types only (no fine label).
+//! The fallback yields coarse 4-class types only (no fine label). The same
+//! degradation fires — with an ERROR, once — if GLiNER loads but then fails at
+//! inference time; see [`NeuralNer::is_fallback_mode`]. Extraction must never
+//! answer a runtime failure with an empty entity list, because an empty list is
+//! also the correct answer for text that names nothing, and nothing downstream
+//! can tell the two apart.
 //!
 //! The legacy bert-tiny 4-class BIO tagger (`extract_neural`) and its MISC→regex
 //! typer (`classify_misc_entity`) have been removed — GLiNER is the sole neural
@@ -23,6 +28,7 @@
 use anyhow::Result;
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 
 use crate::embeddings::gliner::GlinerTyper;
@@ -142,6 +148,16 @@ pub struct NeuralNer {
     gliner: GlinerTyper,
     /// True when GLiNER assets are absent — extraction degrades to rule-based.
     use_fallback: bool,
+    /// Set the first time a GLiNER inference FAILS at runtime.
+    ///
+    /// Availability is decided at construction from files on disk, but the model
+    /// is not loaded until the first inference, and inference can fail long after
+    /// that (a bad ONNX Runtime dylib, a corrupt graph, a session-lock timeout).
+    /// Without this flag such a failure is terminal-but-silent: the typer keeps
+    /// reporting itself available, every `extract` returns an empty vector, and
+    /// the rule-based fallback that exists for exactly this situation never runs.
+    /// Once set, extraction degrades to the fallback for the rest of the process.
+    gliner_runtime_failed: AtomicBool,
     /// Lazy-loaded EntityExtractor for comprehensive rule-based fallback.
     entity_extractor: OnceLock<crate::graph_memory::EntityExtractor>,
     /// Minimum confidence for fallback-path entities.
@@ -278,6 +294,7 @@ impl NeuralNer {
         Ok(Self {
             gliner,
             use_fallback,
+            gliner_runtime_failed: AtomicBool::new(false),
             entity_extractor: OnceLock::new(),
             fallback_confidence_threshold: config.confidence_threshold,
             entity_cache: build_entity_cache(),
@@ -289,15 +306,21 @@ impl NeuralNer {
         Self {
             gliner: GlinerTyper::from_env(),
             use_fallback: true,
+            gliner_runtime_failed: AtomicBool::new(false),
             entity_extractor: OnceLock::new(),
             fallback_confidence_threshold: config.confidence_threshold,
             entity_cache: build_entity_cache(),
         }
     }
 
-    /// Check if using rule-based fallback mode (GLiNER assets absent or forced).
+    /// Check if extraction is running on the rule-based fallback — because the
+    /// GLiNER assets were absent or forced off at construction, OR because the
+    /// model failed at runtime and extraction was degraded to keep entities
+    /// flowing. Callers that report which NER backend is live (the recall
+    /// harness, the smoke gate) must see the degraded state, not the state the
+    /// process started in.
     pub fn is_fallback_mode(&self) -> bool {
-        self.use_fallback
+        self.use_fallback || self.gliner_runtime_failed.load(Ordering::Relaxed)
     }
 
     /// Compute cache key from text (FNV-1a-style hash for speed).
@@ -325,10 +348,27 @@ impl NeuralNer {
             return Ok(cached);
         }
 
-        let entities = if self.use_fallback {
+        let entities = if self.is_fallback_mode() {
             self.extract_fallback(text)?
         } else {
-            self.extract_gliner(text)
+            match self.extract_gliner(text) {
+                Ok(entities) => entities,
+                Err(e) => {
+                    // A runtime failure here used to become an empty vector and
+                    // nothing else, which reads downstream as "this text names
+                    // nobody" — for every memory, forever. Say it once, loudly,
+                    // and fall back so ingest keeps producing entities.
+                    if !self.gliner_runtime_failed.swap(true, Ordering::Relaxed) {
+                        tracing::error!(
+                            "GLiNER bi-edge FAILED AT RUNTIME after loading successfully: {e}. \
+                             NER is degrading to the rule-based fallback for the remainder of \
+                             this process — coarse 4-class types only, no fine labels. Entity \
+                             typing quality is reduced; investigate the ONNX runtime/model."
+                        );
+                    }
+                    self.extract_fallback(text)?
+                }
+            }
         };
 
         self.entity_cache.insert(cache_key, entities.clone());
@@ -352,8 +392,13 @@ impl NeuralNer {
     /// GLiNER performs flat, non-overlapping span selection internally, so each
     /// surface already carries its single top-scoring fine label — that is the
     /// label that lands on the graph node.
-    fn extract_gliner(&self, text: &str) -> Vec<NerEntity> {
-        let spans = self.gliner.extract(text);
+    ///
+    /// Uses the fallible [`GlinerTyper::try_extract`] rather than the
+    /// best-effort `extract`: an inference failure must reach the caller so it
+    /// can degrade to the rule-based path, instead of masquerading as a text
+    /// that happens to contain no entities.
+    fn extract_gliner(&self, text: &str) -> Result<Vec<NerEntity>> {
+        let spans = self.gliner.try_extract(text)?;
         let entities: Vec<NerEntity> = spans
             .into_iter()
             .filter_map(|span| {
@@ -371,7 +416,7 @@ impl NeuralNer {
             })
             .collect();
         // GLiNER already yields non-overlapping spans; dedup guards identical surfaces.
-        self.deduplicate_entities(entities)
+        Ok(self.deduplicate_entities(entities))
     }
 
     /// Get cache statistics.

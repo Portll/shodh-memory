@@ -14,7 +14,7 @@ jobs:
     name: Version Consistency
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Check version consistency across packages
         run: |
           # Extract versions from all package files
@@ -43,7 +43,7 @@ jobs:
     name: Format Check
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
@@ -54,21 +54,162 @@ jobs:
     name: Clippy Analysis
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
+
+      - name: Install LLVM
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y llvm-dev libclang-dev clang
+
       - name: Run Clippy
         run: |
-          cargo clippy --all-targets -- -W clippy::all 2>&1 | tee clippy-output.txt
+          set -o pipefail
+          # The ~30 pre-existing lints tracked for cleanup are style/complexity,
+          # so clippy::all stays at -W until they are cleared.
+          #
+          # clippy::correctness is different and is denied here. Those lints are
+          # deny-by-default upstream because they flag code that is almost
+          # certainly wrong, and a blanket -W clippy::all was silently
+          # downgrading them: two assertions in tests/adaptive_memory_tests.rs
+          # compared unsigned counts >= 0, so they could never fail, and they
+          # kept passing while the subsystem they cover went inert (#489).
+          # A test that cannot fail is invisible to a failing-test sweep — this
+          # lint is the only thing that finds that class.
+          #
+          # -D comes AFTER -W so the deny wins for the correctness subset.
+          cargo clippy --all-targets -- -W clippy::all -D clippy::correctness 2>&1 | tee clippy-output.txt
           WARNINGS=$(grep -c "warning:" clippy-output.txt || true)
+          WARNINGS=${WARNINGS:-0}
           echo "### Clippy Results" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "| Metric | Count |" >> $GITHUB_STEP_SUMMARY
           echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
           echo "| Warnings | $WARNINGS |" >> $GITHUB_STEP_SUMMARY
-          echo "| Status | Passed |" >> $GITHUB_STEP_SUMMARY
+          echo "| Status | $WARNINGS warning(s) — non-blocking (-W mode) |" >> $GITHUB_STEP_SUMMARY
+
+  frontend:
+    name: Dashboard Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: front/ui/package-lock.json
+
+      # Nothing in this workflow compiled front/ui before, so the dashboard
+      # could stop building and every PR would still be green. That is not
+      # hypothetical: a blanket `lib/` rule in .gitignore (Python venv
+      # boilerplate) silently swallowed front/ui/src/lib/ — the entire API
+      # client, the wire types and cn() — and the branch did not type-check
+      # from a clean clone while CI reported success on eleven other checks.
+      #
+      # `npm ci` rather than `npm install`, so this fails loudly if the
+      # lockfile and package.json disagree instead of quietly resolving
+      # something new.
+      - name: Install
+        working-directory: front/ui
+        run: npm ci
+
+      - name: Typecheck
+        working-directory: front/ui
+        run: npx tsc -b --noEmit
+
+      - name: Build
+        working-directory: front/ui
+        run: npx vite build
+
+      # The dashboard is embedded into the shodh-front binary as ONE file and
+      # must run with no network — that is what the on-device claim rests on.
+      # A stray CDN link or un-inlined asset breaks it silently in the browser,
+      # so assert it here instead of hoping.
+      - name: Assert single self-contained artifact
+        working-directory: front/ui
+        run: |
+          set -euo pipefail
+          test -f dist/index.html
+          EXTRA=$(find dist -type f ! -name index.html | wc -l)
+          if [ "$EXTRA" -ne 0 ]; then
+            echo "dist/ must contain only index.html; found $EXTRA other file(s):" >&2
+            find dist -type f ! -name index.html >&2
+            exit 1
+          fi
+          if grep -Eq '(src|href)="https?://' dist/index.html; then
+            echo "dist/index.html references an external URL:" >&2
+            grep -Eo '(src|href)="https?://[^"]*"' dist/index.html | sort -u >&2
+            exit 1
+          fi
+          SIZE=$(wc -c < dist/index.html)
+          echo "### Dashboard Build" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Single self-contained artifact: $SIZE bytes" >> $GITHUB_STEP_SUMMARY
+
+  feature-gates:
+    name: Optional Features Compile
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install LLVM
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y llvm-dev libclang-dev clang
+
+      # Optional features are compiled by nothing else in this workflow, so code
+      # behind a #[cfg(feature = ...)] gate can stop compiling and no PR will
+      # ever show it. Not hypothetical: the zenoh transport accrued four compile
+      # errors that way (repaired in #417), and llm-parser two (repaired here).
+      #
+      # 'python' used to be excluded here on the theory that pypi.yml covers it.
+      # It does not: pypi.yml is workflow_dispatch-only, so nothing built the
+      # PyO3 bindings on a PR, and src/python.rs drifted three E0063 initializers
+      # behind the struct definitions (Experience::toponyms from the #435
+      # gazetteer, Query::ner_entities twice). `cargo check` needs no maturin —
+      # pyo3 is abi3-py38 + extension-module, so the build script only wants the
+      # interpreter that every runner already has, and check never links.
+      - name: cargo check each optional feature
+        run: |
+          set -o pipefail
+          FAILED=""
+          for feature in zenoh llm-parser telemetry python; do
+            echo "::group::cargo check --features $feature"
+            if cargo check --features "$feature" --all-targets; then
+              echo "OK: $feature"
+            else
+              echo "FAILED: $feature"
+              FAILED="$FAILED $feature"
+            fi
+            echo "::endgroup::"
+          done
+          {
+            echo "### Optional Feature Compilation"
+            echo ""
+            if [ -n "$FAILED" ]; then
+              echo "Broken:$FAILED"
+            else
+              echo "All optional features compile."
+            fi
+          } >> $GITHUB_STEP_SUMMARY
+          if [ -n "$FAILED" ]; then
+            echo "Optional features failed to compile:$FAILED" >&2
+            exit 1
+          fi
+
+      # The loop above proves each feature compiles ALONE. It cannot prove the
+      # union compiles, and the union is what `cargo check --all-features`,
+      # `cargo package --all-features`, and any downstream crate enabling two of
+      # ours actually build. Feature unification only ever ADDS cfgs and dep
+      # features, so a symbol that resolves under one feature can stop resolving
+      # when a second is on. This step is a hard gate, not a report.
+      - name: cargo check --all-features --all-targets
+        run: cargo check --all-features --all-targets
 
   build:
     name: Build (${{ matrix.os }})
@@ -78,7 +219,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
@@ -98,8 +239,98 @@ jobs:
       - name: Build Release
         run: cargo build --release
 
+      # `cargo test --release` builds a unit graph that NOTHING else in this
+      # repo builds: `cargo build --release` makes bins only, every test job
+      # runs the dev profile, and `cargo check` emits no cdylib. That gap hid an
+      # unbuildable configuration for months — `[profile.release] panic =
+      # "abort"` plus a cdylib lib target made cargo emit two variants of
+      # `libshodh_memory.rlib` into the same unhashed filename (cargo#6313), so
+      # the loser was clobbered and every consumer linked against the wrong SVH.
+      #
+      # `recall_eval_cli` is the right sentinel and not an arbitrary pick: it
+      # resolves `CARGO_BIN_EXE_recall-eval`, which forces cargo to build the
+      # bins in release alongside a rustc test harness — exactly the two-panic-
+      # flavour graph that broke. Its four tests only parse CLI flags (no
+      # models, no ports), so this runs for real rather than `--no-run` — which
+      # additionally proves the release `recall-eval` binary starts and parses
+      # its arguments, not that a full eval suite passes (recall.yml owns that).
+      # Ubuntu only: this is a build-configuration gate, not a portability one,
+      # and the release profile is fat-LTO.
+      - name: Release test graph compiles and runs (cargo test --release)
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo test --release --test recall_eval_cli
+
+      # `cargo test --lib` constructs real memory systems, and library init
+      # acquires its models on demand: MiniLM (~90MB, HuggingFace) because vector
+      # search is meaningless without it, and the GLiNER typer (142MB) because
+      # only CI ever provisions it otherwise. Unprovisioned, this step therefore
+      # pulled ~230MB per OS per run and was one HuggingFace hiccup away from red
+      # — which is exactly how it failed on PR #443 (MiniLM tokenizer.json), a
+      # flake that then passed on a bare re-run with no code change.
+      #
+      # Pre-supplying both assets makes the step hermetic for those two fetches:
+      # SHODH_MODEL_PATH / SHODH_GLINER_MODEL_PATH are read as explicit local
+      # paths first, so nothing is downloaded and the tests run on the REAL
+      # embedder and the REAL typer, never the silent fallbacks. Cache keys are
+      # shared with the Tier-1 job deliberately.
+      #
+      # SHODH_OFFLINE is NOT set here: the ONNX Runtime dylib is still fetched by
+      # the library (a GitHub release download that is green on both OSes today),
+      # and offline mode would block it. SHODH_ALLOW_SIMPLIFIED_EMBEDDINGS is
+      # likewise never set — degrading the embedder to make CI pass would make
+      # every vector assertion below it meaningless.
+      - name: Cache GLiNER typer assets
+        if: matrix.os != 'windows-latest'
+        id: build-gliner-cache
+        uses: actions/cache@v6
+        with:
+          path: models/gliner-bi-edge
+          key: gliner-bi-edge-onnx-v1
+
+      - name: Fetch GLiNER typer assets
+        if: matrix.os != 'windows-latest' && steps.build-gliner-cache.outputs.cache-hit != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p models/gliner-bi-edge
+          gh release download gliner-bi-edge-onnx-v1 --repo "$GITHUB_REPOSITORY" --dir models/gliner-bi-edge
+          ls -la models/gliner-bi-edge
+
+      - name: Cache MiniLM embedder weights
+        if: matrix.os != 'windows-latest'
+        id: build-minilm-cache
+        uses: actions/cache@v6
+        with:
+          path: models/minilm-l6
+          key: minilm-l6-c9745ed1-v1
+
+      - name: Fetch MiniLM embedder weights
+        if: matrix.os != 'windows-latest' && steps.build-minilm-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p models/minilm-l6
+          BASE="https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/c9745ed1d9f207416be6d2e6f8de32d1f16199bf"
+          curl -fL --retry 5 --retry-delay 5 --connect-timeout 30 -o models/minilm-l6/model_quantized.onnx "$BASE/onnx/model_quint8_avx2.onnx"
+          curl -fL --retry 5 --retry-delay 5 --connect-timeout 30 -o models/minilm-l6/tokenizer.json "$BASE/tokenizer.json"
+          ls -la models/minilm-l6
+
+      - name: Verify model assets (hard gate — refuse to run on missing/degraded assets)
+        if: matrix.os != 'windows-latest'
+        run: |
+          SHODH_MODEL_PATH="${{ github.workspace }}/models/minilm-l6"
+          SHODH_GLINER_MODEL_PATH="${{ github.workspace }}/models/gliner-bi-edge"
+          test -s "$SHODH_MODEL_PATH/model_quantized.onnx" || { echo "::error::MiniLM weights missing"; exit 1; }
+          test -s "$SHODH_MODEL_PATH/tokenizer.json" || { echo "::error::MiniLM tokenizer missing"; exit 1; }
+          test -s "$SHODH_GLINER_MODEL_PATH/model.onnx" || { echo "::error::GLiNER model missing — refusing to run on fallback NER"; exit 1; }
+          test -s "$SHODH_GLINER_MODEL_PATH/tokenizer.json" || { echo "::error::GLiNER tokenizer missing"; exit 1; }
+          test -s "$SHODH_GLINER_MODEL_PATH/label_embeddings.bin" || { echo "::error::GLiNER label embeddings missing"; exit 1; }
+
       - name: Run unit tests
         if: matrix.os != 'windows-latest'
+        env:
+          SHODH_MODEL_PATH: ${{ github.workspace }}/models/minilm-l6
+          SHODH_GLINER_MODEL_PATH: ${{ github.workspace }}/models/gliner-bi-edge
         run: cargo test --lib --no-fail-fast
 
       - name: Display build info (Unix)
@@ -126,7 +357,7 @@ jobs:
 
       - name: Upload binary (Linux)
         if: matrix.os == 'ubuntu-latest'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: shodh-memory-linux
           path: target/release/shodh-memory-server
@@ -134,7 +365,7 @@ jobs:
 
       - name: Upload binary (macOS)
         if: matrix.os == 'macos-latest'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: shodh-memory-macos
           path: target/release/shodh-memory-server
@@ -142,7 +373,7 @@ jobs:
 
       - name: Upload binary (Windows)
         if: matrix.os == 'windows-latest'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: shodh-memory-windows
           path: target/release/shodh-memory-server.exe
@@ -152,20 +383,126 @@ jobs:
     name: Unit Tests (Tier 1)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
+      - name: Install LLVM
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y llvm-dev libclang-dev clang
+
+      # Real models, hermetically pinned — see recall.yml/batched-guard.yml for
+      # the pattern this mirrors. SHODH_OFFLINE=1 below only blocks auto-download
+      # of *missing* assets; ORT_DYLIB_PATH / SHODH_MODEL_PATH /
+      # SHODH_GLINER_MODEL_PATH are all read as explicit local paths first, so
+      # pre-supplying them keeps the run fully offline while using the real
+      # NER/embedder — never the silent fallback (SHODH_ALLOW_SIMPLIFIED_EMBEDDINGS
+      # is deliberately never set here).
+      - name: Determine pinned ONNX Runtime version
+        id: ort-version
+        run: |
+          VERSION=$(grep -oP 'ONNX_RUNTIME_VERSION: &str = "\K[0-9.]+' src/embeddings/downloader.rs)
+          if [ -z "$VERSION" ]; then
+            echo "::error::Could not extract ONNX_RUNTIME_VERSION from src/embeddings/downloader.rs"
+            exit 1
+          fi
+          echo "Pinned ONNX Runtime version: $VERSION"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Cache GLiNER typer assets
+        id: gliner-cache
+        uses: actions/cache@v6
+        with:
+          path: models/gliner-bi-edge
+          key: gliner-bi-edge-onnx-v1
+
+      - name: Fetch GLiNER typer assets
+        if: steps.gliner-cache.outputs.cache-hit != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p models/gliner-bi-edge
+          gh release download gliner-bi-edge-onnx-v1 --repo "$GITHUB_REPOSITORY" --dir models/gliner-bi-edge
+          ls -la models/gliner-bi-edge
+
+      - name: Cache ONNX Runtime
+        id: ort-cache
+        uses: actions/cache@v6
+        with:
+          path: models/onnxruntime
+          key: onnxruntime-v${{ steps.ort-version.outputs.version }}-linux-x64
+
+      - name: Fetch ONNX Runtime
+        if: steps.ort-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          V="${{ steps.ort-version.outputs.version }}"
+          mkdir -p models/onnxruntime
+          curl -fL --retry 5 --retry-delay 5 --connect-timeout 30 -o /tmp/ort.tgz \
+            "https://github.com/microsoft/onnxruntime/releases/download/v${V}/onnxruntime-linux-x64-${V}.tgz"
+          tar -xzf /tmp/ort.tgz -C /tmp
+          # Pick the largest real (non-symlink) libonnxruntime.so* file, excluding
+          # libonnxruntime_providers_shared.so stubs — mirrors the selection logic
+          # in src/embeddings/downloader.rs::extract_onnx_runtime (fixes #223/#250:
+          # entry ordering and provider stubs must never clobber the real lib).
+          REAL=$(find "/tmp/onnxruntime-linux-x64-${V}/lib" -maxdepth 1 -type f -name 'libonnxruntime.so*' ! -name 'libonnxruntime_*' -printf '%s %p\n' | sort -rn | head -1 | cut -d' ' -f2-)
+          if [ -z "$REAL" ]; then
+            echo "::error::Could not find libonnxruntime.so in extracted archive"
+            exit 1
+          fi
+          cp "$REAL" models/onnxruntime/libonnxruntime.so
+          SIZE=$(stat -c%s models/onnxruntime/libonnxruntime.so)
+          if [ "$SIZE" -lt 1000000 ]; then
+            echo "::error::Extracted libonnxruntime.so is only $SIZE bytes — expected >1MB real runtime"
+            exit 1
+          fi
+          ls -la models/onnxruntime
+
+      - name: Cache MiniLM embedder weights
+        id: minilm-cache
+        uses: actions/cache@v6
+        with:
+          path: models/minilm-l6
+          key: minilm-l6-c9745ed1-v1
+
+      - name: Fetch MiniLM embedder weights
+        if: steps.minilm-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p models/minilm-l6
+          BASE="https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/c9745ed1d9f207416be6d2e6f8de32d1f16199bf"
+          curl -fL --retry 5 --retry-delay 5 --connect-timeout 30 -o models/minilm-l6/model_quantized.onnx "$BASE/onnx/model_quint8_avx2.onnx"
+          curl -fL --retry 5 --retry-delay 5 --connect-timeout 30 -o models/minilm-l6/tokenizer.json "$BASE/tokenizer.json"
+          ls -la models/minilm-l6
+
+      - name: Verify model assets (hard gate — refuse to run on missing/degraded assets)
+        run: |
+          ORT_DYLIB_PATH="${{ github.workspace }}/models/onnxruntime/libonnxruntime.so"
+          SHODH_MODEL_PATH="${{ github.workspace }}/models/minilm-l6"
+          SHODH_GLINER_MODEL_PATH="${{ github.workspace }}/models/gliner-bi-edge"
+          test -s "$ORT_DYLIB_PATH" || { echo "::error::ONNX Runtime missing — embedder would hard-fail"; exit 1; }
+          test -s "$SHODH_MODEL_PATH/model_quantized.onnx" || { echo "::error::MiniLM weights missing"; exit 1; }
+          test -s "$SHODH_MODEL_PATH/tokenizer.json" || { echo "::error::MiniLM tokenizer missing"; exit 1; }
+          test -s "$SHODH_GLINER_MODEL_PATH/model.onnx" || { echo "::error::GLiNER model missing — refusing to run on fallback NER"; exit 1; }
+          test -s "$SHODH_GLINER_MODEL_PATH/tokenizer.json" || { echo "::error::GLiNER tokenizer missing"; exit 1; }
+          test -s "$SHODH_GLINER_MODEL_PATH/label_embeddings.bin" || { echo "::error::GLiNER label embeddings missing"; exit 1; }
+
       - name: Run unit tests
         env:
-          SHODH_OFFLINE: "1"   # no GLiNER auto-download in CI; smoke job fetches release assets
+          SHODH_OFFLINE: "1"   # hermetic: all model/runtime paths below are pre-supplied and verified, so offline mode costs nothing and guards against an accidental new auto-download dependency
+          ORT_DYLIB_PATH: ${{ github.workspace }}/models/onnxruntime/libonnxruntime.so
+          SHODH_MODEL_PATH: ${{ github.workspace }}/models/minilm-l6
+          SHODH_GLINER_MODEL_PATH: ${{ github.workspace }}/models/gliner-bi-edge
         run: |
+          set -o pipefail
           cargo test --lib --no-fail-fast 2>&1 | tee test-output.txt
 
       - name: Validate test count
         if: always()
         run: |
-          PASSED=$(grep -oP '\d+(?= passed)' test-output.txt | tail -1 || echo "0")
+          PASSED=$(grep -oP '\d+(?= passed)' test-output.txt | awk '{s+=$1} END {print s+0}')
+          PASSED=${PASSED:-0}
           echo "Unit tests passed: $PASSED"
           if [ "$PASSED" -lt 50 ]; then
             echo "::error::Only $PASSED unit tests passed — expected at least 50. Tests may be silently skipped."
@@ -175,9 +512,12 @@ jobs:
       - name: Generate test summary
         if: always()
         run: |
-          PASSED=$(grep -oP '\d+(?= passed)' test-output.txt | tail -1 || echo "0")
-          FAILED=$(grep -oP '\d+(?= failed)' test-output.txt | tail -1 || echo "0")
-          IGNORED=$(grep -oP '\d+(?= ignored)' test-output.txt | tail -1 || echo "0")
+          PASSED=$(grep -oP '\d+(?= passed)' test-output.txt | awk '{s+=$1} END {print s+0}')
+          PASSED=${PASSED:-0}
+          FAILED=$(grep -oP '\d+(?= failed)' test-output.txt | awk '{s+=$1} END {print s+0}')
+          FAILED=${FAILED:-0}
+          IGNORED=$(grep -oP '\d+(?= ignored)' test-output.txt | awk '{s+=$1} END {print s+0}')
+          IGNORED=${IGNORED:-0}
 
           echo "## Unit Test Results (Tier 1)" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
@@ -191,14 +531,119 @@ jobs:
     name: Integration Tests (Tier 2)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
+      - name: Install LLVM
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y llvm-dev libclang-dev clang
+
+      # Real models, hermetically pinned — see recall.yml/batched-guard.yml for
+      # the pattern this mirrors. SHODH_OFFLINE=1 below only blocks auto-download
+      # of *missing* assets; ORT_DYLIB_PATH / SHODH_MODEL_PATH /
+      # SHODH_GLINER_MODEL_PATH are all read as explicit local paths first, so
+      # pre-supplying them keeps the run fully offline while using the real
+      # NER/embedder — never the silent fallback (SHODH_ALLOW_SIMPLIFIED_EMBEDDINGS
+      # is deliberately never set here).
+      - name: Determine pinned ONNX Runtime version
+        id: ort-version
+        run: |
+          VERSION=$(grep -oP 'ONNX_RUNTIME_VERSION: &str = "\K[0-9.]+' src/embeddings/downloader.rs)
+          if [ -z "$VERSION" ]; then
+            echo "::error::Could not extract ONNX_RUNTIME_VERSION from src/embeddings/downloader.rs"
+            exit 1
+          fi
+          echo "Pinned ONNX Runtime version: $VERSION"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Cache GLiNER typer assets
+        id: gliner-cache
+        uses: actions/cache@v6
+        with:
+          path: models/gliner-bi-edge
+          key: gliner-bi-edge-onnx-v1
+
+      - name: Fetch GLiNER typer assets
+        if: steps.gliner-cache.outputs.cache-hit != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p models/gliner-bi-edge
+          gh release download gliner-bi-edge-onnx-v1 --repo "$GITHUB_REPOSITORY" --dir models/gliner-bi-edge
+          ls -la models/gliner-bi-edge
+
+      - name: Cache ONNX Runtime
+        id: ort-cache
+        uses: actions/cache@v6
+        with:
+          path: models/onnxruntime
+          key: onnxruntime-v${{ steps.ort-version.outputs.version }}-linux-x64
+
+      - name: Fetch ONNX Runtime
+        if: steps.ort-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          V="${{ steps.ort-version.outputs.version }}"
+          mkdir -p models/onnxruntime
+          curl -fL --retry 5 --retry-delay 5 --connect-timeout 30 -o /tmp/ort.tgz \
+            "https://github.com/microsoft/onnxruntime/releases/download/v${V}/onnxruntime-linux-x64-${V}.tgz"
+          tar -xzf /tmp/ort.tgz -C /tmp
+          # Pick the largest real (non-symlink) libonnxruntime.so* file, excluding
+          # libonnxruntime_providers_shared.so stubs — mirrors the selection logic
+          # in src/embeddings/downloader.rs::extract_onnx_runtime (fixes #223/#250:
+          # entry ordering and provider stubs must never clobber the real lib).
+          REAL=$(find "/tmp/onnxruntime-linux-x64-${V}/lib" -maxdepth 1 -type f -name 'libonnxruntime.so*' ! -name 'libonnxruntime_*' -printf '%s %p\n' | sort -rn | head -1 | cut -d' ' -f2-)
+          if [ -z "$REAL" ]; then
+            echo "::error::Could not find libonnxruntime.so in extracted archive"
+            exit 1
+          fi
+          cp "$REAL" models/onnxruntime/libonnxruntime.so
+          SIZE=$(stat -c%s models/onnxruntime/libonnxruntime.so)
+          if [ "$SIZE" -lt 1000000 ]; then
+            echo "::error::Extracted libonnxruntime.so is only $SIZE bytes — expected >1MB real runtime"
+            exit 1
+          fi
+          ls -la models/onnxruntime
+
+      - name: Cache MiniLM embedder weights
+        id: minilm-cache
+        uses: actions/cache@v6
+        with:
+          path: models/minilm-l6
+          key: minilm-l6-c9745ed1-v1
+
+      - name: Fetch MiniLM embedder weights
+        if: steps.minilm-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p models/minilm-l6
+          BASE="https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/c9745ed1d9f207416be6d2e6f8de32d1f16199bf"
+          curl -fL --retry 5 --retry-delay 5 --connect-timeout 30 -o models/minilm-l6/model_quantized.onnx "$BASE/onnx/model_quint8_avx2.onnx"
+          curl -fL --retry 5 --retry-delay 5 --connect-timeout 30 -o models/minilm-l6/tokenizer.json "$BASE/tokenizer.json"
+          ls -la models/minilm-l6
+
+      - name: Verify model assets (hard gate — refuse to run on missing/degraded assets)
+        run: |
+          ORT_DYLIB_PATH="${{ github.workspace }}/models/onnxruntime/libonnxruntime.so"
+          SHODH_MODEL_PATH="${{ github.workspace }}/models/minilm-l6"
+          SHODH_GLINER_MODEL_PATH="${{ github.workspace }}/models/gliner-bi-edge"
+          test -s "$ORT_DYLIB_PATH" || { echo "::error::ONNX Runtime missing — embedder would hard-fail"; exit 1; }
+          test -s "$SHODH_MODEL_PATH/model_quantized.onnx" || { echo "::error::MiniLM weights missing"; exit 1; }
+          test -s "$SHODH_MODEL_PATH/tokenizer.json" || { echo "::error::MiniLM tokenizer missing"; exit 1; }
+          test -s "$SHODH_GLINER_MODEL_PATH/model.onnx" || { echo "::error::GLiNER model missing — refusing to run on fallback NER"; exit 1; }
+          test -s "$SHODH_GLINER_MODEL_PATH/tokenizer.json" || { echo "::error::GLiNER tokenizer missing"; exit 1; }
+          test -s "$SHODH_GLINER_MODEL_PATH/label_embeddings.bin" || { echo "::error::GLiNER label embeddings missing"; exit 1; }
+
       - name: Run integration tests
         env:
-          SHODH_OFFLINE: "1"   # no GLiNER auto-download in CI; smoke job fetches release assets
+          SHODH_OFFLINE: "1"   # hermetic: all model/runtime paths below are pre-supplied and verified, so offline mode costs nothing and guards against an accidental new auto-download dependency
+          ORT_DYLIB_PATH: ${{ github.workspace }}/models/onnxruntime/libonnxruntime.so
+          SHODH_MODEL_PATH: ${{ github.workspace }}/models/minilm-l6
+          SHODH_GLINER_MODEL_PATH: ${{ github.workspace }}/models/gliner-bi-edge
         run: |
+          set -o pipefail
           cargo test \
             --test adaptive_memory_tests \
             --test bug_regression_tests \
@@ -220,13 +665,15 @@ jobs:
             --test salience_tests \
             --test spreading_activation_tests \
             --test storage_edge_case_tests \
+            --test trace_capture \
             --test universe_tests \
             --no-fail-fast 2>&1 | tee test-output.txt
 
       - name: Validate test count
         if: always()
         run: |
-          PASSED=$(grep -oP '\d+(?= passed)' test-output.txt | tail -1 || echo "0")
+          PASSED=$(grep -oP '\d+(?= passed)' test-output.txt | awk '{s+=$1} END {print s+0}')
+          PASSED=${PASSED:-0}
           echo "Integration tests passed: $PASSED"
           if [ "$PASSED" -lt 100 ]; then
             echo "::error::Only $PASSED integration tests passed — expected at least 100. Tests may be silently skipped."
@@ -236,9 +683,12 @@ jobs:
       - name: Generate test summary
         if: always()
         run: |
-          PASSED=$(grep -oP '\d+(?= passed)' test-output.txt | tail -1 || echo "0")
-          FAILED=$(grep -oP '\d+(?= failed)' test-output.txt | tail -1 || echo "0")
-          IGNORED=$(grep -oP '\d+(?= ignored)' test-output.txt | tail -1 || echo "0")
+          PASSED=$(grep -oP '\d+(?= passed)' test-output.txt | awk '{s+=$1} END {print s+0}')
+          PASSED=${PASSED:-0}
+          FAILED=$(grep -oP '\d+(?= failed)' test-output.txt | awk '{s+=$1} END {print s+0}')
+          FAILED=${FAILED:-0}
+          IGNORED=$(grep -oP '\d+(?= ignored)' test-output.txt | awk '{s+=$1} END {print s+0}')
+          IGNORED=${IGNORED:-0}
 
           echo "## Integration Test Results (Tier 2)" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
@@ -261,7 +711,7 @@ jobs:
     runs-on: ubuntu-latest
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
@@ -297,15 +747,38 @@ jobs:
   security:
     name: Security Audit
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - name: Install cargo-audit
         run: cargo install cargo-audit
+
+      # This job is allowed to fail the pipeline. It previously could not, in
+      # three independent ways: the job carried `continue-on-error: true`, the
+      # step ended in `|| true`, and the audit was piped into `tee` — GitHub's
+      # default shell is `bash -e` WITHOUT `pipefail`, so the step's exit status
+      # was tee's, which is always 0. Removing only the first two would still
+      # have left a gate that cannot go red. `set -o pipefail` below closes the
+      # third; keep it if you ever touch this pipeline.
+      #
+      # `cargo audit` fails on vulnerabilities. Informational advisories
+      # (unmaintained / unsound / yanked) are printed but do not fail the run.
+      # That is deliberate, not an oversight: the current dozen are transitive
+      # under zenoh and have no fixed version to move to, and `--deny warnings`
+      # here would make an upstream crate going unmaintained block every PR.
+      #
+      # If a real vulnerability ever has no upgrade path, add it to
+      # `.cargo/audit.toml` under `[advisories] ignore` with a comment stating
+      # why it is not reachable in this codebase and what would change that.
+      # Do not reintroduce `|| true`.
       - name: Run security audit
         run: |
-          cargo audit 2>&1 | tee audit-output.txt || true
+          set -o pipefail
+          cargo audit --color never | tee audit-output.txt
+
+      - name: Publish audit report
+        if: always()
+        run: |
           echo "## Security Audit" >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
           tail -20 audit-output.txt >> $GITHUB_STEP_SUMMARY
@@ -316,7 +789,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
@@ -354,7 +827,7 @@ jobs:
           fi
 
       - name: Upload benchmark results
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: benchmark-results
           path: target/criterion
@@ -363,7 +836,14 @@ jobs:
   summary:
     name: CI Summary
     runs-on: ubuntu-latest
-    needs: [version-check, format, clippy, build, test-unit, test-integration, benchmark]
+    # `CI Summary` is the ONLY required status check on `main` (branch
+    # protection), so a job that is not listed here cannot block a merge no
+    # matter how red it goes. `security`, `frontend`, and `feature-gates` are
+    # listed, and gated below. `test-stress` is deliberately NOT listed: it is
+    # skipped on pull requests (if: push to main), so requiring
+    # `result == 'success'` here would fail every PR.
+    needs:
+      [version-check, format, clippy, build, test-unit, test-integration, security, frontend, feature-gates, benchmark]
     if: always()
     steps:
       - name: Generate final summary
@@ -379,6 +859,9 @@ jobs:
           build_icon="${{ needs.build.result == 'success' && '✅' || '❌' }}"
           unit_icon="${{ needs.test-unit.result == 'success' && '✅' || '❌' }}"
           integration_icon="${{ needs.test-integration.result == 'success' && '✅' || '❌' }}"
+          security_icon="${{ needs.security.result == 'success' && '✅' || '❌' }}"
+          frontend_icon="${{ needs.frontend.result == 'success' && '✅' || '❌' }}"
+          features_icon="${{ needs.feature-gates.result == 'success' && '✅' || '❌' }}"
           bench_icon="${{ needs.benchmark.result == 'success' && '✅' || '⚠️' }}"
 
           echo "| Version | $version_icon ${{ needs.version-check.result }} |" >> $GITHUB_STEP_SUMMARY
@@ -387,6 +870,9 @@ jobs:
           echo "| Build (3 platforms) | $build_icon ${{ needs.build.result }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Unit Tests (Tier 1) | $unit_icon ${{ needs.test-unit.result }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Integration Tests (Tier 2) | $integration_icon ${{ needs.test-integration.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Security Audit | $security_icon ${{ needs.security.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Dashboard Build | $frontend_icon ${{ needs.frontend.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Optional Features Compile | $features_icon ${{ needs.feature-gates.result }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Benchmarks | $bench_icon ${{ needs.benchmark.result }} |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
 
@@ -395,7 +881,10 @@ jobs:
                 "${{ needs.clippy.result }}" == "success" && \
                 "${{ needs.build.result }}" == "success" && \
                 "${{ needs.test-unit.result }}" == "success" && \
-                "${{ needs.test-integration.result }}" == "success" ]]; then
+                "${{ needs.test-integration.result }}" == "success" && \
+                "${{ needs.security.result }}" == "success" && \
+                "${{ needs.frontend.result }}" == "success" && \
+                "${{ needs.feature-gates.result }}" == "success" ]]; then
             echo "### All critical checks passed" >> $GITHUB_STEP_SUMMARY
             exit 0
           else

@@ -40,25 +40,31 @@ pub enum ParserType {
 }
 
 /// Configuration for the query parser
+///
+/// `LlmParser` loads no weights of its own — it calls an OpenAI-compatible or
+/// Ollama HTTP endpoint. The fields below describe that endpoint. They replaced
+/// `llm_model_path`, `llm_threads` and `llm_context_size`, which described an
+/// in-process model loader this parser has not used since it became an HTTP
+/// client; thread and context-size knobs belong to the server now, not to us.
 #[derive(Debug, Clone)]
 pub struct ParserConfig {
     /// Which parser implementation to use
     pub parser_type: ParserType,
-    /// Path to LLM model (only used if parser_type is Llm)
-    pub llm_model_path: Option<String>,
-    /// Number of threads for LLM inference
-    pub llm_threads: usize,
-    /// Context size for LLM
-    pub llm_context_size: usize,
+    /// Base URL of the inference server (only used if parser_type is Llm)
+    pub llm_endpoint: String,
+    /// Model name as the server knows it (only used if parser_type is Llm)
+    pub llm_model: String,
 }
 
 impl Default for ParserConfig {
     fn default() -> Self {
         Self {
             parser_type: ParserType::RuleBased,
-            llm_model_path: None,
-            llm_threads: 4,
-            llm_context_size: 2048,
+            // Ollama's default bind address, and a small instruct model — this
+            // parser classifies queries rather than generating prose, so the
+            // smallest capable model is the right default.
+            llm_endpoint: "http://localhost:11434".to_string(),
+            llm_model: "qwen2.5:1.5b".to_string(),
         }
     }
 }
@@ -69,12 +75,12 @@ impl ParserConfig {
         Self::default()
     }
 
-    /// Create config for LLM parser
-    pub fn llm(model_path: impl Into<String>) -> Self {
+    /// Create config for LLM parser against a given endpoint and model.
+    pub fn llm(endpoint: impl Into<String>, model: impl Into<String>) -> Self {
         Self {
             parser_type: ParserType::Llm,
-            llm_model_path: Some(model_path.into()),
-            ..Default::default()
+            llm_endpoint: endpoint.into(),
+            llm_model: model.into(),
         }
     }
 }
@@ -85,13 +91,11 @@ pub fn create_parser(config: ParserConfig) -> Arc<dyn QueryParser> {
         ParserType::RuleBased => Arc::new(RuleBasedParser::new()),
         #[cfg(feature = "llm-parser")]
         ParserType::Llm => {
-            let model_path = config
-                .llm_model_path
-                .expect("LLM model path required for LLM parser");
-            Arc::new(
-                LlmParser::new(&model_path, config.llm_threads, config.llm_context_size)
-                    .expect("Failed to load LLM model"),
-            )
+            // `LlmParser::new` is infallible and connects lazily — there is no
+            // model to load and therefore nothing here that can fail. The
+            // previous `.expect("Failed to load LLM model")` panicked the
+            // process on a construction that no longer returns a Result.
+            Arc::new(LlmParser::new(&config.llm_endpoint, &config.llm_model))
         }
         #[cfg(not(feature = "llm-parser"))]
         ParserType::Llm => {

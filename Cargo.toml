@@ -23,12 +23,22 @@ exclude = [
     "*.whl",
     "*.pdf",
     "*.odt",
+    # No packaging exception is needed for HTML any more: the two bundled
+    # viewers were retired and the crate no longer `include_str!`s any .html.
     "*.html",
-    "!src/handlers/graph_view.html",
     "*.py",
     "*.log",
     "*.json",
     "!src/entity_type/entity-type-schema.json",
+    # The embedded en_core_web_sm manifest is `include_str!`d, so the blanket
+    # "*.json" exclusion above would break a packaged build.
+    #
+    # NOTE: at ~14.4 MiB the bundle puts a packaged crate over the crates.io
+    # 10 MiB limit. That is not a NEW break — `spacy-rusty` is a version-less
+    # path dependency, which already makes `cargo publish` fail — but whoever
+    # fixes the path dep must also solve the asset size (raised limit, or a
+    # feature-gated download).
+    "!src/dep_parser/en_core_web_sm/model.json",
     "!Cargo.lock",
     "job_log.txt",
     "macos_log.txt",
@@ -82,6 +92,10 @@ name = "shodh_memory"
 path = "src/lib.rs"
 # rlib: for Rust library usage (tests, benchmarks, binary)
 # cdylib: for Python bindings (PyO3/maturin needs shared library)
+#
+# The cdylib forces cargo to emit this lib with an unhashed filename, which is
+# why `[profile.release]` must not set `panic` — see the note there before
+# touching either line.
 crate-type = ["rlib", "cdylib"]
 
 [[bin]]
@@ -277,12 +291,33 @@ opt-level = 3
 lto = true
 codegen-units = 1
 strip = true  # Reduce binary size
-panic = "abort"
+
+# `panic = "abort"` is deliberately NOT set here, and must not be re-added while
+# `[lib] crate-type` contains `cdylib`. The two are incompatible in this crate:
+#
+#   * A lib target that emits a cdylib needs a stable, unhashed artifact name,
+#     so cargo compiles the whole unit without `-C extra-filename` — the rlib
+#     lands at `deps/libshodh_memory.rlib` with no metadata suffix.
+#   * `panic = "abort"` forces cargo to build that same lib TWICE whenever a
+#     rustc test harness is in the graph (harnesses require unwind, bins get
+#     abort). Two units, two `-C metadata` values, one filename.
+#
+# The result is the collision of rust-lang/cargo#6313: both variants write
+# `libshodh_memory.rlib`, the loser is silently clobbered, and whatever consumes
+# it is linked against a crate whose SVH and dependency set are not the ones it
+# was compiled against. `cargo test --release --test <any>` was unbuildable that
+# way — surfacing as 16 LNK2019 unresolved `shodh_memory` symbols, or as E0599
+# on `anyhow::Context` / E0277 on `serde::Serialize`, depending on which variant
+# happened to be written last. `cargo check` never showed it because check emits
+# no cdylib. CI never showed it because no job ran `cargo test --release`.
+#
+# Removing the setting also repairs a live production defect: the two
+# `std::panic::catch_unwind` guards in `src/dep_parser/mod.rs` (which exist so a
+# corrupt model bundle degrades the parser to `None` instead of taking down a
+# request thread) are no-ops under abort — the process dies instead.
 
 [profile.bench]
 # Note: bench profile inherits from release by default
-# panic cannot be overridden when inheriting (Cargo limitation)
-# Criterion benchmarks work with panic = "abort" in release mode
 opt-level = 3
 lto = "thin"  # Faster build than full LTO for benchmarks
 

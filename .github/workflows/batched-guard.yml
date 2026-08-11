@@ -36,7 +36,7 @@ jobs:
       # Production typer is GLiNER bi-edge — measured, never the fallback.
       SHODH_GLINER_MODEL_PATH: ${{ github.workspace }}/models/gliner-bi-edge
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -46,13 +46,13 @@ jobs:
       - name: Build recall-eval
         run: cargo build --release --bin recall-eval
       - name: Cache MiniLM embedder
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.cache/shodh-memory/models
           key: shodh-models-minilm-v1
       - name: Cache GLiNER typer assets
         id: gliner-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: models/gliner-bi-edge
           key: gliner-bi-edge-onnx-v1
@@ -150,7 +150,7 @@ jobs:
 
       - name: Upload results
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: batched-guard-results
           path: |

@@ -56,6 +56,7 @@ fn create_entity(
         is_proper_noun: is_proper,
         selectivity: None,
         fine_type: None,
+        kb_id: None,
     }
 }
 
@@ -87,6 +88,7 @@ fn create_relationship(
         forman_curvature: None,
         endpoint_selectivity: None,
         provenance: Vec::new(),
+        promoted_at: None,
     }
 }
 

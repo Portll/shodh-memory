@@ -257,6 +257,38 @@ pub struct RecallExperience {
     pub content: String,
     pub memory_type: Option<String>,
     pub tags: Vec<String>,
+    /// GPS coordinates `[latitude, longitude, altitude]` in WGS84, when the
+    /// memory carries them.
+    ///
+    /// Recall could already *filter and rank* by location — `geo_lat`/`geo_lon`/
+    /// `geo_radius_meters` compose with every mode, and Layer 0.45 prefetches
+    /// geo candidates into the fused pool — but the coordinates were never
+    /// echoed back. A caller could ask "what do I know within 5km of here" and
+    /// get answers it had no way to place on a map, or even to sort by
+    /// distance. `/api/search/robotics` and `GET /api/memory/{id}` return the
+    /// whole `Memory` and so always exposed this; recall was the gap.
+    ///
+    /// Skipped when absent, matching `score_attribution` on `RecallMemory`.
+    /// The overwhelming majority of memories have no coordinates — nothing in
+    /// the Rust path derives them, they are caller-supplied only — so emitting
+    /// an explicit null on every result would grow every response for nothing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub geo_location: Option<[f64; 3]>,
+
+    /// Places the content MENTIONS, resolved to coordinates by the offline
+    /// gazetteer at remember time.
+    ///
+    /// Distinct from `geo_location` above in the way that matters: that field
+    /// says where the memory was recorded and drives the geohash radius index,
+    /// these say what places the memory talks about and are not spatially
+    /// indexed at all. A memory mentioning Baltimore must never answer "what
+    /// did I record near Baltimore".
+    ///
+    /// Omitted when empty, for the same reason `geo_location` is omitted when
+    /// absent: most memories name no resolvable place, and an empty array on
+    /// every result would grow every response for nothing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub toponyms: Vec<crate::memory::types::Toponym>,
 }
 
 // =============================================================================
@@ -536,6 +568,10 @@ pub struct RestoreBackupResponse {
     pub success: bool,
     pub message: String,
     pub restored_stores: Vec<String>,
+    /// Stores whose restore was attempted and failed. A restore that recovers
+    /// some stores and not others must not report itself as complete: the
+    /// failing branch has already cleared the live data it was replacing.
+    pub failed_stores: Vec<String>,
 }
 
 // =============================================================================

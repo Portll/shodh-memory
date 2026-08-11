@@ -207,15 +207,24 @@ fn test_memory_tier_promotion() {
     memory.promote();
     assert_eq!(memory.tier, MemoryTier::LongTerm);
 
+    // LongTerm is TERMINAL. The LongTerm → Archive arrow was removed: no
+    // production path ever drove it, and Archive's documented job (compressed
+    // archival) already happens on entry to LongTerm. See MemoryTier::Archive.
     memory.promote();
-    assert_eq!(memory.tier, MemoryTier::Archive);
-
-    memory.promote();
-    assert_eq!(memory.tier, MemoryTier::Archive, "Should stay at Archive");
+    assert_eq!(
+        memory.tier,
+        MemoryTier::LongTerm,
+        "LongTerm is the terminal tier — promote() must not invent an Archive"
+    );
 }
 
 #[test]
-fn test_memory_tier_demotion() {
+fn test_archive_tier_is_inert_but_still_decodes() {
+    // The Archive VARIANT is deliberately retained even though nothing assigns
+    // it: MemoryTier is a positionally-encoded postcard enum inside MemoryFlat,
+    // so deleting discriminant 3 would bet live data on a negative-existence
+    // proof. An Archive value that somehow arrives must round-trip untouched
+    // rather than being silently rewritten to another tier.
     let mut memory = Memory::new(
         MemoryId(Uuid::new_v4()),
         Experience::default(),
@@ -225,21 +234,18 @@ fn test_memory_tier_demotion() {
         None,
         None,
     );
-
-    // Start at Archive
     memory.tier = MemoryTier::Archive;
 
-    memory.demote();
-    assert_eq!(memory.tier, MemoryTier::LongTerm);
+    memory.promote();
+    assert_eq!(
+        memory.tier,
+        MemoryTier::Archive,
+        "a retired tier is left alone, not rewritten"
+    );
 
-    memory.demote();
-    assert_eq!(memory.tier, MemoryTier::Session);
-
-    memory.demote();
-    assert_eq!(memory.tier, MemoryTier::Working);
-
-    memory.demote();
-    assert_eq!(memory.tier, MemoryTier::Working, "Should stay at Working");
+    let encoded = serde_json::to_string(&memory.tier).unwrap();
+    let decoded: MemoryTier = serde_json::from_str(&encoded).unwrap();
+    assert_eq!(decoded, MemoryTier::Archive, "Archive must still decode");
 }
 
 #[test]
@@ -254,17 +260,14 @@ fn test_tier_cycle() {
         None,
     );
 
-    // Full promotion cycle
+    // Promotion saturates at LongTerm and stays there — the ladder is
+    // monotonic and terminal, with no demotion path (demote() was removed:
+    // nothing drives it and tier is a retrieval input, so oscillation would
+    // flap a memory's rank between recalls).
     for _ in 0..10 {
         memory.promote();
     }
-    assert_eq!(memory.tier, MemoryTier::Archive);
-
-    // Full demotion cycle
-    for _ in 0..10 {
-        memory.demote();
-    }
-    assert_eq!(memory.tier, MemoryTier::Working);
+    assert_eq!(memory.tier, MemoryTier::LongTerm);
 }
 
 // =============================================================================

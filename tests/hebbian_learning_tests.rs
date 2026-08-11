@@ -231,6 +231,54 @@ fn test_reinforce_neutral_no_change() {
 // =============================================================================
 // ASSOCIATION STRENGTHENING TESTS (Fire Together Wire Together)
 // =============================================================================
+//
+// SHIPPED-SEMANTICS NOTE for every test in this file that co-retrieves plain
+// memories and then looks at memory-to-memory associations.
+//
+// `f6b730ee` (2026-07-10) flipped `SHODH_COACT_STRENGTHEN_ONLY` to default-ON
+// ("strengthen-not-create"): `GraphMemory::record_memory_coactivation`
+// (src/graph_memory.rs:5620) now only STRENGTHENS a memory-to-memory edge that
+// already exists between a co-active pair; it no longer mints a `CoRetrieved`
+// edge for every co-retrieved pair. That un-gated all-pairs minting was
+// measured at ~80% of all graph edges and was the recall-time OOM driver.
+//
+// The consequence these tests hit: the mint branch is the ONLY writer of the
+// `mem_edge:{a}:{b}` pair index that `find_edge_between_entities` reads (every
+// other reference in the tree is a reader). With minting off by default, that
+// lookup returns `None` for every memory pair, so the strengthen branch has
+// nothing to find and `record_memory_coactivation` returns 0. Downstream:
+// `reinforce_recall` sets `stats.associations_strengthened` from that count
+// (src/memory/mod.rs:7630) so it is always 0, and `graph_stats()`
+// (src/memory/mod.rs:8087) reports `edge_count == 0`, `avg_strength == 0.0`,
+// `potentiated_count == 0` for these memories.
+//
+// This is the current, intentional contract, not a bug — but note a
+// remove-vs-revive decision on the memory-to-memory coactivation layer is
+// PENDING. The tests below therefore pin CURRENT shipped behavior and
+// deliberately assert nothing about whether the layer *should* mint.
+//
+// The both-modes contract (mint when strengthen_only=false; strengthen-not-mint
+// when strengthen_only=true and a prior edge exists; mint nothing when
+// strengthen_only=true and no prior edge exists) is pinned by the unit tests in
+// src/graph_memory.rs:
+//   - coactivation_strengthen_only_creates_no_new_edges
+//   - coactivation_strengthen_only_still_strengthens_existing
+//   - coactivation_strengthen_only_actually_increments_activation_and_strength
+// Durability of those edges is pinned by (same module):
+//   - coactivation_edges_survive_graph_reopen
+//   - coactivation_edge_strength_survives_graph_reopen
+//   - coactivation_ltp_status_survives_graph_reopen
+// Those tests can reach the mint path because `record_memory_coactivation_impl`
+// takes `strengthen_only` as a PARAMETER. Integration tests cannot: the only
+// lever from here is the `SHODH_COACT_STRENGTHEN_ONLY` env var, and
+// `std::env::set_var` is process-global — flipping it inside one `#[test]`
+// would change coactivation semantics for every sibling test running
+// concurrently in this same binary. So it is deliberately not used here.
+//
+// Assertions are written as deltas (before vs. after) rather than absolute
+// totals wherever `graph_stats().edge_count` is involved, because that counter
+// is the WHOLE-graph relationship count and these tests do not control what, if
+// anything, entity-level ingest already placed in the graph.
 
 #[test]
 fn test_co_retrieval_strengthens_association() {
@@ -250,16 +298,29 @@ fn test_co_retrieval_strengthens_association() {
         )
         .unwrap();
 
-    // Reinforce both together as helpful
+    // Reinforce both together as helpful. These two memories have no
+    // pre-existing memory-to-memory edge, so under the shipped strengthen-only
+    // default there is nothing to strengthen: the reinforcement is a no-op at
+    // the association layer. See the module note above.
+    let edges_before = memory.graph_stats().edge_count;
     let ids = vec![id1, id2];
     let stats = memory
         .reinforce_recall(&ids, RetrievalOutcome::Helpful)
         .unwrap();
+    let edges_after = memory.graph_stats().edge_count;
 
-    assert!(
-        stats.associations_strengthened > 0,
-        "Should strengthen association between co-retrieved memories"
+    assert_eq!(
+        stats.associations_strengthened, 0,
+        "strengthen-only default (f6b730ee, 2026-07-10) reports zero strengthened \
+         associations for a co-retrieved pair with no prior edge between them"
     );
+    assert_eq!(
+        edges_after, edges_before,
+        "co-retrieval must mint zero NEW edges under the shipped default: \
+         before={edges_before}, after={edges_after}"
+    );
+    // The reinforcement itself still succeeded — it just did not wire anything.
+    assert_eq!(stats.memories_processed, 2);
 }
 
 #[test]
@@ -278,8 +339,13 @@ fn test_repeated_co_retrieval_increases_strength() {
         .unwrap();
 
     let ids = vec![id1, id2];
+    let edges_before = memory.graph_stats().edge_count;
 
-    // Reinforce multiple times
+    // Reinforce multiple times. Repetition is the point of this test: under the
+    // pre-2026-07-10 semantics the FIRST co-retrieval minted the edge and the
+    // second and third strengthened it, so all three reported > 0. Under the
+    // shipped strengthen-only default no edge is ever minted, so repetition
+    // never bootstraps one — every pass stays at zero. See the module note.
     let stats1 = memory
         .reinforce_recall(&ids, RetrievalOutcome::Helpful)
         .unwrap();
@@ -290,10 +356,21 @@ fn test_repeated_co_retrieval_increases_strength() {
         .reinforce_recall(&ids, RetrievalOutcome::Helpful)
         .unwrap();
 
-    // All should strengthen associations
-    assert!(stats1.associations_strengthened > 0);
-    assert!(stats2.associations_strengthened > 0);
-    assert!(stats3.associations_strengthened > 0);
+    assert_eq!(
+        (
+            stats1.associations_strengthened,
+            stats2.associations_strengthened,
+            stats3.associations_strengthened
+        ),
+        (0, 0, 0),
+        "repeated co-retrieval must not bootstrap a memory-to-memory edge under \
+         the shipped strengthen-only default"
+    );
+    assert_eq!(
+        memory.graph_stats().edge_count,
+        edges_before,
+        "three co-retrieval passes must still mint zero NEW edges"
+    );
 }
 
 #[test]
@@ -332,17 +409,28 @@ fn test_many_co_retrieved_associations() {
         ids.push(id);
     }
 
-    // Reinforce all together
+    // Reinforce all together. Before 2026-07-10 this minted C(10,2) = 45
+    // all-pairs CoRetrieved edges (under the MAX_COACTIVATION_SIZE=20 cap,
+    // which only starts truncating above 20 inputs). Under the shipped
+    // strengthen-only default none of the 45 pairs has a prior edge, so the
+    // count is zero and the O(n²) cap is no longer observable from here — the
+    // cap itself is exercised by the unit tests named in the module note.
+    let edges_before = memory.graph_stats().edge_count;
     let stats = memory
         .reinforce_recall(&ids, RetrievalOutcome::Helpful)
         .unwrap();
 
-    // Should have many associations (n*(n-1)/2 for n=10 = 45)
-    // But capped at 20 due to MAX_COACTIVATION_SIZE
-    assert!(
-        stats.associations_strengthened > 0,
-        "Should strengthen associations"
+    assert_eq!(
+        stats.associations_strengthened, 0,
+        "10 co-retrieved memories with no prior edges between them strengthen \
+         nothing under the shipped strengthen-only default"
     );
+    assert_eq!(
+        memory.graph_stats().edge_count,
+        edges_before,
+        "bulk co-retrieval must mint zero NEW edges under the shipped default"
+    );
+    assert_eq!(stats.memories_processed, 10);
 }
 
 // =============================================================================
@@ -748,6 +836,7 @@ fn test_hebbian_graph_persists_across_restart() {
 
     let id1;
     let id2;
+    let edge_count_before_restart;
 
     // Phase 1: Create memories and form associations
     {
@@ -760,7 +849,21 @@ fn test_hebbian_graph_persists_across_restart() {
             .remember(create_experience("Hebbian persistence test memory B"), None)
             .unwrap();
 
-        // Strengthen association by co-retrieval
+        // Co-retrieve repeatedly. Under the shipped strengthen-only default
+        // (see module note) this forms no memory-to-memory edges, so this test
+        // can no longer reach the graph-durability question through
+        // `reinforce_recall`. That question has NOT been dropped: it is held by
+        // src/graph_memory.rs::coactivation_edges_survive_graph_reopen, which
+        // seeds edges through `record_memory_coactivation_impl(&ids, false)`
+        // and asserts they (and the `mem_edge:` pair index) survive a reopen of
+        // the same store. What remains testable here is that a MemorySystem
+        // restart is clean and that whatever the graph does hold survives it.
+        //
+        // Compared as a DELTA against the post-ingest snapshot, never as an
+        // absolute zero: `edge_count` is the whole-graph relationship count and
+        // this test does not control what entity-level ingest may have put in
+        // the graph for these two memories.
+        let edges_after_ingest = memory.graph_stats().edge_count;
         let ids = vec![id1.clone(), id2.clone()];
         for _ in 0..5 {
             memory
@@ -769,32 +872,34 @@ fn test_hebbian_graph_persists_across_restart() {
         }
 
         // Get graph stats before drop
-        let stats = memory.graph_stats();
-        assert!(
-            stats.edge_count > 0,
-            "Should have formed edges: {}",
-            stats.edge_count
+        edge_count_before_restart = memory.graph_stats().edge_count;
+        assert_eq!(
+            edge_count_before_restart, edges_after_ingest,
+            "five co-retrieval passes must form zero NEW memory-to-memory edges \
+             under the shipped strengthen-only default: before={}, after={}",
+            edges_after_ingest, edge_count_before_restart
         );
     }
     // System dropped - simulates restart
 
-    // Phase 2: Verify graph persisted
+    // Phase 2: Verify persistence across the restart
     {
         let memory = create_system_with_graph(config);
 
-        // Verify memories exist
+        // Verify memories exist — the non-vacuous half of this test
         let mem1 = memory.get_memory(&id1).expect("Memory 1 should exist");
         let mem2 = memory.get_memory(&id2).expect("Memory 2 should exist");
         assert!(mem1.experience.content.contains("memory A"));
         assert!(mem2.experience.content.contains("memory B"));
 
-        // Verify graph stats
+        // The graph reopens with exactly the edge population it was closed
+        // with: the restart must neither drop edges nor invent memory-to-memory
+        // edges that co-retrieval never formed.
         let stats = memory.graph_stats();
-        // Memory coactivation creates edges between memory UUIDs (not entity nodes)
-        assert!(
-            stats.edge_count > 0,
-            "Edges should persist after restart: {}",
-            stats.edge_count
+        assert_eq!(
+            stats.edge_count, edge_count_before_restart,
+            "restart must preserve the edge count exactly: before={}, after={}",
+            edge_count_before_restart, stats.edge_count
         );
     }
 }
@@ -819,7 +924,20 @@ fn test_hebbian_edge_strength_persists() {
             .remember(create_experience("Edge strength test B"), None)
             .unwrap();
 
-        // Strengthen many times to increase edge strength
+        // Co-retrieve many times. Under the shipped strengthen-only default
+        // (see module note) no memory-to-memory edge is minted, so co-retrieval
+        // accumulates no edge strength at all — `avg_strength` is unmoved by the
+        // ten passes. The Hebbian strength-accumulation-and-persistence question
+        // is held by
+        // src/graph_memory.rs::coactivation_edge_strength_survives_graph_reopen,
+        // which seeds an edge, strengthens it 9 more times through the DEFAULT
+        // gate, and asserts the raised strength and activation_count come back
+        // after a reopen.
+        //
+        // Compared against the post-ingest snapshot rather than against an
+        // absolute 0.0, since this test does not control what entity-level
+        // ingest may have put in the graph.
+        let stats_after_ingest = memory.graph_stats();
         let ids = vec![id1.clone(), id2.clone()];
         for _ in 0..10 {
             memory
@@ -829,16 +947,36 @@ fn test_hebbian_edge_strength_persists() {
 
         let stats = memory.graph_stats();
         avg_strength_before = stats.avg_strength;
+        assert_eq!(
+            stats.edge_count, stats_after_ingest.edge_count,
+            "no NEW memory-to-memory edge is minted under the shipped default: \
+             before={}, after={}",
+            stats_after_ingest.edge_count, stats.edge_count
+        );
+        assert_eq!(
+            avg_strength_before, stats_after_ingest.avg_strength,
+            "ten co-retrieval passes must not move avg_strength when nothing \
+             was wired: before={}, after={}",
+            stats_after_ingest.avg_strength, avg_strength_before
+        );
+        // src/memory/mod.rs:8095 special-cases the empty relationship set to
+        // (0.0, 0) instead of dividing 0/0 — pin that the summary is a real
+        // number, never NaN, which is what makes it safe to read while the
+        // coactivation layer is inert.
         assert!(
-            avg_strength_before > 0.5,
-            "Edge strength should be high after reinforcement: {}",
-            avg_strength_before
+            avg_strength_before.is_finite(),
+            "avg_strength must never be NaN/inf: {avg_strength_before}"
         );
     }
 
-    // Phase 2: Verify strength persisted
+    // Phase 2: Verify the reported strength survives the restart unchanged
     {
         let memory = create_system_with_graph(config);
+
+        // Memories themselves must persist — the non-vacuous half of this test.
+        let mem1 = memory.get_memory(&id1).expect("Memory 1 should exist");
+        assert!(mem1.experience.content.contains("Edge strength test A"));
+        assert!(memory.get_memory(&id2).is_ok(), "Memory 2 should exist");
 
         let stats = memory.graph_stats();
         let avg_strength_after = stats.avg_strength;
@@ -883,16 +1021,20 @@ fn test_coactivation_during_retrieve_forms_edges() {
     };
     let results = memory.recall(&query).unwrap();
 
-    // If both memories were returned, edges should form
+    // The recall path runs its own Hebbian coactivation on the competition
+    // winners (src/memory/mod.rs:5207) via the same
+    // `record_memory_coactivation` entry point as `reinforce_recall`, so it is
+    // subject to the same strengthen-only default: co-retrieval through
+    // `recall()` also mints nothing. See the module note.
     let both_returned = results.iter().any(|m| m.id == id1) && results.iter().any(|m| m.id == id2);
 
     if both_returned {
         let stats_after = memory.graph_stats();
-        assert!(
-            stats_after.edge_count > edges_before,
-            "Edges should form after co-retrieval: {} > {}",
-            stats_after.edge_count,
-            edges_before
+        assert_eq!(
+            stats_after.edge_count, edges_before,
+            "auto-coactivation on the recall path must mint zero NEW edges \
+             under the shipped strengthen-only default: before={}, after={}",
+            edges_before, stats_after.edge_count
         );
     }
 }
@@ -904,6 +1046,7 @@ fn test_ltp_persists_across_restart() {
 
     let id1;
     let id2;
+    let stats_before_restart;
 
     // Phase 1: Create LTP by many co-activations
     {
@@ -916,7 +1059,18 @@ fn test_ltp_persists_across_restart() {
             .remember(create_experience("LTP persistence test B"), None)
             .unwrap();
 
-        // Reinforce many times to trigger LTP (threshold typically 5-10)
+        // Co-retrieve many times. LTP is a property of an EDGE
+        // (`RelationshipEdge::strengthen` -> `detect_ltp_status`), and under the
+        // shipped strengthen-only default (see module note) no memory-to-memory
+        // edge exists to potentiate, so `potentiated_count` stays 0. The
+        // LTP-survives-restart question is held by
+        // src/graph_memory.rs::coactivation_ltp_status_survives_graph_reopen,
+        // which drives 15 co-activations onto a seeded edge and asserts the
+        // resulting LTP status and strength come back after a reopen.
+        //
+        // Compared as a DELTA against the post-ingest snapshot, not against an
+        // absolute zero — this test does not control entity-level ingest.
+        let potentiated_after_ingest = memory.graph_stats().potentiated_count;
         let ids = vec![id1.clone(), id2.clone()];
         for _ in 0..15 {
             memory
@@ -924,22 +1078,33 @@ fn test_ltp_persists_across_restart() {
                 .unwrap();
         }
 
-        let stats = memory.graph_stats();
-        assert!(
-            stats.potentiated_count > 0 || stats.avg_strength > 0.8,
-            "Should have potentiated edges or high strength after many reinforcements"
+        stats_before_restart = memory.graph_stats();
+        assert_eq!(
+            stats_before_restart.potentiated_count, potentiated_after_ingest,
+            "15 co-retrieval passes potentiate nothing NEW under the shipped \
+             strengthen-only default — there is no memory-to-memory edge to \
+             potentiate: before={}, after={}",
+            potentiated_after_ingest, stats_before_restart.potentiated_count
         );
     }
 
-    // Phase 2: Verify LTP persisted
+    // Phase 2: Verify the restart preserves graph state exactly
     {
         let memory = create_system_with_graph(config);
 
+        // Memories themselves must persist — the non-vacuous half of this test.
+        assert!(memory.get_memory(&id1).is_ok(), "Memory 1 should exist");
+        assert!(memory.get_memory(&id2).is_ok(), "Memory 2 should exist");
+
         let stats = memory.graph_stats();
-        // Either potentiated edges persist, or strength is high
-        assert!(
-            stats.potentiated_count > 0 || stats.avg_strength > 0.7,
-            "LTP should persist: potentiated={}, avg_strength={}",
+        assert_eq!(
+            (stats.edge_count, stats.potentiated_count),
+            (
+                stats_before_restart.edge_count,
+                stats_before_restart.potentiated_count
+            ),
+            "restart must preserve edge/potentiated counts exactly and invent \
+             neither: potentiated={}, avg_strength={}",
             stats.potentiated_count,
             stats.avg_strength
         );
@@ -962,25 +1127,57 @@ fn test_graph_stats_accuracy() {
         ids.push(id);
     }
 
-    // Form associations between all pairs
+    // Co-retrieve all 5. Before 2026-07-10 this minted C(5,2) = 10 edges, which
+    // this test used to assert (`edge_count >= 5`, `avg_strength > 0.0`). Under
+    // the shipped strengthen-only default nothing is minted (see module note),
+    // so what is checked here is that `graph_stats()` reports the EMPTY graph
+    // accurately and consistently rather than producing a stale or NaN summary
+    // — that accuracy is this test's actual subject.
+    let stats_before = memory.graph_stats();
     memory
         .reinforce_recall(&ids, RetrievalOutcome::Helpful)
         .unwrap();
 
     let stats = memory.graph_stats();
 
-    // Memory coactivation creates edges between memory UUIDs (not entity nodes),
-    // so node_count may be 0. Edge count = C(5,2) = 10 pairs.
-    assert!(
-        stats.edge_count >= 5,
-        "Should have multiple edges from coactivation: {}",
-        stats.edge_count
+    assert_eq!(
+        stats.edge_count, stats_before.edge_count,
+        "co-retrieving 5 memories with no prior edges must mint zero NEW edges: \
+         before={}, after={}",
+        stats_before.edge_count, stats.edge_count
     );
-
-    // Strength should be positive
+    // src/memory/mod.rs:8095 special-cases the empty relationship set to
+    // (0.0, 0) instead of dividing 0/0. That is the accuracy contract that
+    // still bites while the coactivation layer is inert: the summary must be a
+    // real number, and must report exactly (0.0, 0) when there is nothing to
+    // summarize.
     assert!(
-        stats.avg_strength > 0.0,
-        "Average edge strength should be positive: {}",
+        stats.avg_strength.is_finite(),
+        "avg_strength must never be NaN/inf: {}",
         stats.avg_strength
     );
+    if stats.edge_count == 0 {
+        assert_eq!(
+            stats.avg_strength, 0.0,
+            "avg_strength must be exactly 0.0 for an empty relationship set: {}",
+            stats.avg_strength
+        );
+        assert_eq!(
+            stats.potentiated_count, 0,
+            "potentiated_count must be 0 for an empty relationship set: {}",
+            stats.potentiated_count
+        );
+    }
+    assert!(
+        stats.potentiated_count <= stats.edge_count,
+        "potentiated_count ({}) can never exceed edge_count ({})",
+        stats.potentiated_count,
+        stats.edge_count
+    );
+    // The memories themselves were still stored — the graph being empty is a
+    // property of the coactivation layer, not of ingest.
+    assert_eq!(ids.len(), 5);
+    for id in &ids {
+        assert!(memory.get_memory(id).is_ok(), "memory {id:?} should exist");
+    }
 }

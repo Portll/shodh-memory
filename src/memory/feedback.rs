@@ -213,6 +213,47 @@ pub enum SignalTrigger {
         /// Sum of raw (undiscounted) signal values before gamma scaling
         raw_total: f32,
     },
+
+    /// Explicit outcome feedback asserted by a caller, not inferred from
+    /// conversation: `POST /api/reinforce`, the seat harness confirming a
+    /// tool-recalled memory, or an eval harness scoring gold.
+    ///
+    /// Every other variant records an *inference* the system drew about
+    /// usefulness. This one records an *assertion* someone made. Keeping it
+    /// distinct is not cosmetic: it names `reinforce_recall` as the writer, so
+    /// the momentum history says which path produced each signal — which is how
+    /// the double-write regression this variant was introduced alongside is
+    /// pinned by test (see `MomentumPolicy`).
+    ExplicitOutcome {
+        /// `"helpful"` or `"misleading"`. Neutral outcomes write no signal at
+        /// all, so they never reach this variant.
+        outcome: String,
+    },
+}
+
+/// Whether a reinforcement call should write to the feedback-momentum EMA.
+///
+/// `reinforce_recall` is reached two different ways, and only one of them owns
+/// the momentum write:
+///
+/// - **Directly** (`POST /api/reinforce`, eval harnesses, tool-recall
+///   confirmation) — nothing else has touched momentum for these memories, so
+///   the call must apply it: [`MomentumPolicy::Apply`].
+/// - **As the second stage of the implicit pipeline** (`proactive_context`) —
+///   which has *already* applied a graded, confidence-weighted signal per
+///   memory before classifying them into helpful/misleading buckets. Applying
+///   again here would be a second hit for one piece of evidence:
+///   [`MomentumPolicy::Skip`].
+///
+/// The policy is an explicit argument rather than an inferred condition because
+/// the caller is the only thing that knows whether momentum was already
+/// applied — and getting it wrong is silent, not loud.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MomentumPolicy {
+    /// Write the outcome into the momentum EMA. The default for direct callers.
+    Apply,
+    /// Leave momentum alone — the caller already applied its own signal.
+    Skip,
 }
 
 /// A tool or actuator action performed between feedback cycles.
@@ -1805,6 +1846,79 @@ impl FeedbackStore {
     /// Mark a memory as dirty (needs persistence)
     pub fn mark_dirty(&mut self, memory_id: &MemoryId) {
         self.dirty.insert(memory_id.clone());
+    }
+
+    /// Persist momentum entries to the feedback CF immediately, in one batch.
+    ///
+    /// `mark_dirty` only queues a write; the queue is drained by
+    /// [`flush`](Self::flush), whose only callers are on the `proactive_context`
+    /// side. A deployment driven purely through `POST /api/reinforce` — the seat
+    /// harness — never calls `flush`, so momentum earned by explicit
+    /// reinforcement lived in the in-memory cache and died with the process.
+    /// This is the durability half of connecting explicit reinforcement to
+    /// momentum.
+    ///
+    /// Writes through RocksDB's WAL without forcing a column-family flush, the
+    /// same shape as [`set_pending`](Self::set_pending). `flush` calls
+    /// `flush_cf_opt` with `set_wait(true)`, which would stall the per-query
+    /// `reinforce_recall` loops in the eval harnesses; a WAL-backed batch write
+    /// survives process restart without that cost.
+    ///
+    /// Falls back to marking entries dirty if the write fails, so a later
+    /// `flush` retries rather than dropping the signal.
+    pub fn persist_momentum(&mut self, memory_ids: &[MemoryId]) {
+        if memory_ids.is_empty() {
+            return;
+        }
+
+        // Encode first so the borrow of `self.momentum` ends before we need
+        // `&mut self.dirty` on the failure paths below.
+        let mut batch = WriteBatch::default();
+        let mut queued = 0usize;
+        let mut failed: Vec<MemoryId> = Vec::new();
+        {
+            let Some(cf) = self.feedback_cf() else {
+                // No persistent backing (in-memory store) — nothing to write.
+                return;
+            };
+            for memory_id in memory_ids {
+                let Some(momentum) = self.momentum.get(memory_id) else {
+                    continue; // No momentum entry for this memory.
+                };
+                match serde_json::to_vec(momentum) {
+                    Ok(value) => {
+                        batch.put_cf(cf, format!("momentum:{}", memory_id.0).as_bytes(), &value);
+                        queued += 1;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            memory_id = %memory_id.0,
+                            error = %e,
+                            "Failed to serialize momentum — requeued for next flush"
+                        );
+                        failed.push(memory_id.clone());
+                    }
+                }
+            }
+        }
+
+        if queued > 0 {
+            // `feedback_cf()` returning Some implies `self.db` is Some.
+            if let Some(db) = self.db.as_ref() {
+                if let Err(e) = db.write(batch) {
+                    tracing::warn!(
+                        count = queued,
+                        error = %e,
+                        "Failed to persist momentum batch — requeued for next flush"
+                    );
+                    failed.extend(memory_ids.iter().cloned());
+                }
+            }
+        }
+
+        for memory_id in failed {
+            self.dirty.insert(memory_id);
+        }
     }
 
     /// Set pending feedback for a user (also persists to disk)

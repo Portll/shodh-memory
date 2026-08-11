@@ -30,9 +30,22 @@ set -e
 API_URL="${SHODH_API_URL:-http://127.0.0.1:3030}"
 USER_ID="${SHODH_USER_ID:-claude-code}"
 
-# API Key - required (no hardcoded fallback for security)
+# API Key - env, else the shared key file persisted by the MCP server
+# (<data-root>/.api-key, see mcp-server/api-key-store.ts). No hardcoded fallback.
 if [ -z "$SHODH_API_KEY" ]; then
-    echo "ERROR: SHODH_API_KEY environment variable not set" >&2
+    for KEY_FILE in \
+        ${SHODH_MEMORY_PATH:+"$SHODH_MEMORY_PATH/.api-key"} \
+        "${XDG_DATA_HOME:-$HOME/.local/share}/shodh-memory/.api-key" \
+        "$HOME/Library/Application Support/shodh-memory/.api-key" \
+        ${APPDATA:+"$APPDATA/shodh-memory/.api-key"}; do
+        if [ -f "$KEY_FILE" ]; then
+            SHODH_API_KEY=$(tr -d '[:space:]' < "$KEY_FILE")
+            if [ -n "$SHODH_API_KEY" ]; then break; fi
+        fi
+    done
+fi
+if [ -z "$SHODH_API_KEY" ]; then
+    echo "ERROR: SHODH_API_KEY not set and no shared key file found (connect the shodh-memory MCP server once to create it)" >&2
     exit 1
 fi
 API_KEY="$SHODH_API_KEY"

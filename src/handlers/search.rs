@@ -250,9 +250,30 @@ pub async fn robotics_search(
         }
     };
 
+    // Validated on the same terms as the recall path (`recall::build_geo_filter`).
+    // This route previously built the filter from a bare `match` with no
+    // validation at all, so a NaN latitude or a negative radius reached
+    // `GeoFilter::new` and produced a haversine comparison against NaN — which
+    // is false for every memory, i.e. an empty result set reported as success.
+    //
+    // A partial triple is now a 400 rather than a silent `None`. Dropping it
+    // silently meant a caller who asked to filter by location got the whole
+    // unfiltered corpus back and no indication the constraint was ignored. The
+    // existing spatial-mode guard below only caught that for `mode=spatial`;
+    // every other mode composed with geo the same way recall does and failed
+    // open.
     let geo_filter = match (req.lat, req.lon, req.radius_meters) {
-        (Some(lat), Some(lon), Some(radius)) => Some(memory::GeoFilter::new(lat, lon, radius)),
-        _ => None,
+        (Some(lat), Some(lon), Some(radius)) => {
+            validation::validate_geo_filter(lat, lon, radius).map_validation_err("geo_filter")?;
+            Some(memory::GeoFilter::new(lat, lon, radius))
+        }
+        (None, None, None) => None,
+        _ => {
+            return Err(AppError::InvalidInput {
+                field: "geo_filter".to_string(),
+                reason: "lat, lon, and radius_meters must all be provided together".to_string(),
+            })
+        }
     };
 
     let reward_range = match (req.min_reward, req.max_reward) {

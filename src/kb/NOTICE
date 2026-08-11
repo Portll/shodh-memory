@@ -1,0 +1,47 @@
+Wikidata entity slice
+=====================
+
+`wikidata-slice.tsv` in this directory is derived from Wikidata.
+
+    Source:  https://www.wikidata.org
+    Export:  https://query.wikidata.org/sparql (Wikidata Query Service)
+    Licence: Creative Commons CC0 1.0 Universal (public domain dedication)
+             https://creativecommons.org/publicdomain/zero/1.0/
+
+Wikidata's statements, labels, aliases and sitelink counts are released under
+CC0, which places them in the public domain and imposes no attribution
+requirement. This notice is provenance, not a licence obligation.
+
+The slice is a mechanical subset, produced by `scripts/build_wikidata_kb.py`:
+
+  - only entities whose `instance of` (P31) is one of an explicit list of
+    concrete organisation and software/product classes are retained (the list
+    is in the script; subclass recursion is deliberately not used);
+  - only entities with at least 12 Wikipedia sitelinks are retained, which is
+    both a prominence floor and the size control;
+  - the retained columns are the QID, a coarse type (`organization` or
+    `product`), the sitelink count, the English label, and English surface
+    forms drawn from `also known as` (skos:altLabel), `official name` (P1448),
+    `short name` (P1813) and `nickname` (P1449);
+  - descriptions are NOT retained. This is deliberate: it keeps the asset small
+    and avoids pulling in Wikipedia-derived text, which is CC BY-SA rather than
+    CC0;
+  - surface forms are cleaned mechanically — a trailing parenthetical
+    disambiguator is dropped ("... Corporation (Armonk, NY)" keeps the head),
+    as are bare domain names ("ibm.com"), short digit-bearing junk ("18M") and
+    forms under two characters; at most 12 aliases per entity are kept;
+  - surface forms built entirely from generic organisational vocabulary are
+    dropped ("International company", "team"), and an entity whose own label is
+    such a description is dropped outright — these are descriptions rather than
+    names, and matching on them produces confident nonsense;
+  - rows are sorted by descending sitelink count then QID, for a stable,
+    diffable asset.
+
+No other transformation is applied. QIDs, labels, aliases and sitelink counts
+are the Wikidata values.
+
+Nothing in the slice is used at runtime beyond exact surface matching and the
+sitelink count as a prominence prior; no network call is made at any point.
+
+Wikimedia and Wikidata are not affiliated with this project and do not endorse
+it.

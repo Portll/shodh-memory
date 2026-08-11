@@ -8,26 +8,29 @@
 //! - Project grouping
 //! - Recurring tasks with automatic next instance creation
 //! - Due date tracking with overdue detection
-//! - Vector embeddings for semantic search (MiniLM-L6-v2)
-//! - Vamana HNSW index for fast similarity search
+//! - Semantic search via exact cosine scan over embeddings persisted on each
+//!   todo (MiniLM-L6-v2, 384-dim), plus a lexical substring path that guarantees
+//!   exact word matches even for todos without embeddings.
+//! - Structured dependencies (`blocked_by`) with cycle rejection
+//! - Bidirectional memory links (`related_memory_ids`)
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use chrono::Utc;
-use parking_lot::RwLock;
 use rocksdb::{ColumnFamily, ColumnFamilyDescriptor, Options, WriteBatch, DB};
-use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use uuid::Uuid;
 
 use super::types::{
-    Project, ProjectId, ProjectStatus, Todo, TodoComment, TodoCommentId, TodoCommentType, TodoId,
-    TodoStatus,
+    MemoryId, Project, ProjectId, ProjectStatus, Todo, TodoComment, TodoCommentId, TodoCommentType,
+    TodoId, TodoStatus,
 };
-use crate::vector_db::{VamanaConfig, VamanaIndex};
 
-/// Embedding dimension (MiniLM-L6-v2)
-const EMBEDDING_DIM: usize = 384;
+/// Minimum cosine similarity for a todo to count as a semantic match.
+/// Below this, results are noise: an exact scan with no floor would return
+/// `limit` todos for ANY query, which misleads callers as badly as returning
+/// none. Lexical substring matches are exempt from this floor.
+pub const MIN_SEMANTIC_SIMILARITY: f32 = 0.3;
 
 const CF_TODOS: &str = "todos";
 const CF_PROJECTS: &str = "projects";
@@ -78,12 +81,13 @@ fn migrate_due_key_padding(db: &DB, index_cf: &ColumnFamily) -> Result<usize> {
 pub struct TodoStore {
     /// Shared RocksDB instance with column families for todos, projects, and indices
     db: Arc<DB>,
-    /// Vector index for semantic search (per-user indices)
-    vector_indices: RwLock<HashMap<String, VamanaIndex>>,
-    /// Storage path for persisting vector indices
+    /// Storage path (used for legacy vector-index cleanup during user purge)
     storage_path: std::path::PathBuf,
     /// Mutex for atomic sequence number allocation (prevents TOCTOU race)
     seq_mutex: parking_lot::Mutex<()>,
+    /// Serializes read-modify-write mutations that can run concurrently with
+    /// user-initiated updates (e.g. async memory linking after remember()).
+    link_mutex: parking_lot::Mutex<()>,
 }
 
 impl TodoStore {
@@ -132,9 +136,9 @@ impl TodoStore {
 
         Ok(Self {
             db,
-            vector_indices: RwLock::new(HashMap::new()),
             storage_path: todos_path,
             seq_mutex: parking_lot::Mutex::new(()),
+            link_mutex: parking_lot::Mutex::new(()),
         })
     }
 
@@ -192,142 +196,132 @@ impl TodoStore {
         Ok(())
     }
 
-    /// Get or create a Vamana vector index for a user
-    fn get_or_create_index(&self, user_id: &str) -> Result<()> {
-        let mut indices = self.vector_indices.write();
-        if !indices.contains_key(user_id) {
-            let config = VamanaConfig {
-                dimension: EMBEDDING_DIM,
-                max_degree: 32,
-                search_list_size: 75,
-                alpha: 1.2,
-                ..Default::default()
-            };
-            let index = VamanaIndex::new(config)?;
-            indices.insert(user_id.to_string(), index);
+    /// Cosine similarity between two vectors. Returns None on dimension
+    /// mismatch or zero-norm inputs (treated as "no semantic signal").
+    fn cosine_similarity(a: &[f32], b: &[f32]) -> Option<f32> {
+        if a.len() != b.len() || a.is_empty() {
+            return None;
         }
-        Ok(())
+        let mut dot = 0.0f32;
+        let mut norm_a = 0.0f32;
+        let mut norm_b = 0.0f32;
+        for (x, y) in a.iter().zip(b.iter()) {
+            dot += x * y;
+            norm_a += x * x;
+            norm_b += y * y;
+        }
+        if norm_a <= f32::EPSILON || norm_b <= f32::EPSILON {
+            return None;
+        }
+        Some(dot / (norm_a.sqrt() * norm_b.sqrt()))
     }
 
-    /// Add or update a todo in the vector index
-    /// Returns the vector ID assigned to this todo
-    pub fn index_todo_embedding(
-        &self,
-        user_id: &str,
-        _todo_id: &TodoId,
-        embedding: &[f32],
-    ) -> Result<u32> {
-        self.get_or_create_index(user_id)?;
-
-        let mut indices = self.vector_indices.write();
-        if let Some(index) = indices.get_mut(user_id) {
-            // Add vector and get assigned ID
-            let vector_id = index.add_vector(embedding.to_vec())?;
-            return Ok(vector_id);
-        }
-        anyhow::bail!("Failed to get vector index for user: {}", user_id)
-    }
-
-    /// Search for similar todos by embedding
+    /// Search for similar todos by embedding.
+    ///
+    /// Exact cosine scan over the embeddings persisted on each todo record.
+    /// This deliberately replaces the previous in-memory Vamana side-index,
+    /// which was never persisted in production (its save path had no callers),
+    /// so every restart silently emptied it and semantic todo search returned
+    /// nothing. The embedding on the todo record is the single source of truth;
+    /// an exact scan over it cannot go stale. Todo counts are human-scale, and
+    /// other hot paths (`find_todo_by_prefix`) already scan all of a user's
+    /// todos, so this matches the store's existing performance profile.
+    ///
+    /// Results are clamped to [0, 1] and filtered by [`MIN_SEMANTIC_SIMILARITY`].
     pub fn search_similar(
         &self,
         user_id: &str,
         query_embedding: &[f32],
         limit: usize,
     ) -> Result<Vec<(Todo, f32)>> {
-        let indices = self.vector_indices.read();
-        if let Some(index) = indices.get(user_id) {
-            let results = index.search(query_embedding, limit)?;
-
-            // Find todos by vector_id (stored in todo_index CF)
-            let mut todo_results = Vec::new();
-            for (vector_id, score) in results {
-                if let Some(todo) = self.get_todo_by_vector_id(user_id, vector_id)? {
-                    todo_results.push((todo, score));
+        let todos = self.list_todos_for_user(user_id, None)?;
+        let mut scored: Vec<(Todo, f32)> = todos
+            .into_iter()
+            .filter_map(|todo| {
+                let emb = todo.embedding.as_deref()?;
+                let sim = Self::cosine_similarity(query_embedding, emb)?;
+                let sim = sim.clamp(0.0, 1.0);
+                if sim >= MIN_SEMANTIC_SIMILARITY {
+                    Some((todo, sim))
+                } else {
+                    None
                 }
-            }
-            Ok(todo_results)
-        } else {
-            Ok(Vec::new())
-        }
+            })
+            .collect();
+
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(limit);
+        Ok(scored)
     }
 
-    /// Get a todo by its vector index ID (stored in todo_index CF)
-    fn get_todo_by_vector_id(&self, user_id: &str, vector_id: u32) -> Result<Option<Todo>> {
-        let key = format!("vector_id:{}:{}", user_id, vector_id);
-        if let Some(data) = self.db.get_cf(self.todo_index_cf(), key.as_bytes())? {
-            let todo_id_str = String::from_utf8_lossy(&data);
-            if let Ok(uuid) = Uuid::parse_str(&todo_id_str) {
-                return self.get_todo(user_id, &TodoId(uuid));
-            }
-        }
-        Ok(None)
-    }
-
-    /// Store the mapping from vector_id to todo_id (and reverse)
-    pub fn store_vector_id_mapping(
+    /// Hybrid todo search: semantic (cosine over persisted embeddings) unioned
+    /// with lexical substring matching over content, notes, and tags.
+    ///
+    /// The lexical path guarantees that exact word matches ALWAYS surface —
+    /// including todos that have no embedding (created while the embedding
+    /// model was unavailable) and queries whose embedding could not be
+    /// computed (`query_embedding = None`).
+    ///
+    /// Ordering: lexical matches first (a literal hit is the strongest signal
+    /// for a task lookup), then by semantic score descending.
+    pub fn search_todos(
         &self,
         user_id: &str,
-        vector_id: u32,
-        todo_id: &TodoId,
-    ) -> Result<()> {
-        let mut batch = WriteBatch::default();
-        let index_cf = self.todo_index_cf();
-
-        // Forward: vector_id → todo_id (for search result resolution)
-        let fwd_key = format!("vector_id:{}:{}", user_id, vector_id);
-        batch.put_cf(
-            index_cf,
-            fwd_key.as_bytes(),
-            todo_id.0.to_string().as_bytes(),
-        );
-
-        // Reverse: todo_id → vector_id (for cleanup on delete)
-        let rev_key = format!("todo_vector:{}:{}", user_id, todo_id.0);
-        batch.put_cf(index_cf, rev_key.as_bytes(), vector_id.to_le_bytes());
-
-        self.db.write(batch)?;
-        Ok(())
-    }
-
-    /// Save vector indices to disk
-    pub fn save_vector_indices(&self) -> Result<()> {
-        let indices = self.vector_indices.read();
-        for (user_id, index) in indices.iter() {
-            let index_path = self.storage_path.join("vectors").join(user_id);
-            std::fs::create_dir_all(&index_path)?;
-            index.save(&index_path)?;
+        query: &str,
+        query_embedding: Option<&[f32]>,
+        limit: usize,
+    ) -> Result<Vec<(Todo, f32)>> {
+        let query_lower = query.trim().to_lowercase();
+        if query_lower.is_empty() {
+            return Ok(Vec::new());
         }
-        Ok(())
-    }
+        let query_tokens: Vec<&str> = query_lower.split_whitespace().collect();
 
-    /// Load vector indices from disk
-    pub fn load_vector_indices(&self) -> Result<()> {
-        let vectors_path = self.storage_path.join("vectors");
-        if !vectors_path.exists() {
-            return Ok(());
-        }
+        let todos = self.list_todos_for_user(user_id, None)?;
+        let mut results: Vec<(Todo, f32, bool)> = Vec::new();
 
-        let mut indices = self.vector_indices.write();
-        for entry in std::fs::read_dir(&vectors_path)? {
-            let entry = entry?;
-            if entry.file_type()?.is_dir() {
-                let user_id = entry.file_name().to_string_lossy().to_string();
-                let index_path = entry.path();
+        for todo in todos {
+            // Searchable text: content + notes + tags (mirrors what the
+            // embedding is computed from)
+            let haystack = format!(
+                "{} {} {}",
+                todo.content,
+                todo.notes.as_deref().unwrap_or(""),
+                todo.tags.join(" ")
+            )
+            .to_lowercase();
 
-                // Create a new index and load from disk
-                let config = VamanaConfig {
-                    dimension: EMBEDDING_DIM,
-                    ..Default::default()
-                };
-                let mut index = VamanaIndex::new(config)?;
-                if index.load(&index_path).is_ok() {
-                    indices.insert(user_id.clone(), index);
-                    tracing::debug!("Loaded todo vector index for user: {}", user_id);
-                }
+            // A lexical hit is either the full query as a substring, or every
+            // query word present somewhere (word-order independent).
+            let lexical_hit = haystack.contains(&query_lower)
+                || query_tokens.iter().all(|tok| haystack.contains(tok));
+
+            let semantic_score = query_embedding
+                .and_then(|q| {
+                    todo.embedding
+                        .as_deref()
+                        .and_then(|e| Self::cosine_similarity(q, e))
+                })
+                .map(|s| s.clamp(0.0, 1.0));
+
+            let semantic_hit = semantic_score.is_some_and(|s| s >= MIN_SEMANTIC_SIMILARITY);
+
+            if lexical_hit || semantic_hit {
+                results.push((todo, semantic_score.unwrap_or(0.0), lexical_hit));
             }
         }
-        Ok(())
+
+        // Lexical hits first, then semantic score descending
+        results.sort_by(|a, b| {
+            b.2.cmp(&a.2)
+                .then(b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal))
+        });
+        results.truncate(limit);
+
+        Ok(results
+            .into_iter()
+            .map(|(todo, score, _)| (todo, score))
+            .collect())
     }
 
     // =========================================================================
@@ -511,39 +505,22 @@ impl TodoStore {
             batch.delete_cf(index_cf, parent_key.as_bytes());
         }
 
-        // Clean up vector index mapping: look up vector_id from reverse mapping.
-        // We capture the vector_id BEFORE the batch write so we can mark_deleted AFTER
-        // the batch commits — this ensures the index only reflects committed deletes.
+        // Legacy hygiene: earlier versions kept a Vamana side-index with
+        // vector-id mappings in the index CF. Remove any leftover mapping keys
+        // for this todo so old stores stay clean. (Orphaned `vector_id:*` keys
+        // from crashes are harmless and are swept by user purge.)
         let rev_key = format!("todo_vector:{}:{}", todo.user_id, id_str);
-        let pending_vector_delete = if let Some(vid_bytes) =
-            self.db.get_cf(index_cf, rev_key.as_bytes())?
-        {
+        if let Some(vid_bytes) = self.db.get_cf(index_cf, rev_key.as_bytes())? {
             if vid_bytes.len() >= 4 {
                 let vector_id =
                     u32::from_le_bytes([vid_bytes[0], vid_bytes[1], vid_bytes[2], vid_bytes[3]]);
-
-                // Remove forward mapping in batch (will commit atomically)
                 let fwd_key = format!("vector_id:{}:{}", todo.user_id, vector_id);
                 batch.delete_cf(index_cf, fwd_key.as_bytes());
-                Some((todo.user_id.clone(), vector_id))
-            } else {
-                None
             }
-        } else {
-            None
-        };
-        // Remove reverse mapping in batch
+        }
         batch.delete_cf(index_cf, rev_key.as_bytes());
 
         self.db.write(batch)?;
-
-        // Mark deleted in Vamana index AFTER batch commit succeeds
-        if let Some((ref user_id, vector_id)) = pending_vector_delete {
-            let indices = self.vector_indices.read();
-            if let Some(index) = indices.get(user_id) {
-                index.mark_deleted(vector_id);
-            }
-        }
         Ok(())
     }
 
@@ -798,6 +775,130 @@ impl TodoStore {
         }
     }
 
+    // =========================================================================
+    // MEMORY LINKS ("why does this task exist")
+    // =========================================================================
+
+    /// Link a memory to a todo (idempotent). Serialized via `link_mutex` so the
+    /// async link-back after `remember()` cannot lose a concurrent update.
+    /// Returns true if the todo exists (whether or not the link was new).
+    pub fn add_related_memory(
+        &self,
+        user_id: &str,
+        todo_id: &TodoId,
+        memory_id: MemoryId,
+    ) -> Result<bool> {
+        let _lock = self.link_mutex.lock();
+        if let Some(mut todo) = self.get_todo(user_id, todo_id)? {
+            if !todo.has_related_memory(&memory_id) {
+                todo.add_related_memory(memory_id);
+                self.update_todo(&todo)?;
+            }
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    // =========================================================================
+    // STRUCTURED DEPENDENCIES (blocked_by)
+    // =========================================================================
+
+    /// Check whether setting `new_blockers` on `todo_id` would create a
+    /// dependency cycle. Walks the `blocked_by` graph from each proposed
+    /// blocker; if any chain reaches back to `todo_id`, the edge set is cyclic.
+    pub fn would_create_dependency_cycle(
+        &self,
+        user_id: &str,
+        todo_id: &TodoId,
+        new_blockers: &[TodoId],
+    ) -> Result<bool> {
+        use std::collections::{HashSet, VecDeque};
+
+        if new_blockers.iter().any(|b| b == todo_id) {
+            return Ok(true); // Self-dependency
+        }
+
+        let mut visited: HashSet<Uuid> = HashSet::new();
+        let mut queue: VecDeque<TodoId> = new_blockers.iter().cloned().collect();
+
+        while let Some(current) = queue.pop_front() {
+            if current == *todo_id {
+                return Ok(true);
+            }
+            if !visited.insert(current.0) {
+                continue;
+            }
+            if let Some(todo) = self.get_todo(user_id, &current)? {
+                for blocker in &todo.blocked_by {
+                    queue.push_back(blocker.clone());
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    /// Walk the full blocking chain for a todo: everything it transitively
+    /// waits on, in BFS order (direct blockers first). Cycle-safe.
+    pub fn blocking_chain(&self, user_id: &str, todo_id: &TodoId) -> Result<Vec<Todo>> {
+        use std::collections::{HashSet, VecDeque};
+
+        let mut visited: HashSet<Uuid> = HashSet::new();
+        visited.insert(todo_id.0);
+        let mut chain = Vec::new();
+        let mut queue: VecDeque<TodoId> = match self.get_todo(user_id, todo_id)? {
+            Some(t) => t.blocked_by.iter().cloned().collect(),
+            None => return Ok(Vec::new()),
+        };
+
+        while let Some(current) = queue.pop_front() {
+            if !visited.insert(current.0) {
+                continue;
+            }
+            if let Some(todo) = self.get_todo(user_id, &current)? {
+                for blocker in &todo.blocked_by {
+                    queue.push_back(blocker.clone());
+                }
+                chain.push(todo);
+            }
+        }
+        Ok(chain)
+    }
+
+    /// Todos that become unblocked by completing `completed_id`: they list it
+    /// in `blocked_by` and every OTHER blocker is already Done/Cancelled (or
+    /// deleted). Used to surface "you can now start X" on completion.
+    pub fn unblocked_by_completion(
+        &self,
+        user_id: &str,
+        completed_id: &TodoId,
+    ) -> Result<Vec<Todo>> {
+        let todos = self.list_todos_for_user(user_id, None)?;
+        let mut unblocked = Vec::new();
+
+        'outer: for todo in todos {
+            if todo.status == TodoStatus::Done || todo.status == TodoStatus::Cancelled {
+                continue;
+            }
+            if !todo.blocked_by.contains(completed_id) {
+                continue;
+            }
+            for blocker_id in &todo.blocked_by {
+                if blocker_id == completed_id {
+                    continue;
+                }
+                if let Some(blocker) = self.get_todo(user_id, blocker_id)? {
+                    if blocker.status != TodoStatus::Done && blocker.status != TodoStatus::Cancelled
+                    {
+                        continue 'outer; // Still blocked by something else
+                    }
+                }
+            }
+            unblocked.push(todo);
+        }
+        Ok(unblocked)
+    }
+
     /// Reorder a todo within its status group
     /// direction: "up" moves earlier in list (lower sort_order), "down" moves later
     pub fn reorder_todo(
@@ -839,7 +940,10 @@ impl TodoStore {
                 }
                 pos + 1
             }
-            _ => return Ok(Some(todo)), // Invalid direction
+            other => bail!(
+                "Invalid reorder direction '{}'. Valid values: up, down",
+                other
+            ),
         };
 
         // Swap sort_order values with adjacent todo
@@ -1333,17 +1437,28 @@ impl TodoStore {
         }
     }
 
-    /// Purge a user's vector index from memory (used during GDPR user deletion)
+    /// Purge a user's legacy on-disk vector index files (GDPR user deletion).
+    /// Embeddings now live only on the todo records themselves, which the
+    /// shared-DB purge deletes; this removes index files written by earlier
+    /// versions that kept a separate Vamana side-index per user.
     pub fn purge_user_vectors(&self, user_id: &str) {
-        let mut indices = self.vector_indices.write();
-        indices.remove(user_id);
+        let legacy_dir = self.storage_path.join("vectors").join(user_id);
+        if legacy_dir.exists() {
+            if let Err(e) = std::fs::remove_dir_all(&legacy_dir) {
+                tracing::warn!(
+                    user_id = %user_id,
+                    error = %e,
+                    "Failed to remove legacy todo vector index dir during purge"
+                );
+            }
+        }
     }
 
     // =========================================================================
     // STATS
     // =========================================================================
 
-    /// Flush all RocksDB column families and save vector indices to disk (critical for graceful shutdown)
+    /// Flush all RocksDB column families to disk (critical for graceful shutdown)
     pub fn flush(&self) -> Result<()> {
         use rocksdb::FlushOptions;
         let mut flush_opts = FlushOptions::default();
@@ -1356,10 +1471,6 @@ impl TodoStore {
                     .map_err(|e| anyhow::anyhow!("Failed to flush {cf_name}: {e}"))?;
             }
         }
-
-        // Save vector indices
-        self.save_vector_indices()
-            .map_err(|e| anyhow::anyhow!("Failed to save todo vector indices: {e}"))?;
 
         Ok(())
     }
@@ -1624,5 +1735,310 @@ mod tests {
             .unwrap();
         assert_eq!(in_progress.len(), 1);
         assert_eq!(in_progress[0].content, "Task 1");
+    }
+
+    // =========================================================================
+    // SEMANTIC + LEXICAL SEARCH
+    // =========================================================================
+
+    /// Regression for the dead `list_todos({query})` path: semantic search must
+    /// read the embeddings persisted on the todo records — including through a
+    /// process restart. The previous Vamana side-index was never saved in
+    /// production, so every restart silently emptied it and search returned
+    /// nothing.
+    #[test]
+    fn test_search_similar_survives_store_reopen() {
+        let temp_dir = TempDir::new().unwrap();
+        let db = open_test_shared_db(temp_dir.path());
+
+        let mut todo_a = Todo::new("test_user".to_string(), "Deploy the API server".to_string());
+        todo_a.embedding = Some(vec![1.0, 0.0, 0.0, 0.0]);
+        let mut todo_b = Todo::new("test_user".to_string(), "Buy groceries".to_string());
+        todo_b.embedding = Some(vec![0.0, 1.0, 0.0, 0.0]);
+
+        {
+            let store = TodoStore::new(db.clone(), temp_dir.path()).unwrap();
+            store.store_todo(&todo_a).unwrap();
+            store.store_todo(&todo_b).unwrap();
+
+            let results = store
+                .search_similar("test_user", &[0.9, 0.1, 0.0, 0.0], 10)
+                .unwrap();
+            // todo_a: cosine ≈ 0.99 (match); todo_b: cosine ≈ 0.11 (below floor)
+            assert_eq!(results.len(), 1, "only the todo above the floor matches");
+            assert_eq!(results[0].0.content, "Deploy the API server");
+            assert!(results[0].1 > MIN_SEMANTIC_SIMILARITY);
+        }
+
+        // Simulate a process restart: a brand-new TodoStore over the same DB.
+        // No in-memory state may be required for search to work.
+        let reopened = TodoStore::new(db, temp_dir.path()).unwrap();
+        let results = reopened
+            .search_similar("test_user", &[0.9, 0.1, 0.0, 0.0], 10)
+            .unwrap();
+        assert!(
+            !results.is_empty(),
+            "semantic search must survive a restart (embeddings are persisted on the todos)"
+        );
+        assert_eq!(results[0].0.content, "Deploy the API server");
+    }
+
+    #[test]
+    fn test_search_similar_applies_similarity_floor() {
+        let (store, _temp) = setup_store();
+
+        let mut todo = Todo::new("test_user".to_string(), "Unrelated task".to_string());
+        todo.embedding = Some(vec![0.0, 0.0, 1.0, 0.0]);
+        store.store_todo(&todo).unwrap();
+
+        // Orthogonal query: cosine 0.0 < MIN_SEMANTIC_SIMILARITY
+        let results = store
+            .search_similar("test_user", &[1.0, 0.0, 0.0, 0.0], 10)
+            .unwrap();
+        assert!(
+            results.is_empty(),
+            "matches below the similarity floor must not surface"
+        );
+    }
+
+    #[test]
+    fn test_search_todos_lexical_guarantees_exact_match() {
+        let (store, _temp) = setup_store();
+
+        // No embedding at all — created while the embedding model was down
+        let todo = Todo::new("test_user".to_string(), "Audit-2 parent task".to_string());
+        store.store_todo(&todo).unwrap();
+
+        // No query embedding either — lexical path must still find it
+        let results = store
+            .search_todos("test_user", "Audit-2 parent", None, 10)
+            .unwrap();
+        assert_eq!(results.len(), 1, "exact word match must always surface");
+        assert_eq!(results[0].0.content, "Audit-2 parent task");
+
+        // Case-insensitive, and matches notes and tags too
+        let mut tagged = Todo::new("test_user".to_string(), "Second task".to_string());
+        tagged.tags = vec!["release-blocker".to_string()];
+        store.store_todo(&tagged).unwrap();
+
+        let by_tag = store
+            .search_todos("test_user", "RELEASE-BLOCKER", None, 10)
+            .unwrap();
+        assert_eq!(by_tag.len(), 1);
+        assert_eq!(by_tag[0].0.content, "Second task");
+
+        // Word-order independent: all query tokens present counts as a hit
+        let reordered = store
+            .search_todos("test_user", "parent Audit-2", None, 10)
+            .unwrap();
+        assert_eq!(reordered.len(), 1, "token match must be order-independent");
+        assert_eq!(reordered[0].0.content, "Audit-2 parent task");
+    }
+
+    #[test]
+    fn test_search_todos_lexical_ranks_before_semantic() {
+        let (store, _temp) = setup_store();
+
+        let mut semantic_only = Todo::new("test_user".to_string(), "Related work".to_string());
+        semantic_only.embedding = Some(vec![1.0, 0.0]);
+        store.store_todo(&semantic_only).unwrap();
+
+        let mut lexical_hit = Todo::new("test_user".to_string(), "Fix login bug".to_string());
+        lexical_hit.embedding = Some(vec![0.8, 0.6]);
+        store.store_todo(&lexical_hit).unwrap();
+
+        let results = store
+            .search_todos("test_user", "login", Some(&[1.0, 0.0]), 10)
+            .unwrap();
+        assert_eq!(results[0].0.content, "Fix login bug", "literal hit first");
+    }
+
+    // =========================================================================
+    // REORDER VALIDATION
+    // =========================================================================
+
+    #[test]
+    fn test_reorder_invalid_direction_rejected() {
+        let (store, _temp) = setup_store();
+
+        let todo = Todo::new("test_user".to_string(), "Task".to_string());
+        store.store_todo(&todo).unwrap();
+
+        let err = store
+            .reorder_todo("test_user", &todo.id, "sideways")
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("Valid values: up, down"),
+            "invalid direction must be an error, not a silent no-op: {err}"
+        );
+        // Valid directions still work
+        assert!(store
+            .reorder_todo("test_user", &todo.id, "up")
+            .unwrap()
+            .is_some());
+        assert!(store
+            .reorder_todo("test_user", &todo.id, "down")
+            .unwrap()
+            .is_some());
+    }
+
+    // =========================================================================
+    // MEMORY LINKS
+    // =========================================================================
+
+    #[test]
+    fn test_add_related_memory_idempotent() {
+        let (store, _temp) = setup_store();
+
+        let todo = Todo::new("test_user".to_string(), "Linked task".to_string());
+        store.store_todo(&todo).unwrap();
+
+        let mem_id = MemoryId(Uuid::new_v4());
+        assert!(store
+            .add_related_memory("test_user", &todo.id, mem_id.clone())
+            .unwrap());
+        assert!(store
+            .add_related_memory("test_user", &todo.id, mem_id.clone())
+            .unwrap());
+
+        let stored = store.get_todo("test_user", &todo.id).unwrap().unwrap();
+        assert_eq!(stored.related_memory_ids, vec![mem_id]);
+
+        // Unknown todo → false, not an error
+        assert!(!store
+            .add_related_memory("test_user", &TodoId::new(), MemoryId(Uuid::new_v4()))
+            .unwrap());
+    }
+
+    // =========================================================================
+    // STRUCTURED DEPENDENCIES
+    // =========================================================================
+
+    #[test]
+    fn test_dependency_cycle_detection() {
+        let (store, _temp) = setup_store();
+
+        let mut a = Todo::new("test_user".to_string(), "A".to_string());
+        let b = Todo::new("test_user".to_string(), "B".to_string());
+        let c = Todo::new("test_user".to_string(), "C".to_string());
+
+        // A depends on B
+        a.blocked_by = vec![b.id.clone()];
+        store.store_todo(&a).unwrap();
+        store.store_todo(&b).unwrap();
+        store.store_todo(&c).unwrap();
+
+        // Self-dependency is a cycle
+        assert!(store
+            .would_create_dependency_cycle("test_user", &a.id, &[a.id.clone()])
+            .unwrap());
+        // B → A would close the loop (A already waits on B)
+        assert!(store
+            .would_create_dependency_cycle("test_user", &b.id, &[a.id.clone()])
+            .unwrap());
+        // C → A is fine (no path from A back to C)
+        assert!(!store
+            .would_create_dependency_cycle("test_user", &c.id, &[a.id.clone()])
+            .unwrap());
+    }
+
+    #[test]
+    fn test_blocking_chain_walk() {
+        let (store, _temp) = setup_store();
+
+        let mut a = Todo::new("test_user".to_string(), "A".to_string());
+        let mut b = Todo::new("test_user".to_string(), "B".to_string());
+        let c = Todo::new("test_user".to_string(), "C".to_string());
+
+        b.blocked_by = vec![c.id.clone()];
+        a.blocked_by = vec![b.id.clone()];
+        store.store_todo(&a).unwrap();
+        store.store_todo(&b).unwrap();
+        store.store_todo(&c).unwrap();
+
+        let chain = store.blocking_chain("test_user", &a.id).unwrap();
+        let contents: Vec<&str> = chain.iter().map(|t| t.content.as_str()).collect();
+        assert_eq!(contents, vec!["B", "C"], "BFS: direct blocker first");
+    }
+
+    #[test]
+    fn test_unblocked_by_completion() {
+        let (store, _temp) = setup_store();
+
+        let mut a = Todo::new("test_user".to_string(), "A".to_string());
+        let b = Todo::new("test_user".to_string(), "B".to_string());
+        let c = Todo::new("test_user".to_string(), "C".to_string());
+
+        a.blocked_by = vec![b.id.clone(), c.id.clone()];
+        store.store_todo(&a).unwrap();
+        store.store_todo(&b).unwrap();
+        store.store_todo(&c).unwrap();
+
+        // Completing B alone does not unblock A (C is still open)
+        store.complete_todo("test_user", &b.id).unwrap();
+        let after_b = store.unblocked_by_completion("test_user", &b.id).unwrap();
+        assert!(after_b.is_empty(), "A still waits on C");
+
+        // Completing C releases A
+        store.complete_todo("test_user", &c.id).unwrap();
+        let after_c = store.unblocked_by_completion("test_user", &c.id).unwrap();
+        assert_eq!(after_c.len(), 1);
+        assert_eq!(after_c[0].content, "A");
+    }
+
+    // =========================================================================
+    // PERSISTED-SHAPE COMPATIBILITY
+    // =========================================================================
+
+    /// A todo serialized by a pre-`blocked_by` build must deserialize cleanly
+    /// (new fields default) and survive a write-back round trip. Todos are
+    /// stored as JSON, so unknown/missing fields are tolerated — this test
+    /// pins that contract against the exact bytes an old build produced.
+    #[test]
+    fn test_old_bytes_round_trip() {
+        let old_json = r#"{
+            "id": "5f2b7a86-3e64-4f0e-9c86-2f9f9a3d1b11",
+            "seq_num": 7,
+            "project_prefix": "MEM",
+            "project": "MEM",
+            "user_id": "test_user",
+            "content": "Legacy todo from an old build",
+            "status": "in_progress",
+            "priority": "high",
+            "project_id": "0e6f4a92-8f4b-4f0a-b0d9-6a3c62f5a001",
+            "parent_id": null,
+            "contexts": ["@computer"],
+            "tags": ["legacy"],
+            "due_date": "2026-01-15T23:59:59Z",
+            "recurrence": null,
+            "blocked_on": "vendor response",
+            "notes": "created before blocked_by existed",
+            "created_at": "2026-01-01T10:00:00Z",
+            "updated_at": "2026-01-02T11:00:00Z",
+            "completed_at": null,
+            "sort_order": 3,
+            "comments": [],
+            "related_memory_ids": []
+        }"#;
+
+        let mut todo: Todo = serde_json::from_str(old_json).expect("old bytes must deserialize");
+        assert_eq!(todo.content, "Legacy todo from an old build");
+        assert_eq!(todo.seq_num, 7);
+        assert!(todo.blocked_by.is_empty(), "new field defaults to empty");
+        assert!(todo.embedding.is_none());
+        assert_eq!(todo.blocked_on.as_deref(), Some("vendor response"));
+
+        // Write-back through the store and read again
+        let (store, _temp) = setup_store();
+        todo.sync_compat_fields();
+        store.store_todo(&todo).unwrap();
+        let reread = store.get_todo("test_user", &todo.id).unwrap().unwrap();
+        assert_eq!(reread.content, todo.content);
+        assert_eq!(reread.seq_num, 7);
+        assert!(reread.blocked_by.is_empty());
+
+        // And the new serialized form carries the new field explicitly
+        let new_json = serde_json::to_string(&reread).unwrap();
+        assert!(new_json.contains("\"blocked_by\":[]"));
     }
 }

@@ -94,8 +94,15 @@ mod linear_tests {
     #[test]
     fn test_linear_webhook_creation() {
         let webhook = LinearWebhook::new(Some("test-secret".to_string()));
-        // Invalid hex should return error
-        assert!(webhook.verify_signature(b"test", "sha256=invalid").is_err());
+        // A malformed (non-hex) signature is an invalid signature, not a server
+        // error — #284 (c1098786) hardened `verify_signature` to reject it via
+        // `Ok(false)` so the HTTP caller responds 400, not 500.
+        let result = webhook.verify_signature(b"test", "sha256=invalid");
+        assert!(result.is_ok());
+        assert!(
+            !result.unwrap(),
+            "malformed (non-hex) signature should be rejected, not errored"
+        );
 
         let webhook_no_secret = LinearWebhook::new(None);
         let result = webhook_no_secret.verify_signature(b"test", "any");
@@ -413,8 +420,15 @@ mod github_tests {
     #[test]
     fn test_github_webhook_creation() {
         let webhook = GitHubWebhook::new(Some("test-secret".to_string()));
-        // Invalid hex should return error
-        assert!(webhook.verify_signature(b"test", "sha256=invalid").is_err());
+        // A malformed (non-hex) signature is an invalid signature, not a server
+        // error — #284 (c1098786) hardened `verify_signature` to reject it via
+        // `Ok(false)` so the HTTP caller responds 400, not 500.
+        let result = webhook.verify_signature(b"test", "sha256=invalid");
+        assert!(result.is_ok());
+        assert!(
+            !result.unwrap(),
+            "malformed (non-hex) signature should be rejected, not errored"
+        );
 
         let webhook_no_secret = GitHubWebhook::new(None);
         let result = webhook_no_secret.verify_signature(b"test", "any");

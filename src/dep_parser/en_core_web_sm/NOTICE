@@ -1,0 +1,37 @@
+en_core_web_sm — spaCy English pipeline
+=======================================
+
+`model.json` and `model.safetensors` in this directory are an exported form of
+spaCy's `en_core_web_sm` trained pipeline, embedded into the binary so
+dependency parsing, OpenIE, CATENA causal/temporal extraction, appositive alias
+minting and entity canonicalization work with no download and no network.
+
+    Model:   en_core_web_sm
+    Source:  https://github.com/explosion/spacy-models
+    Author:  Explosion AI
+    Licence: MIT
+
+The MIT licence permits redistribution with attribution; this file is that
+attribution. The vendored `crates/spacy-rusty/NOTICE` states the same
+requirement for anyone redistributing an exported bundle.
+
+Explosion AI is not affiliated with this project and does not endorse it.
+spaCy and Thinc are also MIT licensed and developed by Explosion AI.
+
+Export format
+-------------
+
+These are NOT the upstream spaCy distribution files. They are an export
+consumable by `crates/spacy-rusty`, an independent reimplementation of spaCy's
+inference pipeline:
+
+  - `model.json`        vocab, tokenizer exceptions, lemmatizer rules,
+                        layer shapes and labels
+  - `model.safetensors` layer weights
+
+`vectors_key2row.json` is absent because `en_core_web_sm` ships no static word
+vectors. The loader treats it as optional.
+
+No spaCy or Thinc source code is included. Numerical inference behaviour was
+matched against spaCy's public releases using golden fixtures generated from
+spaCy itself; see `tests/dep_parser_parity.rs`.

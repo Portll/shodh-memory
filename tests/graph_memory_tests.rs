@@ -53,6 +53,7 @@ fn create_entity_from_ner(ner: &NeuralNer, text: &str) -> Vec<EntityNode> {
             is_proper_noun: true,
             selectivity: None,
             fine_type: None,
+            kb_id: None,
         })
         .collect()
 }
@@ -85,6 +86,7 @@ fn create_entity(
         is_proper_noun: is_proper,
         selectivity: None,
         fine_type: None,
+        kb_id: None,
     }
 }
 
@@ -116,6 +118,7 @@ fn create_relationship(
         endpoint_selectivity: None,
         forman_curvature: None,
         provenance: Vec::new(),
+        promoted_at: None,
     }
 }
 
@@ -153,6 +156,7 @@ fn create_relationship_with_plasticity(
         endpoint_selectivity: None,
         forman_curvature: None,
         provenance: Vec::new(),
+        promoted_at: None,
     }
 }
 
@@ -899,17 +903,30 @@ fn test_long_term_potentiation_threshold() {
     let entity_a = Uuid::new_v4();
     let entity_b = Uuid::new_v4();
 
+    use shodh_memory::constants::TIER_PROMOTION_WORKING_AGE_SECS;
+
     let mut edge = create_relationship(entity_a, entity_b, RelationType::Knows, 0.5);
     assert!(
         !edge.is_potentiated(),
         "Edge should not be potentiated initially"
     );
 
+    // The activation counts below are exactly the ones this test always used
+    // (4 then 5). The only change is the CLOCK: promotion now requires 30
+    // minutes since the edge entered its tier, and LTP is an L2+ mechanism
+    // (`record_activation_timestamp` skips L1 edges), so the edge has to be past
+    // the consolidation window for burst detection to have any history at all.
+    // Activation #1 promotes L1→L2 and seeds timestamp #1; #2–#4 bring the
+    // window to 4; #5 reaches LTP_BURST_THRESHOLD.
+    let birth = edge.created_at;
+    let after_window = birth + Duration::seconds(TIER_PROMOTION_WORKING_AGE_SECS + 1);
+
     // PIPE-4: Multi-scale LTP — Burst LTP fires at 5 rapid activations in 24h
     // Strengthen 4 times (below burst threshold of 5)
     for _ in 0..4 {
-        edge.strengthen();
+        edge.strengthen_at(after_window);
     }
+    assert_eq!(edge.tier, EdgeTier::L2Episodic);
     assert!(
         !edge.is_potentiated(),
         "Edge should not be potentiated at 4 activations (burst threshold is 5)"
@@ -917,7 +934,7 @@ fn test_long_term_potentiation_threshold() {
 
     // Strengthen once more (reaches burst threshold)
     let pre_ltp_strength = edge.strength;
-    edge.strengthen();
+    edge.strengthen_at(after_window);
 
     assert!(
         edge.is_potentiated(),
@@ -928,6 +945,73 @@ fn test_long_term_potentiation_threshold() {
         "Burst LTP should give bonus strength"
     );
 }
+
+#[test]
+fn an_unconsolidated_l1_edge_cannot_potentiate_inside_one_instant() {
+    // The other half of the coupling introduced by the promotion clock, pinned
+    // on its own so it cannot drift.
+    //
+    // LTP is an L2+ mechanism: `record_activation_timestamp` returns early for
+    // L1 ("working edges die too quickly to need history") and `ltp_readiness()`
+    // is zero at L1. Before the clock landed, one strengthen call promoted an
+    // edge to L2 instantly, so a fresh edge could collect Burst or even Full LTP
+    // — 2x-10x decay protection AND prune immunity — inside a single request.
+    // "Hit 20 times in one instant" is precisely the evidence the clock exists
+    // to discount, and potentiation must discount it too.
+    let mut edge = create_relationship(Uuid::new_v4(), Uuid::new_v4(), RelationType::Knows, 0.5);
+    let birth = edge.created_at;
+
+    for _ in 0..20 {
+        edge.strengthen_at(birth);
+    }
+
+    assert_eq!(
+        edge.tier,
+        EdgeTier::L1Working,
+        "20 activations in one instant must not consolidate an edge"
+    );
+    assert!(
+        !edge.is_potentiated(),
+        "and an un-consolidated edge must not be potentiated"
+    );
+    assert!(
+        edge.activation_timestamps.is_none(),
+        "L1 edges record no activation history, so burst detection has nothing to fire on"
+    );
+}
+
+// =============================================================================
+// DECAY TESTS — pinned to the SHIPPED Wixted hybrid model (SHO-103, bee3915b).
+//
+// `RelationshipEdge::decay_at` (src/graph_memory.rs) routes L2Episodic and
+// L3Semantic edges through `crate::decay::hybrid_decay_factor`, NOT through
+// `tier_decay_factor`'s simple-exponential L2 branch (λ=0.031/day) — that branch
+// is now reachable only for L1Working. The tests below therefore derive their
+// expected values from the hybrid model's own parameters:
+//
+//   DECAY_LAMBDA_CONSOLIDATION = 0.693   (src/constants.rs)
+//   DECAY_CROSSOVER_DAYS       = 3.0
+//   POWERLAW_BETA              = 0.5     (non-potentiated)
+//   L2_PRUNE_THRESHOLD         = 0.2
+//   LTP_MIN_STRENGTH           = 0.01    (post-decay floor)
+//
+//   t <  3 days:  f(t) = exp(-0.693 · t)                        [consolidation]
+//   t >= 3 days:  f(t) = exp(-0.693 · 3) · (t / 3)^(-0.5)       [power-law tail]
+//
+// Anchor value used repeatedly below:
+//   A_cross = exp(-0.693 × 3) = exp(-2.079) = 0.12505519
+//
+// `create_relationship_with_plasticity(..., potentiated = false, ...)` builds an
+// L2Episodic edge with LtpStatus::None and endpoint_selectivity = None, so
+// `ltp_factor` = 1.0 and `is_potentiated` (ltp_factor <= 0.5) is FALSE — the
+// non-potentiated β=0.5 branch above is the one exercised.
+//
+// Expected values are written as literals (not recomputed via
+// `shodh_memory::decay::hybrid_decay_factor`) on purpose: recomputing the model
+// inside the assertion would make the test tautological and silently absorb any
+// change to the constants above. The derivation is shown so the literal is
+// auditable rather than a record of whatever the code last printed.
+// =============================================================================
 
 #[test]
 fn test_decay_reduces_strength() {
@@ -953,9 +1037,57 @@ fn test_decay_reduces_strength() {
         edge.strength < initial_strength,
         "Strength should decrease after decay"
     );
+
+    // Derivation (power-law tail, t = 30 days >= crossover 3):
+    //   f(30) = A_cross × (30/3)^(-0.5)
+    //         = 0.12505519 × 10^(-0.5)
+    //         = 0.12505519 × 0.31622777
+    //         = 0.03954777
+    //   strength = 0.8 × 0.03954777 = 0.03163822
+    // Well above LTP_MIN_STRENGTH (0.01), so no floor clamp applies and this is
+    // the raw product.
+    let expected = 0.031_638_22_f32;
     assert!(
-        !should_prune,
-        "Edge with strength 0.8 should not be pruned after 30 days"
+        (edge.strength - expected).abs() < 1e-4,
+        "30-day Wixted decay of a 0.8 L2 edge should give ~{expected}, got {}",
+        edge.strength
+    );
+
+    // Shipped prune semantics: `decay_at`'s final ladder prunes a non-potentiated,
+    // non-corroborated edge once `strength <= tier.prune_threshold()`. At 0.0316
+    // the edge is far below L2_PRUNE_THRESHOLD (0.2), so it IS prune-eligible.
+    // (Only the returned bool is asserted — at exactly 30 days the *age* branch
+    // sits on its `hours_elapsed > 720.0` boundary and may or may not fire first
+    // depending on sub-second timing, but both branches return true.)
+    assert!(
+        should_prune,
+        "a 30-day-stale L2 edge decays to {} <= L2_PRUNE_THRESHOLD (0.2) and is prune-eligible",
+        edge.strength
+    );
+
+    // Complement — the "a strong edge survives" intent, checked where it actually
+    // holds under the shipped model. Consolidation phase, t = 1 day < crossover:
+    //   f(1) = exp(-0.693 × 1) = 0.50007360
+    //   strength = 0.8 × 0.50007360 = 0.40005888  >  0.2
+    let one_day_ago = Utc::now() - Duration::days(1);
+    let mut fresh = create_relationship_with_plasticity(
+        entity_a,
+        entity_b,
+        RelationType::Knows,
+        0.8,
+        5,
+        false,
+        one_day_ago,
+    );
+    let fresh_prune = fresh.decay();
+    assert!(
+        (fresh.strength - 0.400_058_88_f32).abs() < 1e-4,
+        "1-day Wixted decay of a 0.8 L2 edge should give ~0.40005888, got {}",
+        fresh.strength
+    );
+    assert!(
+        !fresh_prune,
+        "an edge active 1 day ago is still above the L2 prune threshold"
     );
 }
 
@@ -964,11 +1096,42 @@ fn test_decay_half_life() {
     let entity_a = Uuid::new_v4();
     let entity_b = Uuid::new_v4();
 
-    // L2 decay rate: λ = 0.031/day (exponential)
-    // Half-life = ln(2)/0.031 ≈ 22.36 days
-    // After 14 days: e^(-0.031 × 14) = e^(-0.434) ≈ 0.648
+    // --- Half-life, consolidation phase -------------------------------------
+    // The hybrid model's exponential leg uses λ = DECAY_LAMBDA_CONSOLIDATION =
+    // 0.693, i.e. ln(2) to three decimals, so the half-life is
+    //   t½ = ln(2)/λ = 0.6931472 / 0.693 = 1.0002125 days  (≈ 1 day, by design).
+    // At exactly t = 1 day:
+    //   f(1) = exp(-0.693) = 0.50007360
+    // λ is 0.693 and not ln(2) exactly, so this is 0.500074 rather than 0.5 —
+    // hence a 1e-3 tolerance rather than an equality check.
+    let one_day_ago = Utc::now() - Duration::days(1);
+    let mut edge_1d = create_relationship_with_plasticity(
+        entity_a,
+        entity_b,
+        RelationType::Knows,
+        1.0,
+        1,
+        false,
+        one_day_ago,
+    );
+    edge_1d.decay();
+    assert!(
+        (edge_1d.strength - 0.500_073_6_f32).abs() < 1e-3,
+        "L2 consolidation half-life is ~1 day: strength should halve to ~0.500074, got {}",
+        edge_1d.strength
+    );
+
+    // --- Power-law tail ------------------------------------------------------
+    // Past the 3-day crossover the model is power-law, so 14 days is NOT four
+    // more exponential half-lives — the heavy tail is the whole point of SHO-103.
+    //   f(14) = A_cross × (14/3)^(-0.5)
+    //         = 0.12505519 × (4.6666667)^(-0.5)
+    //         = 0.12505519 × 0.46291005
+    //         = 0.05788933
+    // Starting strength 1.0 ⇒ strength = 0.05788933 (above LTP_MIN_STRENGTH 0.01,
+    // so no floor clamp).
     let fourteen_days_ago = Utc::now() - Duration::days(14);
-    let mut edge = create_relationship_with_plasticity(
+    let mut edge_14d = create_relationship_with_plasticity(
         entity_a,
         entity_b,
         RelationType::Knows,
@@ -977,18 +1140,19 @@ fn test_decay_half_life() {
         false,
         fourteen_days_ago,
     );
+    edge_14d.decay();
 
-    edge.decay();
-
-    // After 14 days with L2 exponential decay (λ=0.031/day), expect ~0.648
-    let expected = 0.648;
-    let tolerance = 0.05;
+    let expected = 0.057_889_33_f32;
     assert!(
-        (edge.strength - expected).abs() < tolerance,
-        "After 14 days with L2 decay (λ=0.031/day), strength should be ~{}, got {}",
-        expected,
-        edge.strength
+        (edge_14d.strength - expected).abs() < 1e-4,
+        "After 14 days of Wixted hybrid decay, strength should be ~{expected}, got {}",
+        edge_14d.strength
     );
+
+    // Ordering sanity: the tail must retain strictly less than the 1-day value
+    // but stay strictly positive — a power law decays, it does not truncate.
+    assert!(edge_14d.strength < edge_1d.strength);
+    assert!(edge_14d.strength > 0.0);
 }
 
 #[test]
@@ -1164,7 +1328,7 @@ fn test_decay_synapse_persists() {
 
     // Create edge with old activation timestamp
     let thirty_days_ago = Utc::now() - Duration::days(30);
-    let mut edge = create_relationship_with_plasticity(
+    let edge = create_relationship_with_plasticity(
         id1,
         id2,
         RelationType::Knows,
@@ -1174,22 +1338,66 @@ fn test_decay_synapse_persists() {
         thirty_days_ago,
     );
 
-    // Note: add_relationship sets last_activated to now, so we test the method call works
     let edge_id = graph.add_relationship(edge).expect("Failed");
 
-    // Apply decay via the GraphMemory method
-    // For a fresh edge, decay will be minimal but the method should work
+    // The 30-day derivation below is only valid if the insert path round-trips
+    // `strength` and `last_activated` untouched, so pin that first rather than
+    // assume it.
+    let stored = graph
+        .get_relationship(&edge_id)
+        .expect("Failed")
+        .expect("Edge should exist after insert");
+    assert!(
+        (stored.strength - 0.8).abs() < 1e-6,
+        "add_relationship must persist strength verbatim, got {}",
+        stored.strength
+    );
+    assert!(
+        (stored.last_activated - thirty_days_ago)
+            .num_seconds()
+            .abs()
+            <= 1,
+        "add_relationship must preserve last_activated (30 days ago), got {}",
+        stored.last_activated
+    );
+
+    // Apply decay through the GraphMemory method (read-modify-write under lock).
     let should_prune = graph.decay_synapse(&edge_id).expect("Failed");
 
-    // Verify decay was applied
     let decayed_edge = graph
         .get_relationship(&edge_id)
         .expect("Failed")
         .expect("Edge should exist");
 
-    // The strength should have decreased (though the exact amount depends on timing)
-    // Since we can't easily mock time in the DB, we just verify the method works
-    assert!(!should_prune, "Edge with 0.8 strength should not be pruned");
+    // Same derivation as `test_decay_reduces_strength` — L2Episodic, not
+    // potentiated, t = 30 days (power-law tail):
+    //   f(30) = A_cross × (30/3)^(-0.5) = 0.12505519 × 0.31622777 = 0.03954777
+    //   strength = 0.8 × 0.03954777 = 0.03163822
+    // This is what must have been WRITTEN BACK to storage — the point of the
+    // test is that decay_synapse persists its result, not merely that it runs.
+    assert!(
+        (decayed_edge.strength - 0.031_638_22_f32).abs() < 1e-4,
+        "decay_synapse must persist the Wixted-decayed strength (~0.03163822), got {}",
+        decayed_edge.strength
+    );
+    assert!(
+        decayed_edge.strength < stored.strength,
+        "persisted strength should be lower than the pre-decay stored value"
+    );
+    // decay_at also writes `last_activated = now` to prevent double-decay; that
+    // update must survive the round-trip too, otherwise every pass would re-apply
+    // 30 days of decay.
+    assert!(
+        (Utc::now() - decayed_edge.last_activated).num_seconds() < 60,
+        "decay_synapse must persist the refreshed last_activated, got {}",
+        decayed_edge.last_activated
+    );
+
+    // Shipped prune semantics: 0.0316 <= L2_PRUNE_THRESHOLD (0.2) ⇒ prune-eligible.
+    assert!(
+        should_prune,
+        "a 30-day-stale L2 edge decays below the L2 prune threshold and is prune-eligible"
+    );
 }
 
 #[test]

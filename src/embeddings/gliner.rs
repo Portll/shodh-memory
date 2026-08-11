@@ -308,17 +308,34 @@ impl GlinerTyper {
     /// Best-effort: returns an empty vector on empty input, missing assets, or
     /// any inference error (logged), so callers can treat the typer as an
     /// optional enrichment stage.
+    ///
+    /// Prefer [`try_extract`](Self::try_extract) on any path where "the typer
+    /// broke" and "this text has no entities" must lead to different behaviour —
+    /// this method collapses both into the same empty vector.
     pub fn extract(&self, text: &str) -> Vec<TypedSpan> {
-        if text.trim().is_empty() {
-            return Vec::new();
-        }
-        match self.extract_inner(text) {
+        match self.try_extract(text) {
             Ok(spans) => spans,
             Err(e) => {
                 tracing::warn!("GLiNER typing failed: {e}");
                 Vec::new()
             }
         }
+    }
+
+    /// Type `text`, surfacing a runtime failure to the caller instead of
+    /// swallowing it into an empty vector.
+    ///
+    /// The distinction matters because an empty result is a perfectly ordinary
+    /// outcome — most sentences name nothing — so a typer that has stopped
+    /// working looks exactly like a corpus with no entities in it. Every
+    /// consumer downstream of NER (graph labelling, the toponym gazetteer,
+    /// entity-seeded retrieval) then degrades quietly and indefinitely. A caller
+    /// that can degrade deliberately needs to be told which case it is in.
+    pub fn try_extract(&self, text: &str) -> Result<Vec<TypedSpan>> {
+        if text.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        self.extract_inner(text)
     }
 
     fn extract_inner(&self, text: &str) -> Result<Vec<TypedSpan>> {
