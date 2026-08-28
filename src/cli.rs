@@ -557,8 +557,16 @@ fn handle_init() -> Result<()> {
             storage.display()
         );
         std::fs::write(&config_path, config_content)?;
+        restrict_config_permissions(&config_path);
         eprintln!("  ✓ Config created: {}", config_path.display());
-        eprintln!("  ✓ API key generated: {}", api_key);
+        // The full key was just written to the config file with restricted permissions — that is
+        // where the user retrieves it. Printing it here lands it in every captured stderr, shell
+        // transcript and CI log this command runs under, so only a recognisable prefix is shown.
+        eprintln!(
+            "  ✓ API key generated: {}… (full key stored in {})",
+            &api_key[..api_key.len().min(8)],
+            config_path.display()
+        );
     }
 
     // 3. Pre-download ONNX runtime + embedding model
@@ -881,13 +889,35 @@ fn config_directory() -> PathBuf {
 }
 
 fn generate_api_key() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    // Simple deterministic key — good enough for local dev, user can change later
-    format!("sk-shodh-{:x}", timestamp)
+    // Random 128-bit key. A timestamp-derived key is guessable within the window
+    // the user ran `shodh init`: the previous implementation formatted the nanosecond
+    // clock, so an attacker who knows the install date to within a day searches ~10^14
+    // candidates against a key that authenticates every endpoint — and to within a
+    // minute, ~10^11. This matches the veld twin, which has always generated the key
+    // this way; the divergence was found by diffing the two, not by any scanner.
+    format!("sk-shodh-{}", uuid::Uuid::new_v4().simple())
+}
+
+/// Restrict the config file to owner-only access on Unix.
+///
+/// `config.toml` holds the API key in plaintext; world-readable permissions would
+/// expose it to other local users. On Windows the per-user `%APPDATA%` directory is
+/// already ACL-scoped to the user, so no action is needed there.
+fn restrict_config_permissions(path: &std::path::Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(err) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
+            eprintln!(
+                "  ⚠ Could not restrict permissions on {}: {err}",
+                path.display()
+            );
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
 }
 
 // =============================================================================
