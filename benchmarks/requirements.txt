@@ -22,3 +22,9 @@ openai==3.5.0
 # anthropic==1.2.0    # for Anthropic Claude (optional)
 # ollama==0.6.2       # for Ollama local models (optional)
 # requests==2.34.2    # for Baseten native API (optional)
+
+# aiohttp is not used by any benchmark directly — it arrives through datasets → fsspec[http] —
+# but a transitive cannot be retired without dropping datasets, so it is pinned FORWARD instead:
+# 3.14.3 is the lowest version past every fixed-event in the advisories osv reports against the
+# 3.9.5 the resolver otherwise picks. Derived from the advisories' own ranges on 2026-08-28.
+aiohttp==3.14.3
