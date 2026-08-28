@@ -19,6 +19,7 @@ pub mod ab_testing;
 pub mod appositive;
 pub mod auth;
 pub mod path_guard;
+pub mod endpoint_guard;
 pub mod backup;
 pub mod catena;
 pub mod causal_vocab;

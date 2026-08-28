@@ -111,7 +111,6 @@ enum Commands {
         #[arg(
             long,
             env = "SHODH_API_KEY",
-            default_value = "sk-shodh-dev-local-testing-key"
         )]
         api_key: String,
     },
@@ -134,7 +133,6 @@ enum Commands {
         #[arg(
             long,
             env = "SHODH_API_KEY",
-            default_value = "sk-shodh-dev-local-testing-key"
         )]
         api_key: String,
 
@@ -156,7 +154,6 @@ enum Commands {
         #[arg(
             long,
             env = "SHODH_API_KEY",
-            default_value = "sk-shodh-dev-local-testing-key"
         )]
         api_key: String,
     },
@@ -214,7 +211,6 @@ enum Commands {
         #[arg(
             long,
             env = "SHODH_API_KEY",
-            default_value = "sk-shodh-dev-local-testing-key"
         )]
         api_key: String,
     },
@@ -242,7 +238,6 @@ enum HookType {
         #[arg(
             long,
             env = "SHODH_API_KEY",
-            default_value = "sk-shodh-dev-local-testing-key"
         )]
         api_key: String,
 
@@ -268,7 +263,6 @@ enum HookType {
         #[arg(
             long,
             env = "SHODH_API_KEY",
-            default_value = "sk-shodh-dev-local-testing-key"
         )]
         api_key: String,
 
@@ -285,6 +279,23 @@ enum HookType {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    // TRANSPORT GUARD, at the one place every invocation passes through. See
+    // src/endpoint_guard.rs; the veld twin carries the identical check. Placed in main() rather
+    // than in the client constructors because `status` reaches neither of them — found by running
+    // the binary against a remote http:// URL and watching it not refuse.
+    {
+        let explicit = std::env::args().skip_while(|a| a != "--api-url").nth(1);
+        let url = explicit
+            .or_else(|| std::env::var("SHODH_API_URL").ok())
+            .or_else(|| std::env::var("SHODH_SERVER_URL").ok());
+        if let Some(u) = url {
+            if let Err(msg) = shodh_memory::endpoint_guard::check_api_url(&u, std::env::var("SHODH_ALLOW_HTTP").ok().as_deref()) {
+                eprintln!("shodh: {msg}");
+                std::process::exit(2);
+            }
+        }
+    }
 
     match cli.command {
         // =====================================================================
