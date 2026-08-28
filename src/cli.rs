@@ -108,10 +108,7 @@ enum Commands {
         api_url: String,
 
         /// API key for authentication
-        #[arg(
-            long,
-            env = "SHODH_API_KEY",
-        )]
+        #[arg(long, env = "SHODH_API_KEY")]
         api_key: String,
     },
 
@@ -130,10 +127,7 @@ enum Commands {
         api_url: String,
 
         /// API key for authentication
-        #[arg(
-            long,
-            env = "SHODH_API_KEY",
-        )]
+        #[arg(long, env = "SHODH_API_KEY")]
         api_key: String,
 
         /// User ID for memory operations
@@ -151,10 +145,7 @@ enum Commands {
         api_url: String,
 
         /// API key for authentication
-        #[arg(
-            long,
-            env = "SHODH_API_KEY",
-        )]
+        #[arg(long, env = "SHODH_API_KEY")]
         api_key: String,
     },
 
@@ -208,10 +199,7 @@ enum Commands {
         api_url: String,
 
         /// API key for authentication
-        #[arg(
-            long,
-            env = "SHODH_API_KEY",
-        )]
+        #[arg(long, env = "SHODH_API_KEY")]
         api_key: String,
     },
 
@@ -235,10 +223,7 @@ enum HookType {
         api_url: String,
 
         /// API key for authentication
-        #[arg(
-            long,
-            env = "SHODH_API_KEY",
-        )]
+        #[arg(long, env = "SHODH_API_KEY")]
         api_key: String,
 
         /// User ID for memory operations
@@ -260,10 +245,7 @@ enum HookType {
         api_url: String,
 
         /// API key for authentication
-        #[arg(
-            long,
-            env = "SHODH_API_KEY",
-        )]
+        #[arg(long, env = "SHODH_API_KEY")]
         api_key: String,
 
         /// User ID for memory operations
@@ -290,7 +272,10 @@ async fn main() -> Result<()> {
             .or_else(|| std::env::var("SHODH_API_URL").ok())
             .or_else(|| std::env::var("SHODH_SERVER_URL").ok());
         if let Some(u) = url {
-            if let Err(msg) = shodh_memory::endpoint_guard::check_api_url(&u, std::env::var("SHODH_ALLOW_HTTP").ok().as_deref()) {
+            if let Err(msg) = shodh_memory::endpoint_guard::check_api_url(
+                &u,
+                std::env::var("SHODH_ALLOW_HTTP").ok().as_deref(),
+            ) {
                 eprintln!("shodh: {msg}");
                 std::process::exit(2);
             }
