@@ -5120,7 +5120,9 @@ async function main() {
   await server.connect(transport);
   console.error(`Shodh-Memory MCP server v${SERVER_VERSION} running`);
   console.error(`Connecting to: ${BACKEND_LOCATION}`);
-  console.error(`User ID: ${USER_ID === "claude-code" ? "claude-code" : "(custom, set via SHODH_USER_ID)"}`);
+  // Digest, not value: SHODH_USER_ID can hold an email and stderr persists in
+  // client logs. Reproduce with: echo -n "$SHODH_USER_ID" | shasum -a 256 | cut -c1-8
+  console.error(`User ID: ${USER_ID === "claude-code" ? "claude-code" : `custom (sha256:${crypto.createHash("sha256").update(USER_ID).digest("hex").slice(0, 8)})`}`);
   console.error(`Streaming: ${STREAM_ENABLED ? "enabled" : "disabled"}`);
   console.error(`Proactive surfacing: ${PROACTIVE_SURFACING ? "enabled" : "disabled (SHODH_PROACTIVE=false)"}`);
 }
