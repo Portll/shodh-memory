@@ -247,16 +247,31 @@ pub struct GraphDataStats {
     pub l3_edges: usize,
 }
 
-/// CSP for the two browser-facing pages: their inline scripts/styles, the pinned
-/// SRI-tagged CDN hosts, and same-origin fetch/SSE — everything else stays 'none'.
-const VIEW_CSP: &str = "default-src 'none'; script-src 'unsafe-inline' https://cdnjs.cloudflare.com https://cdn.jsdelivr.net; style-src 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; font-src 'self'; base-uri 'none'; form-action 'none'";
+/// CSP for the two browser-facing pages. Element scripts are nonce-gated (the
+/// page's own inline block plus the SRI-tagged CDN hosts); attribute handlers
+/// stay 'unsafe-inline' because the pages use onclick= handlers and their only
+/// interpolation is quote-escaped, so attribute breakout is already blocked.
+fn view_csp(nonce: &str) -> String {
+    format!(
+        "default-src 'none'; script-src 'nonce-{nonce}' https://cdnjs.cloudflare.com https://cdn.jsdelivr.net; \
+         script-src-attr 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; \
+         img-src 'self' data:; font-src 'self'; base-uri 'none'; form-action 'none'"
+    )
+}
+
+/// Fresh per-response nonce, hex-encoded (hex is valid CSP nonce grammar).
+fn fresh_csp_nonce() -> String {
+    let bytes: [u8; 16] = rand::random();
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
 
 /// GET /graph/view - Serve interactive graph visualization HTML
 pub async fn graph_view(Query(params): Query<GraphViewParams>) -> impl IntoResponse {
     let user_id = params.user_id.unwrap_or_else(|| "default".to_string());
+    let nonce = fresh_csp_nonce();
     (
-        [("Content-Security-Policy", VIEW_CSP)],
-        Html(generate_graph_html(&user_id)),
+        [("Content-Security-Policy", view_csp(&nonce))],
+        Html(generate_graph_html(&user_id, &nonce)),
     )
 }
 
@@ -264,9 +279,10 @@ pub async fn graph_view(Query(params): Query<GraphViewParams>) -> impl IntoRespo
 /// + the knowledge graph with typed relationships and document provenance
 /// (/api/graph/{user}/export). The web parallel to the TUI, served by shodh itself.
 pub async fn dashboard() -> impl IntoResponse {
+    let nonce = fresh_csp_nonce();
     (
-        [("Content-Security-Policy", VIEW_CSP)],
-        Html(include_str!("dashboard.html").to_string()),
+        [("Content-Security-Policy", view_csp(&nonce))],
+        Html(include_str!("dashboard.html").replace("{{CSP_NONCE}}", &nonce)),
     )
 }
 
@@ -409,7 +425,7 @@ pub async fn get_graph_data(
 }
 
 /// Generate the HTML page for graph visualization (includes 2D/3D toggle)
-fn generate_graph_html(user_id: &str) -> String {
+fn generate_graph_html(user_id: &str, nonce: &str) -> String {
     let html = include_str!("graph_view.html");
     // HTML-escape user_id to prevent reflected XSS via query parameter injection
     let escaped = user_id
@@ -419,4 +435,5 @@ fn generate_graph_html(user_id: &str) -> String {
         .replace('"', "&quot;")
         .replace('\'', "&#x27;");
     html.replace("{{USER_ID}}", &escaped)
+        .replace("{{CSP_NONCE}}", nonce)
 }
