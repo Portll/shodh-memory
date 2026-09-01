@@ -5,7 +5,7 @@
 
 use axum::{
     extract::{Path, Query, State},
-    response::{Html, Json},
+    response::{Html, IntoResponse, Json},
 };
 use serde::{Deserialize, Serialize};
 
@@ -247,17 +247,27 @@ pub struct GraphDataStats {
     pub l3_edges: usize,
 }
 
+/// CSP for the two browser-facing pages: their inline scripts/styles, the pinned
+/// SRI-tagged CDN hosts, and same-origin fetch/SSE — everything else stays 'none'.
+const VIEW_CSP: &str = "default-src 'none'; script-src 'unsafe-inline' https://cdnjs.cloudflare.com https://cdn.jsdelivr.net; style-src 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; font-src 'self'; base-uri 'none'; form-action 'none'";
+
 /// GET /graph/view - Serve interactive graph visualization HTML
-pub async fn graph_view(Query(params): Query<GraphViewParams>) -> Html<String> {
+pub async fn graph_view(Query(params): Query<GraphViewParams>) -> impl IntoResponse {
     let user_id = params.user_id.unwrap_or_else(|| "default".to_string());
-    Html(generate_graph_html(&user_id))
+    (
+        [("Content-Security-Policy", VIEW_CSP)],
+        Html(generate_graph_html(&user_id)),
+    )
 }
 
 /// GET /dashboard - LLM-free memory dashboard: deterministic search (/api/recall)
 /// + the knowledge graph with typed relationships and document provenance
 /// (/api/graph/{user}/export). The web parallel to the TUI, served by shodh itself.
-pub async fn dashboard() -> Html<String> {
-    Html(include_str!("dashboard.html").to_string())
+pub async fn dashboard() -> impl IntoResponse {
+    (
+        [("Content-Security-Policy", VIEW_CSP)],
+        Html(include_str!("dashboard.html").to_string()),
+    )
 }
 
 /// GET /api/graph/data/{user_id} - Get graph data as JSON for d3.js

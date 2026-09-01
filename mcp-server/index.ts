@@ -349,7 +349,7 @@ async function connectStream(): Promise<void> {
         },
       });
       streamSocket?.send(handshake);
-      console.error("[Stream] Sent handshake for user:", USER_ID);
+      console.error("[Stream] Sent handshake");
     };
 
     streamSocket.onmessage = (event) => {
@@ -530,7 +530,7 @@ async function backendRequest<T>(
     try {
       return await response.json() as T;
     } catch {
-      throw new Error(`API returned invalid JSON from ${endpoint}`);
+      throw new Error(`API returned invalid JSON (HTTP ${response.status})`);
     }
   } finally {
     clearTimeout(timeoutId);
@@ -5120,7 +5120,7 @@ async function main() {
   await server.connect(transport);
   console.error(`Shodh-Memory MCP server v${SERVER_VERSION} running`);
   console.error(`Connecting to: ${BACKEND_LOCATION}`);
-  console.error(`User ID: ${USER_ID}`);
+  console.error(`User ID: ${USER_ID === "claude-code" ? "claude-code" : "(custom, set via SHODH_USER_ID)"}`);
   console.error(`Streaming: ${STREAM_ENABLED ? "enabled" : "disabled"}`);
   console.error(`Proactive surfacing: ${PROACTIVE_SURFACING ? "enabled" : "disabled (SHODH_PROACTIVE=false)"}`);
 }
