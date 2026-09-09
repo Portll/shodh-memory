@@ -8639,6 +8639,19 @@ impl MemorySystem {
         self.hybrid_search.bm25_commit_failure_count()
     }
 
+    /// Index inserts lost during ingest, lexical and vector.
+    ///
+    /// Nonzero means memories are stored and UNREACHABLE by that route: a
+    /// different loss from a dropped commit, where the document reached the
+    /// writer and the batch did not reach disk. Both are handled-and-continued
+    /// during ingest, which is right for a server and invalid for an eval.
+    pub fn index_failure_counts(&self) -> (u64, u64) {
+        (
+            self.retriever.index_failure_count(),
+            self.hybrid_search.bm25_index_failure_count(),
+        )
+    }
+
     /// Get vector index health information
     ///
     /// Returns metrics about the Vamana index including total vectors,
