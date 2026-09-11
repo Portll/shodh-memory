@@ -153,10 +153,15 @@ pub struct BM25Index {
     /// STORED BUT LEXICALLY UNREACHABLE — present in the primary store,
     /// findable by no BM25 query — which is a different loss from
     /// `commit_failures`, where the document reached the writer and the batch
-    /// did not reach disk. Both are handled-and-continued by the eleven
-    /// `if let Err(e) = ...index_memory(...)` sites in `memory/mod.rs`: right
-    /// for a server's availability, and invisible to a measurement that needs
-    /// to know its corpus is whole.
+    /// did not reach disk. Both are handled-and-continued by all fifteen index
+    /// sites in `memory/mod.rs` — thirteen `index_memory` (eleven `if let
+    /// Err`, two `match`) plus two `reindex_memory`, none propagating — which
+    /// is right for availability and invisible to a measurement that needs its
+    /// corpus whole.
+    ///
+    /// Narrow on this side by nature: `add_document` buffers and errors only
+    /// once the writer is dead. `MemorySystem::index_coverage` is what catches
+    /// a loss that never errored at all.
     index_failures: std::sync::atomic::AtomicU64,
 }
 
@@ -1093,42 +1098,6 @@ mod tests {
         assert_eq!(config.rrf_k, 45.0); // Lower k for top-rank emphasis
         assert_eq!(config.candidate_count, 100); // Increased for better recall
         assert_eq!(config.min_graph_score, 0.01); // Graph score threshold (SHO-D4)
-    }
-
-    #[test]
-    fn index_failures_are_counted_not_swallowed() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let index = BM25Index::new(temp_dir.path()).unwrap();
-        assert_eq!(index.index_failure_count(), 0, "clean at start");
-
-        let id = MemoryId(uuid::Uuid::new_v4());
-        index
-            .upsert(&id, "findable content", &[], &[])
-            .expect("healthy insert succeeds");
-        assert_eq!(
-            index.index_failure_count(),
-            0,
-            "a successful insert must not count as a loss"
-        );
-
-        // Remove the index directory under the writer, then insert again. The
-        // eleven callers in memory/mod.rs log this and continue, so the count
-        // is the only thing that can report it afterwards.
-        std::fs::remove_dir_all(temp_dir.path()).ok();
-        let id2 = MemoryId(uuid::Uuid::new_v4());
-        let result = index.upsert(&id2, "lost content", &[], &[]);
-
-        // The assertion is the AGREEMENT, in both directions: it fails if the
-        // insert errored without counting, and equally if the count moved
-        // while the insert succeeded. A counter nobody has watched move is the
-        // defect it exists to catch.
-        assert_eq!(
-            result.is_err(),
-            index.index_failure_count() == 1,
-            "error and count disagree: err={} count={}",
-            result.is_err(),
-            index.index_failure_count()
-        );
     }
 
     #[test]

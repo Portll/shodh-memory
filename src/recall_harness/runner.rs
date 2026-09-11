@@ -1590,6 +1590,20 @@ pub fn ingest_corpus(
         );
     }
 
+    // Both guards above trust that a loss announced itself; this one compares
+    // populations, so it catches one that did not. Shortfall only — a surplus
+    // (chunking, re-index) is not loss.
+    let (stored, vec_idx, lex_idx) = user_mem.read().index_coverage()?;
+    if vec_idx < stored || lex_idx < stored {
+        anyhow::bail!(
+            "index coverage shortfall after ingest: {stored} stored, {vec_idx} in the vector \
+             index, {lex_idx} in the lexical index. Memories that are stored but not indexed \
+             are unretrievable, so recall would be measured against a corpus smaller than the \
+             one ingested. No insert or commit error was raised for this — the counters above \
+             are clean — which means the loss was silent."
+        );
+    }
+
     Ok(map)
 }
 
