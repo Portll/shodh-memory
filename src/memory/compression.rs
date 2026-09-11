@@ -214,21 +214,22 @@ impl CompressionPipeline {
             .map(|s| s.as_str())
             .unwrap_or("unknown");
 
+        // Legacy pre-fix records truncated the body at storage time and are unrecoverable,
+        // under WHATEVER label they carry (see `is_legacy_lossy`). Fail honestly rather than
+        // returning a truncated summary as if it were the original content.
+        if Self::is_legacy_lossy(memory) {
+            return Err(anyhow!(
+                "Memory '{}' was written by the pre-fix lossy semantic compressor: \
+                 its full content was truncated at storage time and cannot be \
+                 recovered. Only the surviving summary/keywords remain in place.",
+                memory.id.0
+            ));
+        }
+
         match strategy {
             // Both LZ4 and hybrid store the full experience in the LZ4 blob.
             "lz4" | "hybrid" => self.decompress_lz4(memory),
             "semantic" => {
-                // Legacy pre-fix records truncated the body at storage time and
-                // are unrecoverable. Fail honestly rather than returning a
-                // truncated summary as if it were the original content.
-                if Self::is_legacy_lossy(memory) {
-                    return Err(anyhow!(
-                        "Memory '{}' was written by the pre-fix lossy semantic compressor: \
-                         its full content was truncated at storage time and cannot be \
-                         recovered. Only the surviving summary/keywords remain in place.",
-                        memory.id.0
-                    ));
-                }
                 // New-format semantic records preserve the full body — restore
                 // the uncompressed state in place.
                 let mut restored = memory.clone();
@@ -252,14 +253,17 @@ impl CompressionPipeline {
     /// full body, so a `semantic` record missing that key with a `...`-terminated
     /// body is an unrecoverable legacy record.
     fn is_legacy_lossy(memory: &Memory) -> bool {
-        let strategy = memory
-            .experience
-            .metadata
-            .get("compression_strategy")
-            .map(|s| s.as_str())
-            .unwrap_or("");
-        strategy == "semantic"
-            && !memory.experience.metadata.contains_key("summary")
+        // Keyed on the metadata SHAPE, not the strategy label. The pre-fix semantic pass wrote
+        // `keywords` and never `summary`; the new pass always writes both. So keywords-without-
+        // summary plus a `...`-terminated body is a destroyed record under any label — and the
+        // label is not trustworthy for these records: the pre-fix `compress_hybrid` ran the
+        // lossy semantic pass and then `compress_lz4`, which stamped "lz4" last, so every
+        // hybrid record from that era advertises the lossless strategy. Checking only
+        // `"semantic"` let those decompress the LZ4 blob and return the summary as the body.
+        let meta = &memory.experience.metadata;
+        memory.compressed
+            && meta.contains_key("keywords")
+            && !meta.contains_key("summary")
             && memory.experience.content.trim_end().ends_with("...")
     }
 
