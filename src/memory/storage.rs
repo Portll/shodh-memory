@@ -2399,6 +2399,10 @@ impl MemoryStorage {
                         .into_iter()
                         .filter(|id| result_sets.iter().all(|set| set.contains(id)))
                         .collect();
+                    // The intersection went through a HashSet, which discards whatever
+                    // order the leaves produced. Same fix as `search_by_tags`: stable
+                    // by id, so a caller that truncates gets the same records twice.
+                    memory_ids.sort();
                 }
             }
 
