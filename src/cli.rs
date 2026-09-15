@@ -108,11 +108,7 @@ enum Commands {
         api_url: String,
 
         /// API key for authentication
-        #[arg(
-            long,
-            env = "SHODH_API_KEY",
-            default_value = "sk-shodh-dev-local-testing-key"
-        )]
+        #[arg(long, env = "SHODH_API_KEY")]
         api_key: String,
     },
 
@@ -131,11 +127,7 @@ enum Commands {
         api_url: String,
 
         /// API key for authentication
-        #[arg(
-            long,
-            env = "SHODH_API_KEY",
-            default_value = "sk-shodh-dev-local-testing-key"
-        )]
+        #[arg(long, env = "SHODH_API_KEY")]
         api_key: String,
 
         /// User ID for memory operations
@@ -153,11 +145,7 @@ enum Commands {
         api_url: String,
 
         /// API key for authentication
-        #[arg(
-            long,
-            env = "SHODH_API_KEY",
-            default_value = "sk-shodh-dev-local-testing-key"
-        )]
+        #[arg(long, env = "SHODH_API_KEY")]
         api_key: String,
     },
 
@@ -211,11 +199,7 @@ enum Commands {
         api_url: String,
 
         /// API key for authentication
-        #[arg(
-            long,
-            env = "SHODH_API_KEY",
-            default_value = "sk-shodh-dev-local-testing-key"
-        )]
+        #[arg(long, env = "SHODH_API_KEY")]
         api_key: String,
     },
 
@@ -239,11 +223,7 @@ enum HookType {
         api_url: String,
 
         /// API key for authentication
-        #[arg(
-            long,
-            env = "SHODH_API_KEY",
-            default_value = "sk-shodh-dev-local-testing-key"
-        )]
+        #[arg(long, env = "SHODH_API_KEY")]
         api_key: String,
 
         /// User ID for memory operations
@@ -265,11 +245,7 @@ enum HookType {
         api_url: String,
 
         /// API key for authentication
-        #[arg(
-            long,
-            env = "SHODH_API_KEY",
-            default_value = "sk-shodh-dev-local-testing-key"
-        )]
+        #[arg(long, env = "SHODH_API_KEY")]
         api_key: String,
 
         /// User ID for memory operations
@@ -285,6 +261,26 @@ enum HookType {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    // TRANSPORT GUARD, at the one place every invocation passes through. See
+    // src/endpoint_guard.rs; the veld twin carries the identical check. Placed in main() rather
+    // than in the client constructors because `status` reaches neither of them — found by running
+    // the binary against a remote http:// URL and watching it not refuse.
+    {
+        let explicit = std::env::args().skip_while(|a| a != "--api-url").nth(1);
+        let url = explicit
+            .or_else(|| std::env::var("SHODH_API_URL").ok())
+            .or_else(|| std::env::var("SHODH_SERVER_URL").ok());
+        if let Some(u) = url {
+            if let Err(msg) = shodh_memory::endpoint_guard::check_api_url(
+                &u,
+                std::env::var("SHODH_ALLOW_HTTP").ok().as_deref(),
+            ) {
+                eprintln!("shodh: {msg}");
+                std::process::exit(2);
+            }
+        }
+    }
 
     match cli.command {
         // =====================================================================
@@ -564,7 +560,7 @@ fn handle_init() -> Result<()> {
         // transcript and CI log this command runs under, so only a recognisable prefix is shown.
         eprintln!(
             "  ✓ API key generated: {}… (full key stored in {})",
-            &api_key[..api_key.len().min(8)],
+            api_key.get(..12).unwrap_or("sk-shodh"),
             config_path.display()
         );
     }

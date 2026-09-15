@@ -48,7 +48,6 @@ enum Commands {
         #[arg(
             long,
             env = "SHODH_API_KEY",
-            default_value = "sk-shodh-dev-local-testing-key"
         )]
         api_key: String,
 
@@ -87,7 +86,6 @@ enum HookType {
         #[arg(
             long,
             env = "SHODH_API_KEY",
-            default_value = "sk-shodh-dev-local-testing-key"
         )]
         api_key: String,
 
@@ -113,7 +111,6 @@ enum HookType {
         #[arg(
             long,
             env = "SHODH_API_KEY",
-            default_value = "sk-shodh-dev-local-testing-key"
         )]
         api_key: String,
 
