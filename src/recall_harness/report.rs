@@ -16,6 +16,10 @@ use super::metrics::Metrics;
 /// `k` value used by the L1 smoke suite for top-`k` metrics.
 pub const SMOKE_K: usize = 10;
 
+/// The `embedder` a report carries when the run could not say what embedded it. Its own
+/// value, never a plausible model name, so `compare_to_baseline` can refuse it.
+pub const EMBEDDER_UNKNOWN: &str = "unknown";
+
 /// Top-level recall-eval report.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Report {
@@ -492,10 +496,6 @@ pub struct CategoryReport {
 /// Two flavours are emitted:
 /// - `kind = "regression"` when a baseline comparison exceeds the tolerance.
 /// - `kind = "case"` when a single case has zero relevant retrievals at all.
-/// The `embedder` a report carries when the run could not say what embedded it. Its own
-/// value, never a plausible model name, so `compare_to_baseline` can refuse it.
-pub const EMBEDDER_UNKNOWN: &str = "unknown";
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Failure {
     pub kind: String,
@@ -641,7 +641,10 @@ pub fn compare_to_baseline(
     // embedders is a diff of two systems, and calling its result a regression or an
     // improvement describes neither. A report that cannot say what embedded it is not
     // diffable against anything, including another unknown. Refuse before any metric.
-    for (which, e) in [("baseline", &baseline.embedder), ("current", &current.embedder)] {
+    for (which, e) in [
+        ("baseline", &baseline.embedder),
+        ("current", &current.embedder),
+    ] {
         if e.is_empty() || e == EMBEDDER_UNKNOWN {
             return vec![Failure {
                 kind: "infrastructure".to_string(),
@@ -1137,13 +1140,26 @@ mod tests {
         let failures = compare_to_baseline(&baseline, &current, 2.0);
         assert_eq!(failures.len(), 1, "{failures:?}");
         assert_eq!(failures[0].kind, "infrastructure");
-        assert!(failures[0].detail.contains("embedder differs"), "{}", failures[0].detail);
+        assert!(
+            failures[0].detail.contains("embedder differs"),
+            "{}",
+            failures[0].detail
+        );
     }
 
     /// A report of unknown provenance is refused on either side, even against another unknown.
+    /// The asymmetric empty cases pin the `is_empty` branch apart from the differs branch: an
+    /// empty embedder against a real one is refused as unknown, not as a mismatch.
     #[test]
     fn unknown_embedder_is_refused_on_either_side() {
-        for (b, c) in [(EMBEDDER_UNKNOWN, "minilm-l6-v2"), ("minilm-l6-v2", EMBEDDER_UNKNOWN), (EMBEDDER_UNKNOWN, EMBEDDER_UNKNOWN), ("", "")] {
+        for (b, c) in [
+            (EMBEDDER_UNKNOWN, "minilm-l6-v2"),
+            ("minilm-l6-v2", EMBEDDER_UNKNOWN),
+            (EMBEDDER_UNKNOWN, EMBEDDER_UNKNOWN),
+            ("", "minilm-l6-v2"),
+            ("minilm-l6-v2", ""),
+            ("", ""),
+        ] {
             let mut baseline = report_with_full(0.6, 0.7, 0.5, 0.4);
             let mut current = report_with_full(0.6, 0.7, 0.5, 0.4);
             baseline.embedder = b.to_string();
@@ -1151,7 +1167,11 @@ mod tests {
             let failures = compare_to_baseline(&baseline, &current, 2.0);
             assert_eq!(failures.len(), 1, "{b:?} vs {c:?}: {failures:?}");
             assert_eq!(failures[0].kind, "infrastructure");
-            assert!(failures[0].detail.contains("provenance"), "{}", failures[0].detail);
+            assert!(
+                failures[0].detail.contains("provenance"),
+                "{}",
+                failures[0].detail
+            );
         }
     }
 
