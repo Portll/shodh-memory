@@ -1591,8 +1591,10 @@ pub fn ingest_corpus(
     }
 
     // Both guards above trust that a loss announced itself; this one compares
-    // populations, so it catches one that did not. Shortfall only — a surplus
-    // (chunking, re-index) is not loss.
+    // populations, so it catches one that did not. Shortfall only: all three
+    // counts are per memory, so chunking cannot produce a surplus, and an index
+    // entry with no stored memory behind it is a stale index — a different
+    // defect from the one this guards.
     let (stored, vec_idx, lex_idx) = user_mem.read().index_coverage()?;
     if vec_idx < stored || lex_idx < stored {
         anyhow::bail!(

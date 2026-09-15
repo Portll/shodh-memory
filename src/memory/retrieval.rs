@@ -640,6 +640,17 @@ impl RetrievalEngine {
             .collect()
     }
 
+    /// Vector index inserts lost since process start. Nonzero means memories
+    /// exist in the primary store that no semantic query can reach.
+    ///
+    /// Covers `index_memory` and `reindex_memory` (which delegates to it). The
+    /// startup migration and orphan-recovery paths call `add_vector` directly
+    /// and are not counted here.
+    pub fn index_failure_count(&self) -> u64 {
+        self.index_failures
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Add memory to vector index with atomic RocksDB storage
     ///
     /// ATOMIC ARCHITECTURE: This method stores the vector mapping atomically
@@ -649,13 +660,6 @@ impl RetrievalEngine {
     /// every chunk fits the model's sequence window) and creates multiple
     /// embeddings to ensure ALL content is searchable — not just the tokens
     /// that survive truncation.
-    /// Vector index inserts lost since process start. Nonzero means memories
-    /// exist in the primary store that no semantic query can reach.
-    pub fn index_failure_count(&self) -> u64 {
-        self.index_failures
-            .load(std::sync::atomic::Ordering::Relaxed)
-    }
-
     pub fn index_memory(&self, memory: &Memory) -> Result<()> {
         // Counted at the boundary, not at the call sites that log and continue.
         match self.index_memory_inner(memory) {
