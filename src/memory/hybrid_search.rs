@@ -259,7 +259,7 @@ impl BM25Index {
         doc.add_text(self.tags_field, tags.join(" "));
         doc.add_text(self.entities_field, entities.join(" "));
 
-        // Counted HERE rather than at the eleven call sites that log and
+        // Counted HERE rather than at the fifteen index sites that log and
         // continue, so a caller added later cannot forget to record its loss.
         if let Err(e) = writer.add_document(doc) {
             self.index_failures
