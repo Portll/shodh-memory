@@ -2628,6 +2628,12 @@ impl MemorySystem {
     pub fn recall_by_tags(&self, tags: &[String], limit: usize) -> Result<Vec<Memory>> {
         let criteria = storage::SearchCriteria::ByTags(tags.to_vec());
         let mut memories = self.advanced_search(criteria)?;
+        // `/api/recall/tags` serialises this order straight to the client, so the
+        // page it truncates to has to be the newest `limit`, not a stable-but-
+        // arbitrary `limit`. The memories are already materialised here, so the
+        // sort costs nothing extra. Stable sort: ties keep the id order the
+        // storage layer returns, which is what makes the page repeatable.
+        memories.sort_by(|a, b| b.created_at.cmp(&a.created_at));
         memories.truncate(limit);
         // Persisted usage write on a read path — same gate as every other one.
         // This entry point takes no `Query`, which is why it was missed when
