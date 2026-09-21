@@ -47,6 +47,11 @@ const VAMANA_INDEX_FILE: &str = "vamana.idx";
 /// **Note:** Memory graph (Hebbian learning) has been consolidated into GraphMemory
 /// which is managed at the API layer (MultiUserMemoryManager.graph_memories)
 pub struct RetrievalEngine {
+    /// Vector index inserts that failed. A nonzero count means memories are
+    /// STORED BUT SEMANTICALLY UNREACHABLE — the orphan condition the startup
+    /// recovery repairs, counted while it accumulates rather than only after a
+    /// restart notices it.
+    index_failures: std::sync::atomic::AtomicU64,
     storage: Arc<MemoryStorage>,
     embedder: Arc<MiniLMEmbedder>,
     /// Lock order: 1 - Acquire first
@@ -203,6 +208,7 @@ impl RetrievalEngine {
         // This enables persistent storage in RocksDB with proper Hebbian learning
 
         let engine = Self {
+            index_failures: std::sync::atomic::AtomicU64::new(0),
             storage,
             embedder,
             vector_index: Arc::new(RwLock::new(vector_index)),
@@ -634,6 +640,17 @@ impl RetrievalEngine {
             .collect()
     }
 
+    /// Vector index inserts lost since process start. Nonzero means memories
+    /// exist in the primary store that no semantic query can reach.
+    ///
+    /// Covers `index_memory` and `reindex_memory` (which delegates to it). The
+    /// startup migration and orphan-recovery paths call `add_vector` directly
+    /// and are not counted here.
+    pub fn index_failure_count(&self) -> u64 {
+        self.index_failures
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Add memory to vector index with atomic RocksDB storage
     ///
     /// ATOMIC ARCHITECTURE: This method stores the vector mapping atomically
@@ -644,6 +661,18 @@ impl RetrievalEngine {
     /// embeddings to ensure ALL content is searchable — not just the tokens
     /// that survive truncation.
     pub fn index_memory(&self, memory: &Memory) -> Result<()> {
+        // Counted at the boundary, not at the call sites that log and continue.
+        match self.index_memory_inner(memory) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                self.index_failures
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Err(e)
+            }
+        }
+    }
+
+    fn index_memory_inner(&self, memory: &Memory) -> Result<()> {
         use crate::embeddings::chunking::{chunk_text, ChunkConfig};
 
         let text = Self::extract_searchable_text(memory);
