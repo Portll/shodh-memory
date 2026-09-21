@@ -2399,6 +2399,10 @@ impl MemoryStorage {
                         .into_iter()
                         .filter(|id| result_sets.iter().all(|set| set.contains(id)))
                         .collect();
+                    // The intersection went through a HashSet, which discards whatever
+                    // order the leaves produced. Same fix as `search_by_tags`: stable
+                    // by id, so a caller that truncates gets the same records twice.
+                    memory_ids.sort();
                 }
             }
 
@@ -2566,7 +2570,12 @@ impl MemoryStorage {
             }
         }
 
-        Ok(all_ids.into_iter().collect())
+        // A HashSet has no order, and recall_by_tags truncates what this returns — so with more
+        // matches than the limit, WHICH records came back changed between identical calls.
+        // Sorted by id the truncation is at least repeatable; callers wanting recency sort again.
+        let mut ids: Vec<MemoryId> = all_ids.into_iter().collect();
+        ids.sort();
+        Ok(ids)
     }
 
     /// Search memories by episode ID

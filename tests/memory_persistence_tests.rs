@@ -839,6 +839,51 @@ fn test_stress_reinforcement_cycles() {
     );
 }
 
+/// `recall_by_tags` truncates what the tag index returns. That index returned a
+/// HashSet's iteration order, so with more matches than the limit WHICH records
+/// came back changed between two identical calls in one process — and the
+/// endpoint serialises that page straight to the client. Two properties, both
+/// verified failing on the unsorted path: the page is the same set twice, and
+/// it is the newest `LIMIT`, not an arbitrary `LIMIT`.
+#[test]
+fn recall_by_tags_page_is_repeatable_and_newest_first() {
+    let (system, _t) = create_test_system();
+    const N: usize = 40;
+    const LIMIT: usize = 10;
+    for i in 0..N {
+        let mut experience = create_experience(&format!("tagged probe number {i}"), vec!["probe"]);
+        experience.tags = vec!["repeatable".to_string()];
+        system.remember(experience, None).expect("remember");
+    }
+    let tags = vec!["repeatable".to_string()];
+    let ids = |page: &[shodh_memory::memory::Memory]| -> Vec<MemoryId> {
+        page.iter().map(|m| m.id.clone()).collect()
+    };
+
+    let first = system.recall_by_tags(&tags, LIMIT).expect("recall_by_tags");
+    let second = system.recall_by_tags(&tags, LIMIT).expect("recall_by_tags");
+    assert_eq!(
+        first.len(),
+        LIMIT,
+        "seeded {N} under one tag, asked for {LIMIT}"
+    );
+    assert_eq!(
+        ids(&first),
+        ids(&second),
+        "same query, same process, different records"
+    );
+
+    let mut all = system.recall_by_tags(&tags, N).expect("recall_by_tags");
+    assert_eq!(all.len(), N);
+    all.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    all.truncate(LIMIT);
+    assert_eq!(
+        ids(&first),
+        ids(&all),
+        "the truncated page is not the newest {LIMIT} of {N}"
+    );
+}
+
 /// Every stored memory must be present in both indexes. Measured on this path
 /// (8 remembered gives stored=8 vector=8 lexical=8), so equality is asserted
 /// rather than a bound. Verified failing: a mutant that silently skips one
