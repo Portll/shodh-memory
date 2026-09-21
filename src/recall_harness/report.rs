@@ -16,6 +16,10 @@ use super::metrics::Metrics;
 /// `k` value used by the L1 smoke suite for top-`k` metrics.
 pub const SMOKE_K: usize = 10;
 
+/// The `embedder` a report carries when the run could not say what embedded it. Its own
+/// value, never a plausible model name, so `compare_to_baseline` can refuse it.
+pub const EMBEDDER_UNKNOWN: &str = "unknown";
+
 /// Top-level recall-eval report.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Report {
@@ -633,6 +637,34 @@ pub fn compare_to_baseline(
     current: &Report,
     tolerance_pct: f64,
 ) -> Vec<Failure> {
+    // A value nothing reads is not a check. Both reports carry `embedder`; a diff across two
+    // embedders is a diff of two systems, and calling its result a regression or an
+    // improvement describes neither. A report that cannot say what embedded it is not
+    // diffable against anything, including another unknown. Refuse before any metric.
+    for (which, e) in [
+        ("baseline", &baseline.embedder),
+        ("current", &current.embedder),
+    ] {
+        if e.is_empty() || e == EMBEDDER_UNKNOWN {
+            return vec![Failure {
+                kind: "infrastructure".to_string(),
+                detail: format!(
+                    "{which} report cannot say what embedded it (embedder {e:?}); a run of unknown \
+                     provenance is not diffable against anything"
+                ),
+            }];
+        }
+    }
+    if baseline.embedder != current.embedder {
+        return vec![Failure {
+            kind: "infrastructure".to_string(),
+            detail: format!(
+                "embedder differs: baseline {:?}, current {:?} — metrics from two embedders are \
+                 not comparable; record a new baseline under the current embedder instead",
+                baseline.embedder, current.embedder
+            ),
+        }];
+    }
     let Some(base_full) = baseline.layers.get("full") else {
         return vec![Failure {
             kind: "infrastructure".to_string(),
@@ -1096,6 +1128,51 @@ mod tests {
         let baseline = report_with_full(0.60, 0.70, 0.50, 0.40);
         let current = report_with_full(0.80, 0.90, 0.70, 0.60);
         assert!(compare_to_baseline(&baseline, &current, 2.0).is_empty());
+    }
+
+    /// Two embedders, identical numbers: not a pass, not a regression, a refusal — and no
+    /// metric failure rides along with it.
+    #[test]
+    fn different_embedder_refuses_before_any_metric_is_compared() {
+        let baseline = report_with_full(0.6, 0.7, 0.5, 0.4);
+        let mut current = report_with_full(0.1, 0.1, 0.1, 0.1); // would fail every gate
+        current.embedder = "text-embedding-nomic-embed-text-v1.5".to_string();
+        let failures = compare_to_baseline(&baseline, &current, 2.0);
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert_eq!(failures[0].kind, "infrastructure");
+        assert!(
+            failures[0].detail.contains("embedder differs"),
+            "{}",
+            failures[0].detail
+        );
+    }
+
+    /// A report of unknown provenance is refused on either side, even against another unknown.
+    /// The asymmetric empty cases pin the `is_empty` branch apart from the differs branch: an
+    /// empty embedder against a real one is refused as unknown, not as a mismatch.
+    #[test]
+    fn unknown_embedder_is_refused_on_either_side() {
+        for (b, c) in [
+            (EMBEDDER_UNKNOWN, "minilm-l6-v2"),
+            ("minilm-l6-v2", EMBEDDER_UNKNOWN),
+            (EMBEDDER_UNKNOWN, EMBEDDER_UNKNOWN),
+            ("", "minilm-l6-v2"),
+            ("minilm-l6-v2", ""),
+            ("", ""),
+        ] {
+            let mut baseline = report_with_full(0.6, 0.7, 0.5, 0.4);
+            let mut current = report_with_full(0.6, 0.7, 0.5, 0.4);
+            baseline.embedder = b.to_string();
+            current.embedder = c.to_string();
+            let failures = compare_to_baseline(&baseline, &current, 2.0);
+            assert_eq!(failures.len(), 1, "{b:?} vs {c:?}: {failures:?}");
+            assert_eq!(failures[0].kind, "infrastructure");
+            assert!(
+                failures[0].detail.contains("provenance"),
+                "{}",
+                failures[0].detail
+            );
+        }
     }
 
     #[test]
