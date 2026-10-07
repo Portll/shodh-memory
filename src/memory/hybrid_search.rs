@@ -1075,6 +1075,10 @@ impl HybridSearchEngine {
     /// markers near the focal entity have a chance to enter the candidate set.
     /// Pure post-fusion reranking cannot rescue passages that were never
     /// retrieved — see arXiv 2603.17580 ("Negation is Not Semantic").
+    // 8 args: self, query, vector input, content closure and four independent tuning
+    // dials. Bundling into a config struct would just push the wide surface
+    // up to every caller for no clarity gain.
+    #[allow(clippy::too_many_arguments)]
     pub fn search_with_dynamic_weights_pool<F>(
         &self,
         query: &str,
