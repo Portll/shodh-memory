@@ -165,6 +165,19 @@ Set the passphrase and restart. Old records are plaintext until touched:
 encrypted records as current. Until that pass runs, the tripwire will fire
 for every old record read — that is the signal it exists to give.
 
+### Migrating from field-level encryption
+
+Earlier builds of this fork encrypted `experience.content` alone under the raw key in
+`SHODH_ENCRYPTION_KEY`. That format is read, never written. To migrate a store:
+
+1. Set `SHODH_MASTER_PASSPHRASE` (a keystore is created on first open) and keep
+   `SHODH_ENCRYPTION_KEY` set to the old key.
+2. Each record read in the old format is decrypted and re-sealed under the keystore.
+3. Once every record has been read or rewritten, unset `SHODH_ENCRYPTION_KEY`.
+
+`SHODH_ENCRYPTION_KEY` without a keystore refuses to open the store, and a record
+still in the old format with the key unset is an error, never its ciphertext as text.
+
 ## 6. Scope — what is and is not encrypted
 
 Encrypted: the primary `Memory` record in the default column family, in full.
