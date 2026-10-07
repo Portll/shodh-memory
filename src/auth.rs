@@ -118,7 +118,22 @@ impl IntoResponse for AuthError {
 
 /// Compiler-resistant constant-time comparison for equal-length key material.
 pub(crate) fn constant_time_compare(a: &str, b: &str) -> bool {
-    a.as_bytes().ct_eq(b.as_bytes()).into()
+    let a_bytes = a.as_bytes();
+    let b_bytes = b.as_bytes();
+
+    // Equal-length normalisation: `subtle`'s slice `ct_eq` is only constant-time
+    // for equal-length inputs (it returns early on a length mismatch). When the
+    // lengths differ we run a fixed dummy compare and then fail via `len_match`,
+    // so the comparison cost does not leak length information.
+    let len_match = a_bytes.len() == b_bytes.len();
+    let bytes_eq = if len_match {
+        bool::from(a_bytes.ct_eq(b_bytes))
+    } else {
+        let _ = bool::from(b_bytes.ct_eq(b_bytes));
+        false
+    };
+
+    len_match && bytes_eq
 }
 
 /// Resolve API keys using the one precedence rule shared by HTTP and local IPC.
