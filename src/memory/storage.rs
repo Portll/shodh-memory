@@ -905,7 +905,7 @@ fn deserialize_memory_checked(key: &[u8], data: &[u8]) -> Result<(Memory, bool)>
 /// the plaintext-under-keystore tripwire on the very records it is fixing.
 fn deserialize_plain_checked(key: &[u8], plain: &[u8]) -> Result<(Memory, bool)> {
     let data = plain;
-    let (memory, needs_migration) = deserialize_memory(data)?;
+    let (mut memory, mut needs_migration) = deserialize_memory(data)?;
     if memory.id.0.as_bytes() != key {
         tracing::warn!(
             decoded_id = %memory.id.0,
@@ -921,6 +921,14 @@ fn deserialize_plain_checked(key: &[u8], plain: &[u8]) -> Result<(Memory, bool)>
             hex::encode(key),
             data.len()
         ));
+    }
+    // Content in the retired field-level format: opened here, and the record is
+    // re-sealed under the keystore by the same lazy migration that seals plaintext.
+    if let Some(plain) =
+        crate::legacy_field_encryption::open_legacy_content(&memory.experience.content)?
+    {
+        memory.experience.content = plain;
+        needs_migration = true;
     }
     Ok((memory, needs_migration))
 }
@@ -1738,6 +1746,7 @@ impl MemoryStorage {
         // Encryption at rest: unseal the keystore (if any) and install the
         // record crypto. No keystore + no passphrase = plaintext, as before.
         Self::init_storage_crypto(&db, &storage_path)?;
+        crate::legacy_field_encryption::check_config(encryption_active())?;
 
         let write_mode = WriteMode::default();
         tracing::info!(
