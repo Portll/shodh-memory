@@ -4691,16 +4691,22 @@ impl MemorySystem {
                         .iter()
                         .map(|(_, a, _)| *a)
                         .fold(0.0_f32, f32::max);
-                    let feats: [f32; 11] = [
-                        peak(&by_bm),
-                        peak(&by_vec),
+                    // Cap-invariant shape of each leg; see `trust_gate` for why
+                    // the legs' widths are not features.
+                    use crate::memory::trust_gate::{
+                        mass_ratio, strong_count, MASS_TOP, MASS_WITHIN, VEC_STRONG_COSINE,
+                    };
+                    let vec_scores: Vec<f32> = by_vec.iter().map(|x| x.1).collect();
+                    let bm_scores: Vec<f32> = by_bm.iter().map(|x| x.1).collect();
+                    let feats: [f32; crate::memory::trust_gate::FEATURE_COUNT] = [
+                        peak(&by_bm).max(1e-3).ln(),
+                        peak(&by_vec).max(1e-3).ln(),
                         agreement,
                         max_bm,
                         max_vec,
-                        by_bm.len() as f32,
-                        by_vec.len() as f32,
-                        hybrid_components.len() as f32,
-                        graph_results.len() as f32,
+                        strong_count(&vec_scores, VEC_STRONG_COSINE) as f32,
+                        mass_ratio(&vec_scores, MASS_TOP, MASS_WITHIN),
+                        mass_ratio(&bm_scores, MASS_TOP, MASS_WITHIN),
                         graph_max_act,
                         query_text.len() as f32,
                     ];
